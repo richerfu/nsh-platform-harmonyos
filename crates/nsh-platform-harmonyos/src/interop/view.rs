@@ -26,6 +26,7 @@ use crate::{
 enum RetirePhase {
     Exporting,
     Settling,
+    ClearingExport,
 }
 
 struct RootBridge {
@@ -73,6 +74,7 @@ pub(crate) struct Wrapper {
     settings: std::cell::RefCell<Option<ViewOptions>>,
     pub(crate) composite: std::cell::RefCell<Option<crate::render::composition::worker::Composite>>,
     retiring: Cell<Option<(u32, RetirePhase)>>,
+    clearing_export_nodes: RefCell<Vec<std::rc::Weak<Node>>>,
     lingering: std::cell::RefCell<Vec<crate::render::composition::worker::Composite>>,
     /// The accessibility mode and grouping last given the wrapped node
     /// (`None`: to give again, after the node's own props reset them).
@@ -135,7 +137,81 @@ impl Wrapper {
         !self.closed.get() && self.context_live.get()
     }
     pub(crate) fn retiring_export(&self) -> bool {
-        matches!(self.retiring.get(), Some((_, RetirePhase::Exporting)))
+        self.retiring.get().is_some()
+    }
+    pub(crate) fn blocks_composite_update(&self) -> bool {
+        matches!(
+            self.retiring.get(),
+            Some((_, RetirePhase::Exporting | RetirePhase::ClearingExport))
+        )
+    }
+    fn collect_clearing_screens(node: &Rc<Node>, out: &mut Vec<Rc<Node>>) {
+        for child in node
+            .children
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            if !child.active.get() || child.retained.get() || child.modal.borrow().is_some() {
+                continue;
+            }
+            if child.kind == nsh_core::ViewKind::Screen {
+                out.push(child);
+            } else {
+                Self::collect_clearing_screens(&child, out);
+            }
+        }
+    }
+    fn begin_clearing_export(&self, owner: &Rc<Node>) -> Result<()> {
+        let mut screens = Vec::new();
+        Self::collect_clearing_screens(owner, &mut screens);
+        let mut held = self.clearing_export_nodes.borrow_mut();
+        for screen in screens {
+            if !screen.clearing_export.replace(true) {
+                held.push(Rc::downgrade(&screen));
+            }
+            let visual = screen.visual_node();
+            if visual.borrow().is_owned() {
+                visual.borrow().opacity(f32::MIN_POSITIVE)?;
+                visual.borrow().opacity(0.0)?;
+            }
+            screen.restore_style()?;
+        }
+        drop(held);
+        if owner.native.borrow().is_owned() {
+            owner
+                .native
+                .borrow()
+                .mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            owner
+                .native
+                .borrow()
+                .mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
+        Ok(())
+    }
+    fn release_clearing_export_holds(&self) -> Result<()> {
+        let held: Vec<_> = self.clearing_export_nodes.borrow_mut().drain(..).collect();
+        for weak in held {
+            if let Some(screen) = weak.upgrade()
+                && screen.clearing_export.replace(false)
+                && screen.active.get()
+            {
+                screen.restore_after_export()?;
+                screen.invalidate_subtree_paint()?;
+            }
+        }
+        Ok(())
+    }
+    fn cancel_retiring(&self, owner: Option<&Node>) -> Result<()> {
+        let was_retiring = self.retiring.replace(None).is_some();
+        if was_retiring && let Some(composite) = self.composite.borrow().as_ref() {
+            composite.unfreeze();
+            if let Some(owner) = owner {
+                owner.composite_dirty.set(true);
+            }
+        }
+        self.release_clearing_export_holds()
     }
     fn bridge_nodes_valid(bridge: &RootBridge) -> Option<(Rc<Node>, Rc<Node>, Rc<Node>)> {
         let stack = bridge.stack.upgrade()?;
@@ -257,11 +333,51 @@ impl Wrapper {
                 .set(peer.export_repair.get().saturating_sub(1));
         }
     }
+    fn prepare_bridge_before_target_update(
+        &self,
+        export_requested: bool,
+        active_surface_ready: bool,
+        revealed: bool,
+    ) -> Result<()> {
+        if self.closed.get()
+            || !self.context_live.get()
+            || !export_requested
+            || revealed
+            || !active_surface_ready
+        {
+            return Ok(());
+        }
+        let Some(bridge) = self.bridge.borrow().clone() else {
+            return Ok(());
+        };
+        let Some((_, _, screen_owner)) = Self::bridge_nodes_valid(&bridge) else {
+            return Ok(());
+        };
+        let current_phase = screen_owner
+            .screen
+            .borrow()
+            .as_ref()
+            .map(|screen| screen.bridge_phase.get());
+        if current_phase != Some(crate::navigation::stack::RootBridgePhase::RenderingExport) {
+            if let Some(screen) = screen_owner.screen.borrow().as_ref() {
+                screen
+                    .bridge_phase
+                    .set(crate::navigation::stack::RootBridgePhase::RenderingExport);
+            }
+            screen_owner.navigation_presentation(1.0, 0.0)?;
+            screen_owner.restore_style()?;
+            screen_owner.restore_export_controls()?;
+            screen_owner.shaders.invalidate_visibility();
+            screen_owner.animator.request_frame();
+        }
+        Ok(())
+    }
     fn sync_bridge(
         &self,
         owner: &Node,
         export_requested: bool,
         active_target_is_texture: bool,
+        target_switched_to_texture: bool,
         revealed: bool,
     ) -> Result<()> {
         let Some(bridge) = self.bridge.borrow().clone() else {
@@ -352,6 +468,8 @@ impl Wrapper {
                 screen_owner.schedule_subtree_paint(4)?;
                 screen_owner.shaders.invalidate_visibility();
                 screen_owner.animator.request_frame();
+            } else if target_switched_to_texture {
+                screen_owner.schedule_subtree_paint(4)?;
             }
         } else if current_phase != Some(crate::navigation::stack::RootBridgePhase::HoldingDirect) {
             if let Some(screen) = screen_owner.screen.borrow().as_ref() {
@@ -766,14 +884,26 @@ impl Wrapper {
             return;
         }
         if node.needs_texture() {
-            if let Some(wrapper) = node.wrapper.borrow().as_ref()
-                && wrapper.retiring.get().map(|(g, _)| g) == Some(generation)
-            {
-                wrapper.retiring.set(None);
-            }
+            callback(|| {
+                if let Some(wrapper) = node.wrapper.borrow().as_ref()
+                    && wrapper.retiring.get().map(|(g, _)| g) == Some(generation)
+                {
+                    wrapper.cancel_retiring(Some(&node))?;
+                    if let Some(composite) = wrapper
+                        .composite
+                        .borrow()
+                        .as_ref()
+                        .filter(|c| c.generation == generation)
+                    {
+                        let _ = composite.update(&node);
+                    }
+                    node.flush_arkui()?;
+                }
+                Ok(())
+            });
             return;
         }
-        if remaining == 2 {
+        if remaining == 4 {
             callback(|| {
                 node.composite_dirty.set(true);
                 if let Some(wrapper) = node.wrapper.borrow().as_ref()
@@ -790,6 +920,35 @@ impl Wrapper {
                     {
                         let _ = composite.update(&node);
                     }
+                }
+                Ok(())
+            });
+        } else if remaining == 2 {
+            callback(|| {
+                if let Some(wrapper) = node.wrapper.borrow().as_ref()
+                    && wrapper.retiring.get().map(|(g, _)| g) == Some(generation)
+                {
+                    wrapper
+                        .retiring
+                        .set(Some((generation, RetirePhase::ClearingExport)));
+                    if let Some(composite) = wrapper
+                        .composite
+                        .borrow()
+                        .as_ref()
+                        .filter(|c| c.generation == generation)
+                    {
+                        composite.freeze();
+                    }
+                    wrapper.begin_clearing_export(&node)?;
+                    node.flush_arkui()?;
+                }
+                Ok(())
+            });
+        } else if remaining == 1 {
+            callback(|| {
+                if node.native.borrow().is_owned() {
+                    node.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+                    node.flush_arkui()?;
                 }
                 Ok(())
             });
@@ -824,9 +983,9 @@ impl Wrapper {
                 }
             });
             if let Some(old) = retired {
+                old.freeze();
                 let old_generation = old.generation;
                 node.composite_dirty.set(true);
-                let _ = old.update(&node);
                 if let Some(wrapper) = node.wrapper.borrow().as_ref() {
                     wrapper.lingering.borrow_mut().push(old);
                     Self::retire_lingering(Rc::downgrade(&node), old_generation, 12);
@@ -835,10 +994,15 @@ impl Wrapper {
                         .borrow()
                         .mark_dirty(NodeDirtyFlag::NeedRender)?;
                 }
-                node.schedule_subtree_paint(6)?;
                 node.update_wrapper()?;
+                if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+                    wrapper.release_clearing_export_holds()?;
+                }
+                node.schedule_subtree_paint(6)?;
                 node.restore_style()?;
                 node.flush_arkui()?;
+            } else if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+                wrapper.release_clearing_export_holds()?;
             }
             Ok(())
         });
@@ -952,6 +1116,7 @@ impl Wrapper {
         let _ = self.release_bridge();
         let drained = self.pending_reattach.borrow_mut().drain_all();
         let root = self.owner.upgrade();
+        let _ = self.cancel_retiring(root.as_deref());
         for entry in drained {
             let _ = Self::finish_bridge_reattach(root.as_deref(), entry);
         }
@@ -1242,6 +1407,7 @@ impl Wrapper {
             settings: std::cell::RefCell::default(),
             composite: std::cell::RefCell::default(),
             retiring: Cell::new(None),
+            clearing_export_nodes: RefCell::default(),
             lingering: std::cell::RefCell::default(),
             semantics: Cell::new(None),
             measured: Cell::new(None),
@@ -1401,6 +1567,13 @@ impl Wrapper {
             menu: owner.selection_menu(),
         };
         drop(spec);
+        if is_root {
+            self.prepare_bridge_before_target_update(
+                export_requested,
+                settings.texture_surface.is_some(),
+                revealed,
+            )?;
+        }
         let mut changed = false;
         {
             let mut previous = self.settings.borrow_mut();
@@ -1410,16 +1583,16 @@ impl Wrapper {
                 changed = true;
             }
         }
-        self.handoff.borrow_mut().note_target_updated(
-            self.active_target_is_texture(),
-            revealed,
-            now,
-        );
+        let active_is_texture = self.active_target_is_texture();
+        self.handoff
+            .borrow_mut()
+            .note_target_updated(active_is_texture, revealed, now);
         if is_root {
             self.sync_bridge(
                 owner,
                 export_requested,
-                self.active_target_is_texture(),
+                active_is_texture,
+                changed && active_is_texture && previous_texture != Some(true),
                 revealed,
             )?;
         }
@@ -1438,7 +1611,7 @@ impl Wrapper {
         for entry in drained {
             let _ = Self::cancel_bridge_reattach(Some(&self.outer), entry);
         }
-        self.retiring.set(None);
+        let _ = self.cancel_retiring(Some(owner));
         self.retired_for_background.set(false);
         self.handoff.borrow_mut().reset();
         self.route.borrow_mut().take();
@@ -1617,7 +1790,7 @@ impl Node {
                 });
             if immediate_retire {
                 if let Some(wrapper) = self.wrapper.borrow().as_ref() {
-                    wrapper.retiring.set(None);
+                    wrapper.cancel_retiring(Some(self))?;
                     if wrapper.composite.borrow_mut().take().is_some() {
                         if !self.shaders.hosts_retainable() {
                             wrapper.retired_for_background.set(true);
@@ -1651,11 +1824,11 @@ impl Node {
                             .borrow()
                             .mark_dirty(NodeDirtyFlag::NeedRender)?;
                     }
-                    Wrapper::retire_composite(Rc::downgrade(self), generation, 3);
+                    Wrapper::retire_composite(Rc::downgrade(self), generation, 5);
                 }
             }
         } else if let Some(wrapper) = self.wrapper.borrow().as_ref() {
-            wrapper.retiring.set(None);
+            wrapper.cancel_retiring(Some(self))?;
             if wrapper.composite.borrow().is_none() {
                 if wrapper.target.borrow().is_none() {
                     return Err(crate::render::node::Error::Unsupported(

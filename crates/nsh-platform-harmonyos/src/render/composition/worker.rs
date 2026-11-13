@@ -64,6 +64,7 @@ struct State {
 struct Shared {
     released: AtomicBool,
     active: AtomicBool,
+    frozen: AtomicBool,
     state: Mutex<State>,
     queued: AtomicBool,
     posted: AtomicBool,
@@ -420,6 +421,9 @@ impl Worker {
                                 .is_some_and(|r| r.active.load(Ordering::Acquire))
                             {
                                 for entry in entries.iter_mut().flatten() {
+                                    if entry.shared.frozen.load(Ordering::Acquire) {
+                                        continue;
+                                    }
                                     if entry.window.is_some() {
                                         entry.window_dirty = true;
                                     }
@@ -440,6 +444,7 @@ impl Worker {
                                             .navigation
                                             .as_ref()
                                             .is_some_and(|nav| !nav.complete))
+                                    && !entry.shared.frozen.load(Ordering::Acquire)
                                     && entry.shared.active.load(Ordering::Acquire)
                                     && entry.shared.animating.load(Ordering::Acquire)
                                 {
@@ -484,7 +489,9 @@ impl Worker {
                                     .extend(settings.shaders.iter().map(|(_, layer)| layer.clone()));
                                 let mut reader =
                                     TextureReader::with_context(gpu.as_ref().unwrap(), move || {
-                                        if let Some(shared) = weak.upgrade() {
+                                        if let Some(shared) = weak.upgrade()
+                                            && !shared.frozen.load(Ordering::Acquire)
+                                        {
                                             wake(&callback, key, &shared);
                                         }
                                     })
@@ -550,6 +557,9 @@ impl Worker {
                                         generation: key.generation,
                                     });
                                 }
+                                continue;
+                            }
+                            if entry.shared.frozen.load(Ordering::Acquire) {
                                 continue;
                             }
                             if !route
@@ -967,6 +977,7 @@ impl Worker {
                                 let pending_nav =
                                     entry.navigation.as_ref().is_some_and(|n| !n.complete);
                                 (entry.window.is_some() || entry.settings.scene || pending_nav)
+                                    && !entry.shared.frozen.load(Ordering::Acquire)
                                     && entry.shared.active.load(Ordering::Acquire)
                                     && (entry.window_dirty
                                         || entry.shaders.wants_frame()
@@ -1672,6 +1683,7 @@ impl Composite {
         let shared = Arc::new(Shared {
             released: AtomicBool::new(false),
             active: AtomicBool::new(true),
+            frozen: AtomicBool::new(false),
             state: Mutex::new(State {
                 settings: initial_settings.clone(),
                 screen_origin: initial_origin,
@@ -1744,11 +1756,12 @@ impl Composite {
             return Ok(false);
         }
         if !self.key.overlay
-            && owner
-                .wrapper
-                .borrow()
-                .as_ref()
-                .is_some_and(crate::interop::view::Wrapper::retiring_export)
+            && (self.shared.frozen.load(Ordering::Acquire)
+                || owner
+                    .wrapper
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(crate::interop::view::Wrapper::blocks_composite_update))
         {
             return Ok(false);
         }
@@ -1850,10 +1863,25 @@ impl Composite {
             complete: false,
         }));
     }
+    pub(crate) fn freeze(&self) {
+        self.shared.frozen.store(true, Ordering::Release);
+        self.shared.active.store(false, Ordering::Release);
+    }
+    pub(crate) fn unfreeze(&self) {
+        if self.shared.frozen.swap(false, Ordering::AcqRel) {
+            self.shared.active.store(true, Ordering::Release);
+            wake(&self.worker.send, self.key, &self.shared);
+        }
+    }
     pub(crate) fn activate(&self) {
-        self.shared.active.store(true, Ordering::Release);
+        if !self.shared.frozen.load(Ordering::Acquire) {
+            self.shared.active.store(true, Ordering::Release);
+        }
     }
     pub(crate) fn shader_frame(&self, active: bool) -> bool {
+        if self.shared.frozen.load(Ordering::Acquire) {
+            return false;
+        }
         let was_active = self.shared.active.swap(active, Ordering::AcqRel);
         let due = active && self.needs_shader_frame();
         if due && !was_active {

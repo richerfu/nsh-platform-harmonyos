@@ -136,6 +136,7 @@ pub(crate) struct Node {
     pub(crate) web: RefCell<Option<crate::media::webview::WebView>>,
     pub(crate) active: Cell<bool>,
     pub(crate) export_repair: Cell<u32>,
+    pub(crate) clearing_export: Cell<bool>,
     pub(crate) bridged_on_root_outer: Cell<bool>,
     pub(crate) retained: Cell<bool>,
     pub(crate) retained_owner: RefCell<Weak<Node>>,

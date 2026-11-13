@@ -13,11 +13,12 @@ impl Node {
     pub(crate) fn desired_visibility(&self) -> i32 {
         if self.retained.get() || !self.header_item_visible() {
             2
-        } else if self
-            .screen
-            .borrow()
-            .as_ref()
-            .is_some_and(|screen| !screen.paint_visible())
+        } else if self.clearing_export.get()
+            || self
+                .screen
+                .borrow()
+                .as_ref()
+                .is_some_and(|screen| !screen.paint_visible())
         {
             1
         } else {
@@ -221,17 +222,13 @@ impl Node {
             .set(style.backface_hidden && m.0[10] < 0.0);
         let visibility = if self.export_repair.get() != 0 {
             0
-        } else if self.retained.get() || !self.header_item_visible() {
-            2
-        } else if self
-            .screen
-            .borrow()
-            .as_ref()
-            .is_some_and(|screen| !screen.paint_visible())
-        {
-            1
         } else {
-            i32::from(style.hidden || self.backface_away.get())
+            let desired = self.desired_visibility();
+            if desired != 0 {
+                desired
+            } else {
+                i32::from(self.backface_away.get())
+            }
         };
         let visibility_changed = applied.visibility != visibility;
         let revealed = visibility_changed && applied.visibility != 0 && visibility == 0;

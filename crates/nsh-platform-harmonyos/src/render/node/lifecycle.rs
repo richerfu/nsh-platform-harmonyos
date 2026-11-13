@@ -69,6 +69,7 @@ impl Node {
             video: RefCell::default(),
             active: Cell::new(true),
             export_repair: Cell::new(0),
+            clearing_export: Cell::new(false),
             bridged_on_root_outer: Cell::new(false),
             retained: Cell::new(false),
             retained_owner: RefCell::default(),
