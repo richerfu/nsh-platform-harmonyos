@@ -358,6 +358,12 @@ pub(crate) fn nsh_attach_native_subtree(
         export.restore();
         return Err(error);
     }
+    if let Err(error) = owner.flush_pending_bridge_reattach_if_direct() {
+        log::warn!("OHOS post-attach bridge reattach failed for target {target_id}: {error}");
+    }
+    if let Err(error) = owner.sync_subtree_scroll_offsets() {
+        log::warn!("OHOS post-attach scroll sync failed for target {target_id}: {error}");
+    }
     if let Err(error) = export.after_attach(&inner) {
         log::warn!("OHOS post-attach export repair failed for target {target_id}: {error}");
     }

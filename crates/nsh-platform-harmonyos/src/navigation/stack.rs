@@ -450,6 +450,7 @@ impl Screen {
             screen.revealed.set(true);
             screen.show()?;
         }
+        previous.sync_subtree_scroll_offsets()?;
         *self.peer.borrow_mut() = Rc::downgrade(&previous);
         Ok(true)
     }

@@ -390,6 +390,134 @@ impl HandoffState {
     }
 }
 
+/// Frame callbacks between detaching a bridged `Screen` from `wrapper.outer`
+/// (`RenderService` pipeline) and re-inserting it into `BuilderNode` (`TextureExport`
+/// pipeline). Matches `texture_export.rs`: two frame callbacks leave one complete
+/// `RenderService` tree rebuild so `wrapper.outer`'s `RSNode::RemoveChild` executes
+/// before `RSNode::SetTextureExport(true)` switches the child's target side.
+pub(crate) const BRIDGE_REATTACH_SETTLE_FRAMES: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BridgeReattachPlan {
+    Immediate,
+    Defer { remaining_frames: u8 },
+}
+
+/// Places a bridged `Screen` after the active `NativeAttachment` child (if mounted on
+/// `wrapper.outer`) and strictly before any `Presentation` (`XComponent`) overlays.
+pub(crate) fn bridge_insert_index(outer_len: usize, target_child_index: Option<usize>) -> usize {
+    target_child_index.map_or(0, |idx| (idx + 1).min(outer_len))
+}
+
+pub(crate) fn plan_bridge_reattach(
+    closed: bool,
+    outer_owned: bool,
+    destination_is_texture_export: bool,
+) -> BridgeReattachPlan {
+    if !closed && outer_owned && destination_is_texture_export {
+        BridgeReattachPlan::Defer {
+            remaining_frames: BRIDGE_REATTACH_SETTLE_FRAMES,
+        }
+    } else {
+        BridgeReattachPlan::Immediate
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingReattachEntry<T> {
+    pub id: u64,
+    pub stack_id: u32,
+    pub peer_id: u32,
+    pub remaining_frames: u8,
+    pub payload: T,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReattachTick<T> {
+    Stale,
+    WaitMore,
+    Complete(T),
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingReattachQueue<T> {
+    next_id: u64,
+    entries: Vec<PendingReattachEntry<T>>,
+}
+
+impl<T> Default for PendingReattachQueue<T> {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> PendingReattachQueue<T> {
+    pub(crate) fn enqueue(
+        &mut self,
+        stack_id: u32,
+        peer_id: u32,
+        remaining_frames: u8,
+        payload: T,
+    ) -> u64 {
+        self.entries.retain(|entry| entry.peer_id != peer_id);
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.entries.push(PendingReattachEntry {
+            id,
+            stack_id,
+            peer_id,
+            remaining_frames: remaining_frames.max(1),
+            payload,
+        });
+        id
+    }
+
+    pub(crate) fn on_frame_callback(&mut self, id: u64) -> ReattachTick<T> {
+        let Some(pos) = self.entries.iter().position(|entry| entry.id == id) else {
+            return ReattachTick::Stale;
+        };
+        if self.entries[pos].remaining_frames > 1 {
+            self.entries[pos].remaining_frames -= 1;
+            ReattachTick::WaitMore
+        } else {
+            ReattachTick::Complete(self.entries.remove(pos).payload)
+        }
+    }
+
+    pub(crate) fn take_by_id(&mut self, id: u64) -> Option<T> {
+        let pos = self.entries.iter().position(|entry| entry.id == id)?;
+        Some(self.entries.remove(pos).payload)
+    }
+
+    pub(crate) fn take_peer(&mut self, peer_id: u32) -> Option<T> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|entry| entry.peer_id == peer_id)?;
+        Some(self.entries.remove(pos).payload)
+    }
+
+    pub(crate) fn take_referencing(&mut self, node_id: u32) -> Vec<T> {
+        let mut taken = Vec::new();
+        let mut i = 0;
+        while i < self.entries.len() {
+            if self.entries[i].peer_id == node_id || self.entries[i].stack_id == node_id {
+                taken.push(self.entries.remove(i).payload);
+            } else {
+                i += 1;
+            }
+        }
+        taken
+    }
+
+    pub(crate) fn drain_all(&mut self) -> Vec<T> {
+        self.entries.drain(..).map(|entry| entry.payload).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,5 +878,78 @@ mod tests {
         let (stopped, gap) = state.note_revealed(t0 + Duration::from_millis(118));
         assert!(stopped);
         assert_eq!(gap, Some((Duration::from_millis(118), GapKind::Mount)));
+    }
+
+    #[test]
+    fn bridge_insert_index_places_peer_after_target_and_before_presentation() {
+        // `[0: DirectRoot, 1: Presentation]` -> insert `peer` at `1` (`[DirectRoot, peer, Presentation]`).
+        assert_eq!(bridge_insert_index(2, Some(0)), 1);
+        // No target child attached yet (`[0: Presentation]`) -> insert `peer` at `0` (`[peer, Presentation]`).
+        assert_eq!(bridge_insert_index(1, None), 0);
+        // Empty `outer` -> `0`.
+        assert_eq!(bridge_insert_index(0, None), 0);
+        // Bounds clamp if target was last child.
+        assert_eq!(bridge_insert_index(1, Some(0)), 1);
+    }
+
+    #[test]
+    fn plan_bridge_reattach_defers_only_for_live_cross_pipeline_export() {
+        assert_eq!(
+            plan_bridge_reattach(false, true, true),
+            BridgeReattachPlan::Defer {
+                remaining_frames: BRIDGE_REATTACH_SETTLE_FRAMES
+            }
+        );
+        assert_eq!(
+            plan_bridge_reattach(false, true, false),
+            BridgeReattachPlan::Immediate
+        );
+        assert_eq!(
+            plan_bridge_reattach(true, true, true),
+            BridgeReattachPlan::Immediate
+        );
+        assert_eq!(
+            plan_bridge_reattach(false, false, true),
+            BridgeReattachPlan::Immediate
+        );
+    }
+
+    #[test]
+    fn pending_reattach_queue_waits_two_frames_and_handles_cancel_and_drain() {
+        let mut queue = PendingReattachQueue::default();
+        let id1 = queue.enqueue(10, 20, BRIDGE_REATTACH_SETTLE_FRAMES, "home");
+
+        // Frame callback 1 (after `outer` flushed RemoveChild on RenderService): wait 1 more frame.
+        assert_eq!(queue.on_frame_callback(id1), ReattachTick::WaitMore);
+        // Frame callback 2 (one complete RS rebuild elapsed): complete reattach into BuilderNode.
+        assert_eq!(queue.on_frame_callback(id1), ReattachTick::Complete("home"));
+        // Subsequent stale callbacks are ignored.
+        assert_eq!(queue.on_frame_callback(id1), ReattachTick::Stale);
+
+        // Unlinking either `peer` or `stack` cancels without re-inserting.
+        let id2 = queue.enqueue(10, 21, BRIDGE_REATTACH_SETTLE_FRAMES, "peer_a");
+        let id3 = queue.enqueue(11, 22, BRIDGE_REATTACH_SETTLE_FRAMES, "peer_b");
+        assert_eq!(queue.take_referencing(21), vec!["peer_a"]);
+        assert_eq!(queue.on_frame_callback(id2), ReattachTick::Stale);
+        // Unlinking an unrelated screen (`screen_owner` id = 99) leaves pending reattach intact.
+        assert!(queue.take_referencing(99).is_empty());
+        assert_eq!(queue.take_referencing(11), vec!["peer_b"]);
+        assert_eq!(queue.on_frame_callback(id3), ReattachTick::Stale);
+
+        // Re-bridging the same `peer`, failed callback fallback (`take_by_id`), or returning to
+        // `DirectRoot` drains cleanly.
+        let id4 = queue.enqueue(10, 30, BRIDGE_REATTACH_SETTLE_FRAMES, "rebridged");
+        assert_eq!(queue.take_peer(30), Some("rebridged"));
+        assert_eq!(queue.on_frame_callback(id4), ReattachTick::Stale);
+
+        let id5 = queue.enqueue(10, 33, BRIDGE_REATTACH_SETTLE_FRAMES, "fallback");
+        assert_eq!(queue.take_by_id(id5), Some("fallback"));
+        assert_eq!(queue.take_by_id(id5), None);
+        assert_eq!(queue.on_frame_callback(id5), ReattachTick::Stale);
+
+        let _ = queue.enqueue(10, 31, BRIDGE_REATTACH_SETTLE_FRAMES, "d1");
+        let _ = queue.enqueue(10, 32, BRIDGE_REATTACH_SETTLE_FRAMES, "d2");
+        assert_eq!(queue.drain_all(), vec!["d1", "d2"]);
+        assert!(queue.drain_all().is_empty());
     }
 }
