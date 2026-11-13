@@ -85,6 +85,7 @@ enum Task {
         key: Key,
         shared: Arc<Shared>,
     },
+    Precompile(Vec<Arc<ShaderLayer>>),
     Fill(super::fill::Command),
     Frame,
     Resume,
@@ -109,7 +110,7 @@ impl Coalesce for Task {
     fn is_barrier(&self) -> bool {
         use super::fill::Command as FillCmd;
         match self {
-            Self::Frame | Self::Resume | Self::Plan | Self::Slot(..) => false,
+            Self::Frame | Self::Resume | Self::Plan | Self::Precompile(_) | Self::Slot(..) => false,
             Self::Fill(FillCmd::Slot(..) | FillCmd::Size(..) | FillCmd::Shown(..)) => false,
             Self::Create { .. }
             | Self::Fill(
@@ -138,6 +139,12 @@ impl Coalesce for Task {
             | (Self::Resume, Some(Self::Resume))
             | (Self::Plan, Some(Self::Plan)) => {
                 incoming.take();
+                true
+            }
+            (Self::Precompile(layers), Some(Self::Precompile(_))) => {
+                if let Some(Self::Precompile(more)) = incoming.take() {
+                    layers.extend(more);
+                }
                 true
             }
             (Self::Slot(k1, id1, s1, v1), Some(Self::Slot(k2, id2, s2, _)))
@@ -249,6 +256,9 @@ impl Worker {
         }
         Ok(slot.as_ref().unwrap().clone())
     }
+    pub(crate) fn precompile(&self, layer: Arc<ShaderLayer>) {
+        let _ = self.send.send(Task::Precompile(vec![layer]));
+    }
     pub(crate) fn fill(&self, command: super::fill::Command) {
         let _ = self.send.send(Task::Fill(command));
     }
@@ -323,6 +333,26 @@ impl Worker {
                                     generation: 0,
                                 });
                                 route.send(Message::Shader);
+                            }
+                        }
+                        Task::Precompile(layers) => {
+                            if gpu.is_none() {
+                                match TextureContext::new() {
+                                    Ok(ctx) => {
+                                        gpu = Some(ctx);
+                                        gpu_error_reported = false;
+                                    }
+                                    Err(error) => {
+                                        log::warn!("shader precompile context: {error}");
+                                    }
+                                }
+                            }
+                            if let Some(gpu) = gpu.as_ref() {
+                                for layer in &layers {
+                                    if let Err(error) = super::gles::precompile(gpu, layer) {
+                                        log::warn!("shader precompile: {error}");
+                                    }
+                                }
                             }
                         }
                         Task::Fill(super::fill::Command::Remove(key)) => {
@@ -425,6 +455,13 @@ impl Worker {
                                     gpu = Some(
                                         TextureContext::new().map_err(|error| error.to_string())?,
                                     );
+                                }
+                                for (_, layer) in &settings.shaders {
+                                    if let Err(error) =
+                                        super::gles::precompile(gpu.as_ref().unwrap(), layer)
+                                    {
+                                        log::warn!("shader precompile: {error}");
+                                    }
                                 }
                                 let mut reader =
                                     TextureReader::with_context(gpu.as_ref().unwrap(), move || {
@@ -1793,6 +1830,9 @@ impl Composite {
             reverse_inputs,
             complete: false,
         }));
+    }
+    pub(crate) fn activate(&self) {
+        self.shared.active.store(true, Ordering::Release);
     }
     pub(crate) fn shader_frame(&self, active: bool) -> bool {
         let was_active = self.shared.active.swap(active, Ordering::AcqRel);

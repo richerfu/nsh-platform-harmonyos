@@ -17,6 +17,54 @@ use rustc_hash::FxHashMap;
 use super::navigation::{CAPTURE_DEADLINE, CaptureDemands, Event, HeldViews, Key, Navigation};
 use crate::render::node::{Node, Result};
 
+pub(super) fn unhidden_chain(node: &Rc<Node>) -> bool {
+    let mut at = Some(node.clone());
+    while let Some(current) = at {
+        if !current.active.get() || current.retained.get() || current.style.borrow().hidden {
+            return false;
+        }
+        at = current.parent_node.borrow().upgrade();
+    }
+    true
+}
+
+pub(super) fn mounted_and_unhidden_in_root(node: &Rc<Node>) -> bool {
+    let mut at = Some(node.clone());
+    let mut reached_root = false;
+    while let Some(current) = at {
+        if !current.active.get() || current.retained.get() || current.style.borrow().hidden {
+            return false;
+        }
+        if current.id == nsh_core::ROOT_ID {
+            reached_root = true;
+            break;
+        }
+        at = current.parent_node.borrow().upgrade();
+    }
+    reached_root
+}
+
+fn enclosing_screen_scope(owner: &Rc<Node>) -> Option<Rc<Node>> {
+    let mut at = Some(owner.clone());
+    let mut scope: Option<Rc<Node>> = None;
+    let mut root: Option<Rc<Node>> = None;
+    while let Some(current) = at {
+        if !current.active.get() || current.retained.get() {
+            return None;
+        }
+        if scope.is_none() && matches!(current.kind, ViewKind::Screen | ViewKind::Modal) {
+            scope = Some(current.clone());
+        }
+        if current.id == nsh_core::ROOT_ID {
+            root = Some(current);
+            break;
+        }
+        at = current.parent_node.borrow().upgrade();
+    }
+    let root = root?;
+    Some(scope.unwrap_or(root))
+}
+
 #[derive(Default)]
 pub(super) struct Effects {
     root: RefCell<Weak<Node>>,
@@ -25,7 +73,14 @@ pub(super) struct Effects {
     demands: RefCell<CaptureDemands>,
     held: RefCell<HeldViews>,
     capture_nodes: RefCell<FxHashMap<NodeId, Weak<Node>>>,
+    capable_nodes: RefCell<FxHashMap<NodeId, (Weak<Node>, f32)>>,
+    screen_effect_owners: RefCell<FxHashMap<NodeId, Weak<Node>>>,
+    screen_scopes: RefCell<FxHashMap<NodeId, Weak<Node>>>,
+    root_max_overflow: Cell<f32>,
+    keep_alive_active: RefCell<FxHashMap<NodeId, bool>>,
+    was_surface_active: Cell<bool>,
     logged_state: Cell<Option<(usize, usize)>>,
+    logged_hosts: Cell<Option<(usize, usize, usize, usize)>>,
 }
 
 struct State {
@@ -48,12 +103,229 @@ struct PendingNavigation {
 }
 
 impl Effects {
-    fn surface_active(&self) -> bool {
+    pub(super) fn surface_active(&self) -> bool {
         self.root.borrow().upgrade().is_some_and(|root| {
-            root.dispatcher
-                .upgrade()
-                .is_some_and(|d| d.active.load(Ordering::Acquire))
+            root.platform.get().lifecycle != nsh_engine::Lifecycle::Background
+                && root
+                    .dispatcher
+                    .upgrade()
+                    .is_some_and(|d| d.active.load(Ordering::Acquire))
         })
+    }
+
+    pub(super) fn root_node(&self) -> Option<Rc<Node>> {
+        self.root.borrow().upgrade()
+    }
+
+    pub(super) fn keep_alive(&self, id: NodeId) -> bool {
+        self.keep_alive_active
+            .borrow()
+            .get(&id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn max_overflow(&self, id: NodeId) -> f32 {
+        let own = self
+            .capable_nodes
+            .borrow()
+            .get(&id)
+            .map_or(0.0, |&(_, overflow)| overflow);
+        if id == nsh_core::ROOT_ID {
+            own.max(self.root_max_overflow.get())
+        } else {
+            own
+        }
+    }
+
+    pub(super) fn has_navigation_layer(&self, target_id: NodeId) -> bool {
+        self.views.borrow().values().any(|state| {
+            state.navigation.is_some()
+                && state
+                    .target
+                    .upgrade()
+                    .is_some_and(|target| target.id == target_id)
+        })
+    }
+
+    fn count_active_composites(root_node: Option<&Rc<Node>>) -> usize {
+        root_node.map_or(0, |root| {
+            root.composite_nodes
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|node| {
+                    node.active.get()
+                        && node.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                            wrapper.composite.borrow().is_some() && !wrapper.retiring_export()
+                        })
+                })
+                .count()
+        })
+    }
+
+    pub(super) fn reconcile_hosts(&self, has_fill_in_root: bool, fill_count: usize) -> Result<()> {
+        let root_node = self.root.borrow().upgrade();
+        let active_surface = self.surface_active();
+        let surface_changed = self.was_surface_active.replace(active_surface) != active_surface;
+
+        {
+            let mut owners = self.screen_effect_owners.borrow_mut();
+            let mut scopes = self.screen_scopes.borrow_mut();
+            owners.retain(|_, weak| {
+                let Some(owner) = weak.upgrade() else {
+                    return false;
+                };
+                if !owner.active.get() || owner.retained.get() {
+                    return false;
+                }
+                if let Some(scope) = enclosing_screen_scope(&owner) {
+                    scopes.insert(scope.id, Rc::downgrade(&scope));
+                }
+                true
+            });
+            scopes.retain(|_, weak| {
+                weak.upgrade()
+                    .is_some_and(|scope| scope.active.get() && !scope.retained.get())
+            });
+        }
+
+        let mut capable_list = Vec::new();
+        {
+            let mut capable = self.capable_nodes.borrow_mut();
+            capable.retain(|&id, (weak, _)| {
+                let Some(node) = weak.upgrade() else {
+                    return false;
+                };
+                if !node.active.get() || node.retained.get() {
+                    return false;
+                }
+                capable_list.push((id, node));
+                true
+            });
+        }
+
+        let has_screen_views = self.views.borrow().values().any(|state| {
+            state.navigation.is_none()
+                && matches!(
+                    state.layer.role,
+                    ShaderRole::Screen | ShaderRole::ScreenTransition
+                )
+        });
+        if !has_screen_views
+            && self.screen_effect_owners.borrow().is_empty()
+            && self.screen_scopes.borrow().is_empty()
+        {
+            self.root_max_overflow.set(0.0);
+        }
+
+        let mut desired: FxHashMap<NodeId, (Rc<Node>, bool)> = FxHashMap::default();
+        for (id, node) in capable_list {
+            let keep = active_surface && mounted_and_unhidden_in_root(&node);
+            desired.insert(id, (node, keep));
+        }
+
+        if let Some(root) = &root_node {
+            let has_non_nav_effect_in_root = self.views.borrow().values().any(|state| {
+                state.navigation.is_none()
+                    && state
+                        .owner
+                        .upgrade()
+                        .is_some_and(|owner| mounted_and_unhidden_in_root(&owner))
+            });
+            let has_screen_scope = self
+                .screen_scopes
+                .borrow()
+                .values()
+                .filter_map(Weak::upgrade)
+                .any(|scope| mounted_and_unhidden_in_root(&scope));
+            let root_capable = desired.get(&root.id).is_some_and(|&(_, keep)| keep);
+            let root_keep = active_surface
+                && mounted_and_unhidden_in_root(root)
+                && (has_fill_in_root
+                    || has_non_nav_effect_in_root
+                    || has_screen_scope
+                    || root_capable);
+            desired.insert(root.id, (root.clone(), root_keep));
+        }
+
+        let mut to_refresh: Vec<Rc<Node>> = Vec::new();
+        {
+            let mut active_map = self.keep_alive_active.borrow_mut();
+            let stale_keys: Vec<NodeId> = active_map
+                .keys()
+                .copied()
+                .filter(|id| !desired.contains_key(id))
+                .collect();
+            for id in stale_keys {
+                active_map.remove(&id);
+            }
+            for (&id, (node, keep)) in &desired {
+                let prev = active_map.get(&id).copied().unwrap_or(false);
+                if *keep {
+                    active_map.insert(id, true);
+                } else {
+                    active_map.remove(&id);
+                }
+                if prev != *keep || surface_changed {
+                    to_refresh.push(node.clone());
+                }
+            }
+        }
+
+        if surface_changed {
+            let extra_targets: Vec<Rc<Node>> = self
+                .views
+                .borrow()
+                .values()
+                .filter_map(|state| state.target.upgrade())
+                .filter(|target| !to_refresh.iter().any(|n| n.id == target.id))
+                .collect();
+            to_refresh.extend(extra_targets);
+        }
+
+        for node in to_refresh {
+            node.invalidate_composites();
+            if let Some(scene) = node.scene.borrow().as_ref() {
+                scene.require(&node);
+            }
+            if node.active.get() {
+                node.ensure_wrapper()?;
+                node.restore_style()?;
+            }
+        }
+
+        let active_composites = Self::count_active_composites(root_node.as_ref());
+        let (keep_alive_hosts, passthrough_hosts) = {
+            let active_map = self.keep_alive_active.borrow();
+            let mut keep_count = 0usize;
+            let mut passthrough_count = 0usize;
+            for (&id, &keep) in active_map.iter() {
+                if !keep {
+                    continue;
+                }
+                keep_count += 1;
+                let empty_layers = desired
+                    .get(&id)
+                    .is_some_and(|(node, _)| node.shader_layers.borrow().is_empty());
+                if empty_layers {
+                    passthrough_count += 1;
+                }
+            }
+            (keep_count, passthrough_count)
+        };
+        let snap = (
+            active_composites,
+            keep_alive_hosts,
+            passthrough_hosts,
+            fill_count,
+        );
+        if self.logged_hosts.replace(Some(snap)) != Some(snap) {
+            log::info!(
+                "[NSH] shader-hosts active_composites={active_composites} keep_alive_hosts={keep_alive_hosts} passthrough_hosts={passthrough_hosts} fill_views={fill_count}"
+            );
+        }
+        Ok(())
     }
 
     fn cancel_on_worker(&self, keys: &[Key]) {
@@ -71,13 +343,9 @@ impl Effects {
 
     fn sync_capture_roots(&self, reason: &str, force_log: bool) -> Result<()> {
         let root_node = self.root.borrow().upgrade();
-        let allow_capture = root_node.as_ref().is_some_and(|root| {
-            !root.platform.get().reduce_motion
-                && root
-                    .dispatcher
-                    .upgrade()
-                    .is_some_and(|d| d.active.load(Ordering::Acquire))
-        });
+        let allow_capture = root_node
+            .as_ref()
+            .is_some_and(|root| !root.platform.get().reduce_motion && self.surface_active());
         let active_demands = self.demands.borrow().len();
 
         let mut candidates: Vec<(NodeId, Rc<Node>, bool)> = Vec::new();
@@ -282,8 +550,38 @@ impl Effects {
         layer: Arc<ShaderLayer>,
         navigation: Option<Rc<Navigation>>,
     ) -> Result<()> {
-        if navigation.is_none() {
+        let is_non_nav = navigation.is_none();
+        if is_non_nav {
             self.held.borrow_mut().remove_view(owner.id);
+            if let Ok(worker) = crate::render::composition::worker::Worker::for_owner(target) {
+                worker.precompile(layer.clone());
+            }
+            let overflow = layer.overflow.0.max(0.0);
+            if matches!(
+                layer.role,
+                ShaderRole::Screen | ShaderRole::ScreenTransition
+            ) {
+                self.screen_effect_owners
+                    .borrow_mut()
+                    .insert(owner.id, Rc::downgrade(owner));
+                if let Some(scope) = enclosing_screen_scope(owner) {
+                    self.screen_scopes
+                        .borrow_mut()
+                        .insert(scope.id, Rc::downgrade(&scope));
+                }
+                self.root_max_overflow
+                    .set(self.root_max_overflow.get().max(overflow));
+            } else {
+                let mut capable = self.capable_nodes.borrow_mut();
+                let entry = capable
+                    .entry(target.id)
+                    .or_insert_with(|| (Rc::downgrade(target), 0.0));
+                entry.0 = Rc::downgrade(target);
+                entry.1 = entry.1.max(overflow);
+            }
+            if self.surface_active() && unhidden_chain(owner) && unhidden_chain(target) {
+                self.keep_alive_active.borrow_mut().insert(target.id, true);
+            }
         }
         let moved = self.views.borrow().get(&owner.id).is_some_and(|state| {
             state
@@ -306,13 +604,35 @@ impl Effects {
                 transition_until: Cell::new(None),
             },
         );
-        {
+        let already_revealed = target.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+            wrapper
+                .composite
+                .borrow()
+                .as_ref()
+                .is_some_and(|composite| composite.is_revealed())
+        });
+        let (changed_layers, layer_count) = {
             let mut layers = target.shader_layers.borrow_mut();
-            if let Some((_, old)) = layers.iter_mut().find(|(id, _)| *id == owner.id) {
-                *old = layer;
+            let changed = if let Some((_, old)) = layers.iter_mut().find(|(id, _)| *id == owner.id)
+            {
+                if *old != layer {
+                    *old = layer;
+                    true
+                } else {
+                    false
+                }
             } else {
                 layers.push((owner.id, layer));
-            }
+                true
+            };
+            (changed, layers.len())
+        };
+        if is_non_nav && already_revealed && changed_layers {
+            log::info!(
+                "[NSH] shader-layer-swap node={} layers={} passthrough=false",
+                target.id,
+                layer_count,
+            );
         }
         target.invalidate_composites();
         if let Some(scene) = target.scene.borrow().as_ref() {
@@ -330,10 +650,30 @@ impl Effects {
         if let Some(state) = state
             && let Some(target) = state.target.upgrade()
         {
-            target
-                .shader_layers
-                .borrow_mut()
-                .retain(|(owner, _)| *owner != id);
+            let is_non_nav = state.navigation.is_none();
+            let (changed, next_len) = {
+                let mut layers = target.shader_layers.borrow_mut();
+                let prev_len = layers.len();
+                layers.retain(|(owner, _)| *owner != id);
+                let next_len = layers.len();
+                (next_len != prev_len, next_len)
+            };
+            if changed
+                && let Some(wrapper) = target.wrapper.borrow().as_ref()
+                && let Some(composite) = wrapper.composite.borrow().as_ref()
+            {
+                if next_len == 0 {
+                    composite.activate();
+                }
+                if is_non_nav && composite.is_revealed() && self.keep_alive(target.id) {
+                    log::info!(
+                        "[NSH] shader-layer-swap node={} layers={} passthrough={}",
+                        target.id,
+                        next_len,
+                        next_len == 0,
+                    );
+                }
+            }
             target.invalidate_composites();
             if let Some(scene) = target.scene.borrow().as_ref() {
                 scene.require(&target);
@@ -952,7 +1292,7 @@ impl Effects {
                 // even when its declaring page is behind another page. This
                 // matches UIKit/AppKit and keeps the root's render ownership
                 // stable throughout a navigation.
-                attached
+                attached && unhidden_chain(&owner)
             };
             if active != state.active.replace(active) {
                 target
@@ -974,6 +1314,28 @@ impl Effects {
             }
             let shown = active && (state.navigation.is_some() || super::in_sight(&target));
             let entry = targets.entry(target.id).or_insert((target, false));
+            entry.1 |= shown;
+        }
+        let keep_hosts: Vec<Rc<Node>> = {
+            let root = self.root.borrow().upgrade();
+            let capable = self.capable_nodes.borrow();
+            self.keep_alive_active
+                .borrow()
+                .iter()
+                .filter(|(_, keep)| **keep)
+                .filter_map(|(&id, _)| {
+                    if id == nsh_core::ROOT_ID {
+                        root.clone()
+                    } else {
+                        capable.get(&id).and_then(|(weak, _)| weak.upgrade())
+                    }
+                })
+                .filter(|node| node.active.get())
+                .collect()
+        };
+        for host in keep_hosts {
+            let shown = super::in_sight(&host);
+            let entry = targets.entry(host.id).or_insert((host, false));
             entry.1 |= shown;
         }
         // Keep demanded picture roots active on the compositor while awaiting

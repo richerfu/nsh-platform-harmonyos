@@ -53,6 +53,11 @@ pub(crate) fn resolve_visual_opacity(
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EffectsContext {
     pub(crate) has_shaders: bool,
+    /// Keeps a shader-capable node (or `ROOT_ID` while a shader page/scope is
+    /// mounted and visible) in `Composite` identity-passthrough mode when its
+    /// active shader layers are toggled off, avoiding `DirectRoot <-> TextureContainer`
+    /// cutovers across toggles.
+    pub(crate) shader_keep_alive: bool,
     pub(crate) shader_samples_backdrop: bool,
     pub(crate) navigation_capture: bool,
     pub(crate) scene_active: bool,
@@ -92,10 +97,12 @@ impl EffectsPlan {
         let non_blur_backdrop = has_non_blur_filter(backdrop_filters);
 
         // When a node exports its own subtree to `RENDER_TYPE_TEXTURE` (for
-        // non-blur CSS filters or shader layers), `self.native` renders into an
-        // isolated transparent buffer and cannot sample the window backdrop via
-        // `Attribute::BackdropBlur`; `Scene` must composite the backdrop instead.
-        let own_texture = non_blur_filter || ctx.has_shaders || ctx.navigation_capture;
+        // non-blur CSS filters, active shader layers, or shader keep-alive
+        // passthrough), `self.native` renders into an isolated transparent
+        // buffer and cannot sample the window backdrop via `Attribute::BackdropBlur`;
+        // `Scene` must composite the backdrop instead.
+        let own_texture =
+            non_blur_filter || ctx.has_shaders || ctx.shader_keep_alive || ctx.navigation_capture;
         let requires_scene = style.blend_mode == BlendMode::PlusDarker
             || ctx.shader_samples_backdrop
             || has_masks
@@ -106,7 +113,8 @@ impl EffectsPlan {
         let requires_texture = ctx.navigation_capture
             || (ctx.scene_active && ctx.has_native_paint)
             || non_blur_filter
-            || ctx.has_shaders;
+            || ctx.has_shaders
+            || ctx.shader_keep_alive;
 
         let native_active = !ctx.scene_active && !requires_texture && !ctx.composite_active;
         let mut native_blur = 0.0;
@@ -332,6 +340,47 @@ mod tests {
         // Releasing the last demand restores the native path.
         let restored = EffectsPlan::compute(&backdrop_style, EffectsContext::default());
         assert_eq!(restored, idle_backdrop);
+    }
+
+    #[test]
+    fn shader_keep_alive_maintains_texture_export_in_passthrough_and_retires_when_cleared() {
+        let plain = ViewStyle::default();
+        let passthrough = EffectsPlan::compute(
+            &plain,
+            EffectsContext {
+                shader_keep_alive: true,
+                composite_active: true,
+                ..EffectsContext::default()
+            },
+        );
+        assert!(passthrough.requires_texture);
+        assert!(!passthrough.requires_scene);
+
+        // If the shader-capable node itself also carries a pure blur filter, GLES
+        // continues owning the blur while passthrough Composite stays active.
+        let blurred = ViewStyle {
+            effects: Some(Arc::new(Effects {
+                filters: vec![Filter::Blur(Points(6.0))],
+                ..Default::default()
+            })),
+            ..ViewStyle::default()
+        };
+        let passthrough_blur = EffectsPlan::compute(
+            &blurred,
+            EffectsContext {
+                shader_keep_alive: true,
+                composite_active: true,
+                ..EffectsContext::default()
+            },
+        );
+        assert!(passthrough_blur.requires_texture);
+        assert_eq!(passthrough_blur.native_blur, 0.0);
+
+        // Unmount / visibility-gone / background clears `shader_keep_alive`,
+        // retiring the export back to native.
+        let retired = EffectsPlan::compute(&plain, EffectsContext::default());
+        assert!(!retired.requires_texture);
+        assert!(!retired.requires_scene);
     }
 
     #[test]

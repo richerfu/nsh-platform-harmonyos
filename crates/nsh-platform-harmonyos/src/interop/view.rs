@@ -581,26 +581,37 @@ impl Wrapper {
             .borrow()
             .as_ref()
             .map(|previous| previous.texture_surface.is_some());
+        let is_root = owner.id == nsh_core::ROOT_ID;
         let has_mounted_child = matches!(self.with_child(|_| ()), Ok(Some(())));
+        let has_mounted_direct = previous_texture == Some(false) && has_mounted_child;
         let revealed = owner.is_handoff_revealed(self);
         let export_requested = if owner.scene_active() {
             owner.scene_root.get() && self.composite.borrow().is_some()
         } else {
             self.composite.borrow().is_some()
         };
+        if previous_texture.is_none() && !is_root && export_requested && desired_surface.is_none() {
+            self.handoff.borrow_mut().begin_mount_export(now);
+            return Ok(false);
+        }
+        let is_mount_or_prewarm = !has_mounted_direct
+            || (owner.shaders.keep_alive(owner.id) && owner.shader_layers.borrow().is_empty());
         let inputs = crate::interop::handoff::HandoffInputs {
             closed: self.closed.get(),
             fill: owner.placeholder_fill(),
-            has_mounted_direct: previous_texture == Some(false) && has_mounted_child,
+            is_root,
+            is_mount_or_prewarm,
+            has_mounted_direct,
             active_target_is_texture: previous_texture == Some(true),
             export_requested,
             desired_surface_ready: desired_surface.is_some(),
             revealed,
         };
         let (mut outcome, finished_gap) = self.handoff.borrow_mut().prepare_target(inputs, now);
-        if let Some((gap, gap_outcome)) = finished_gap {
+        if let Some((gap, gap_outcome, gap_kind)) = finished_gap {
             log::info!(
-                "[NSH] handoff-gap ms={:.1} node={} outcome={}",
+                "[NSH] {} ms={:.1} node={} outcome={}",
+                gap_kind.log_tag(),
                 gap.as_secs_f64() * 1000.0,
                 owner.id,
                 gap_outcome.as_str(),
@@ -889,24 +900,26 @@ impl Node {
         }
         let mut created_composite = false;
         if !requires_texture {
-            let cancel_unrevealed = self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
-                wrapper
-                    .composite
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|composite| !composite.is_revealed())
-            });
-            if cancel_unrevealed {
+            let immediate_retire = !self.shaders.surface_active()
+                || self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                    wrapper
+                        .composite
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|composite| !composite.is_revealed())
+                });
+            if immediate_retire {
                 if let Some(wrapper) = self.wrapper.borrow().as_ref() {
                     wrapper.retiring.set(None);
-                    wrapper.composite.borrow_mut().take();
-                    wrapper
-                        .outer
-                        .borrow()
-                        .mark_dirty(NodeDirtyFlag::NeedRender)?;
+                    if wrapper.composite.borrow_mut().take().is_some() {
+                        wrapper
+                            .outer
+                            .borrow()
+                            .mark_dirty(NodeDirtyFlag::NeedRender)?;
+                        self.composite_dirty.set(true);
+                        self.restore_style()?;
+                    }
                 }
-                self.composite_dirty.set(true);
-                self.restore_style()?;
             } else {
                 let start_generation = self.wrapper.borrow().as_ref().and_then(|wrapper| {
                     let generation = wrapper.composite.borrow().as_ref()?.generation;
@@ -1061,9 +1074,10 @@ impl Node {
                         .handoff
                         .borrow_mut()
                         .note_revealed(std::time::Instant::now());
-                    if let Some(gap) = gap {
+                    if let Some((gap, gap_kind)) = gap {
                         log::info!(
-                            "[NSH] handoff-gap ms={:.1} node={} outcome=revealed",
+                            "[NSH] {} ms={:.1} node={} outcome=revealed",
+                            gap_kind.log_tag(),
                             gap.as_secs_f64() * 1000.0,
                             self.id,
                         );

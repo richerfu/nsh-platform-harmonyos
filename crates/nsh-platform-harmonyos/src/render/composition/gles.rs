@@ -296,7 +296,85 @@ struct Program {
     buffers: [glow::Buffer; 2],
     empty: Target,
 }
+pub(super) fn precompile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<()> {
+    Program::compile(gpu, layer).map(|_| ())
+}
+
 impl Program {
+    fn compile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<Rc<Compiled>> {
+        let _current = gpu.context.enter()?;
+        let gl = &gpu.gl;
+        // SAFETY: validated core-generated GLSL and all program objects are
+        // compiled and used exclusively on this worker's current context.
+        unsafe {
+            if let Some(cached) = gpu.programs.borrow().get(&layer.shader.hash()).cloned() {
+                return Ok(cached);
+            }
+            let source = layer
+                .shader
+                .glsl_es()
+                .map_err(|e| Error::Shader(e.to_string()))?;
+            let native = gl.create_program()?;
+            let compile = || -> Result<()> {
+                for (kind, source) in [
+                    (glow::VERTEX_SHADER, &source.vertex),
+                    (glow::FRAGMENT_SHADER, &source.fragment),
+                ] {
+                    let shader = gl.create_shader(kind)?;
+                    gl.shader_source(shader, source);
+                    gl.compile_shader(shader);
+                    if !gl.get_shader_compile_status(shader) {
+                        let error = gl.get_shader_info_log(shader);
+                        gl.delete_shader(shader);
+                        return Err(Error::Shader(error));
+                    }
+                    gl.attach_shader(native, shader);
+                    gl.delete_shader(shader);
+                }
+                gl.link_program(native);
+                if !gl.get_program_link_status(native) {
+                    return Err(Error::Shader(gl.get_program_info_log(native)));
+                }
+                Ok(())
+            };
+            if let Err(error) = compile() {
+                gl.delete_program(native);
+                return Err(error);
+            }
+            for (binding, name) in [
+                source.builtins_block.as_deref(),
+                source.uniforms_block.as_deref(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some(name) = name
+                    && let Some(index) = gl.get_uniform_block_index(native, name)
+                {
+                    gl.uniform_block_binding(native, index, binding as u32);
+                }
+            }
+            let pictures = source
+                .pictures
+                .iter()
+                .filter_map(|(name, input)| {
+                    gl.get_uniform_location(native, name)
+                        .map(|location| (location, *input))
+                })
+                .collect();
+            let compiled = Rc::new(Compiled {
+                context: gpu.context.clone(),
+                gl: gpu.gl.clone(),
+                native,
+                pictures,
+            });
+            gpu.programs
+                .borrow_mut()
+                .insert(layer.shader.hash(), compiled.clone());
+            Ok(compiled)
+        }
+    }
+
     fn new(gpu: &TextureContext, layer: &ShaderLayer) -> Result<Self> {
         let empty = Target::upload(
             gpu,
@@ -306,78 +384,11 @@ impl Program {
                 pixels: vec![0; 4],
             },
         )?;
+        let compiled = Self::compile(gpu, layer)?;
         let _current = gpu.context.enter()?;
         let gl = &gpu.gl;
-        // SAFETY: validated core-generated GLSL and all program/buffer objects
-        // are compiled and used exclusively on this worker's current context.
+        // SAFETY: buffer objects belong exclusively to this worker's current context.
         unsafe {
-            let cached = gpu.programs.borrow().get(&layer.shader.hash()).cloned();
-            let compiled = if let Some(cached) = cached {
-                cached
-            } else {
-                let source = layer
-                    .shader
-                    .glsl_es()
-                    .map_err(|e| Error::Shader(e.to_string()))?;
-                let native = gl.create_program()?;
-                let compile = || -> Result<()> {
-                    for (kind, source) in [
-                        (glow::VERTEX_SHADER, &source.vertex),
-                        (glow::FRAGMENT_SHADER, &source.fragment),
-                    ] {
-                        let shader = gl.create_shader(kind)?;
-                        gl.shader_source(shader, source);
-                        gl.compile_shader(shader);
-                        if !gl.get_shader_compile_status(shader) {
-                            let error = gl.get_shader_info_log(shader);
-                            gl.delete_shader(shader);
-                            return Err(Error::Shader(error));
-                        }
-                        gl.attach_shader(native, shader);
-                        gl.delete_shader(shader);
-                    }
-                    gl.link_program(native);
-                    if !gl.get_program_link_status(native) {
-                        return Err(Error::Shader(gl.get_program_info_log(native)));
-                    }
-                    Ok(())
-                };
-                if let Err(error) = compile() {
-                    gl.delete_program(native);
-                    return Err(error);
-                }
-                for (binding, name) in [
-                    source.builtins_block.as_deref(),
-                    source.uniforms_block.as_deref(),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    if let Some(name) = name
-                        && let Some(index) = gl.get_uniform_block_index(native, name)
-                    {
-                        gl.uniform_block_binding(native, index, binding as u32);
-                    }
-                }
-                let pictures = source
-                    .pictures
-                    .iter()
-                    .filter_map(|(name, input)| {
-                        gl.get_uniform_location(native, name)
-                            .map(|location| (location, *input))
-                    })
-                    .collect();
-                let compiled = Rc::new(Compiled {
-                    context: gpu.context.clone(),
-                    gl: gpu.gl.clone(),
-                    native,
-                    pictures,
-                });
-                gpu.programs
-                    .borrow_mut()
-                    .insert(layer.shader.hash(), compiled.clone());
-                compiled
-            };
             let first = match gl.create_buffer() {
                 Ok(b) => b,
                 Err(e) => {
@@ -511,6 +522,9 @@ impl Effects {
     pub(super) fn layers(&mut self, layers: &[(NodeId, Arc<ShaderLayer>)]) -> Result<()> {
         self.views
             .retain(|view| layers.iter().any(|(id, _)| *id == view.id));
+        if self.shown.is_some_and(|index| index >= self.views.len()) {
+            self.direct_output = false;
+        }
         for (index, (id, layer)) in layers.iter().enumerate() {
             if let Some(at) = self.views.iter().position(|view| view.id == *id) {
                 self.views.swap(index, at);

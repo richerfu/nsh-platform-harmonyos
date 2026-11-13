@@ -133,13 +133,31 @@ impl Node {
             self.interaction.invalidate_opacity();
         }
     }
+    fn unhidden_for_effects(&self, style: &ViewStyle) -> bool {
+        if !self.active.get() || self.retained.get() || style.hidden {
+            return false;
+        }
+        let mut at = self.parent_node.borrow().upgrade();
+        while let Some(current) = at {
+            if !current.active.get() || current.retained.get() || current.style.borrow().hidden {
+                return false;
+            }
+            at = current.parent_node.borrow().upgrade();
+        }
+        true
+    }
     pub(crate) fn effects_plan_for(
         &self,
         style: &ViewStyle,
     ) -> crate::render::effects::EffectsPlan {
+        let surface_active = self.shaders.surface_active();
+        let unhidden = surface_active && self.unhidden_for_effects(style);
         let shaders = self.shader_layers.borrow();
-        let has_shaders = !shaders.is_empty();
-        let shader_samples_backdrop = self.id != nsh_core::ROOT_ID
+        let has_shaders = !shaders.is_empty()
+            && surface_active
+            && (unhidden || self.shaders.has_navigation_layer(self.id));
+        let shader_samples_backdrop = has_shaders
+            && self.id != nsh_core::ROOT_ID
             && shaders.iter().any(|(_, layer)| {
                 layer
                     .shader
@@ -147,6 +165,7 @@ impl Node {
                     .contains(nsh_core::shader::ShaderInput::Backdrop)
             });
         drop(shaders);
+        let shader_keep_alive = unhidden && self.shaders.keep_alive(self.id);
         let composite_active = self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
             wrapper
                 .composite
@@ -158,8 +177,9 @@ impl Node {
             style,
             crate::render::effects::EffectsContext {
                 has_shaders,
+                shader_keep_alive,
                 shader_samples_backdrop,
-                navigation_capture: self.navigation_capture.get(),
+                navigation_capture: surface_active && self.navigation_capture.get(),
                 scene_active: self.scene_active(),
                 composite_active,
                 has_native_paint: self.has_native_paint(style),

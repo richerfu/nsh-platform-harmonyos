@@ -30,6 +30,8 @@ pub(crate) struct PlaceholderFill {
 pub(crate) struct HandoffInputs {
     pub closed: bool,
     pub fill: Option<PlaceholderFill>,
+    pub is_root: bool,
+    pub is_mount_or_prewarm: bool,
     pub has_mounted_direct: bool,
     pub active_target_is_texture: bool,
     pub export_requested: bool,
@@ -67,6 +69,22 @@ impl GapOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GapKind {
+    Mount,
+    #[default]
+    FallbackCutover,
+}
+
+impl GapKind {
+    pub(crate) fn log_tag(self) -> &'static str {
+        match self {
+            Self::Mount => "shader-mount-gap",
+            Self::FallbackCutover => "handoff-gap",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CommitGate {
     #[default]
     Idle,
@@ -88,6 +106,9 @@ pub(crate) struct HandoffState {
     placeholder_active: bool,
     last_fill: Option<PlaceholderFill>,
     was_texture: bool,
+    in_handoff: bool,
+    mount_hidden: bool,
+    gap_kind: GapKind,
     gap_started_at: Option<Instant>,
 }
 
@@ -100,20 +121,34 @@ impl HandoffState {
         }
     }
 
+    pub(crate) fn begin_mount_export(&mut self, now: Instant) {
+        if !self.in_handoff {
+            self.in_handoff = true;
+            self.mount_hidden = true;
+            self.gap_kind = GapKind::Mount;
+        }
+        self.gap_started_at.get_or_insert(now);
+    }
+
     pub(crate) fn prepare_target(
         &mut self,
         inputs: HandoffInputs,
         now: Instant,
-    ) -> (PrepareOutcome, Option<(Duration, GapOutcome)>) {
+    ) -> (PrepareOutcome, Option<(Duration, GapOutcome, GapKind)>) {
         if inputs.closed || !inputs.export_requested {
+            let kind = self.gap_kind;
             let gap = self.gap_started_at.take().map(|started| {
                 (
                     now.saturating_duration_since(started),
                     GapOutcome::Cancelled,
+                    kind,
                 )
             });
             self.gate = CommitGate::Idle;
             self.callback_in_flight = None;
+            self.in_handoff = false;
+            self.mount_hidden = false;
+            self.gap_kind = GapKind::FallbackCutover;
             self.was_texture = inputs.active_target_is_texture;
             let repaint_outer = std::mem::replace(&mut self.placeholder_active, false);
             self.last_fill = None;
@@ -128,12 +163,19 @@ impl HandoffState {
         }
 
         if inputs.revealed {
-            let gap = self
-                .gap_started_at
-                .take()
-                .map(|started| (now.saturating_duration_since(started), GapOutcome::Revealed));
+            let kind = self.gap_kind;
+            let gap = self.gap_started_at.take().map(|started| {
+                (
+                    now.saturating_duration_since(started),
+                    GapOutcome::Revealed,
+                    kind,
+                )
+            });
             self.gate = CommitGate::Idle;
             self.callback_in_flight = None;
+            self.in_handoff = false;
+            self.mount_hidden = false;
+            self.gap_kind = GapKind::FallbackCutover;
             self.was_texture = inputs.active_target_is_texture;
             let repaint_outer = std::mem::replace(&mut self.placeholder_active, false);
             self.last_fill = None;
@@ -144,6 +186,33 @@ impl HandoffState {
                     arm_frame_callback: None,
                 },
                 gap,
+            );
+        }
+
+        if !self.in_handoff {
+            self.in_handoff = true;
+            self.mount_hidden =
+                !inputs.has_mounted_direct && !inputs.is_root && !inputs.active_target_is_texture;
+            self.gap_kind = if inputs.is_mount_or_prewarm {
+                GapKind::Mount
+            } else {
+                GapKind::FallbackCutover
+            };
+        }
+
+        if self.mount_hidden {
+            self.gate = CommitGate::Committed;
+            self.callback_in_flight = None;
+            self.gap_started_at.get_or_insert(now);
+            let repaint_outer = std::mem::replace(&mut self.placeholder_active, false);
+            self.last_fill = None;
+            return (
+                PrepareOutcome {
+                    hold_direct_target: false,
+                    repaint_outer,
+                    arm_frame_callback: None,
+                },
+                None,
             );
         }
 
@@ -280,20 +349,24 @@ impl HandoffState {
         now: Instant,
     ) {
         if !self.was_texture && active_target_is_texture && !revealed {
-            self.gap_started_at = Some(now);
+            self.gap_started_at.get_or_insert(now);
         }
         self.was_texture = active_target_is_texture;
     }
 
-    pub(crate) fn note_revealed(&mut self, now: Instant) -> (bool, Option<Duration>) {
+    pub(crate) fn note_revealed(&mut self, now: Instant) -> (bool, Option<(Duration, GapKind)>) {
+        let kind = self.gap_kind;
         self.gate = CommitGate::Idle;
         self.callback_in_flight = None;
+        self.in_handoff = false;
+        self.mount_hidden = false;
+        self.gap_kind = GapKind::FallbackCutover;
         let stopped_placeholder = std::mem::replace(&mut self.placeholder_active, false);
         self.last_fill = None;
         let gap = self
             .gap_started_at
             .take()
-            .map(|started| now.saturating_duration_since(started));
+            .map(|started| (now.saturating_duration_since(started), kind));
         (stopped_placeholder, gap)
     }
 
@@ -303,6 +376,9 @@ impl HandoffState {
         self.placeholder_active = false;
         self.last_fill = None;
         self.was_texture = false;
+        self.in_handoff = false;
+        self.mount_hidden = false;
+        self.gap_kind = GapKind::FallbackCutover;
         self.gap_started_at = None;
         self.generation = self.generation.wrapping_add(1);
     }
@@ -321,6 +397,8 @@ mod tests {
         HandoffInputs {
             closed: false,
             fill: Some(DARK_BG),
+            is_root: false,
+            is_mount_or_prewarm: false,
             has_mounted_direct: true,
             active_target_is_texture: false,
             export_requested: false,
@@ -386,7 +464,11 @@ mod tests {
         let reveal_at = detach_at + Duration::from_millis(180);
         let (stopped, gap) = state.note_revealed(reveal_at);
         assert!(stopped);
-        assert_eq!(gap, Some(Duration::from_millis(180)));
+        assert_eq!(
+            gap,
+            Some((Duration::from_millis(180), GapKind::FallbackCutover))
+        );
+        assert_eq!(GapKind::FallbackCutover.log_tag(), "handoff-gap");
         assert_eq!(GapOutcome::Revealed.as_str(), "revealed");
         assert_eq!(state.active_fill(), None);
 
@@ -396,6 +478,68 @@ mod tests {
         assert!(gap.is_none());
         assert!(!out.repaint_outer);
         assert_eq!(state.active_fill(), None);
+    }
+
+    #[test]
+    fn non_root_mount_stays_hidden_without_placeholder_and_reports_mount_gap() {
+        let mut state = HandoffState::default();
+        let t0 = Instant::now();
+        state.begin_mount_export(t0);
+
+        let mut inputs = base_inputs();
+        inputs.is_root = false;
+        inputs.is_mount_or_prewarm = true;
+        inputs.has_mounted_direct = false;
+        inputs.export_requested = true;
+        inputs.desired_surface_ready = true;
+
+        // Turn 1 (`surface_id` ready, attaching TextureContainer directly): no placeholder box!
+        let t1 = t0 + Duration::from_millis(4);
+        let (out, gap) = state.prepare_target(inputs, t1);
+        assert!(gap.is_none());
+        assert!(!out.hold_direct_target);
+        assert!(!out.repaint_outer);
+        assert!(out.arm_frame_callback.is_none());
+        assert_eq!(state.active_fill(), None);
+        state.note_target_updated(true, false, t1);
+
+        // Turn 1.5 (style/frame update while waiting for frame 0 swap): still no placeholder!
+        inputs.active_target_is_texture = true;
+        let (out, gap) = state.prepare_target(inputs, t0 + Duration::from_millis(25));
+        assert!(gap.is_none());
+        assert!(!out.repaint_outer);
+        assert_eq!(state.active_fill(), None);
+
+        // Turn 2 (frame 0 swapped): reports total mount gap from t0 with `GapKind::Mount`.
+        let (stopped, gap) = state.note_revealed(t0 + Duration::from_millis(62));
+        assert!(!stopped);
+        assert_eq!(gap, Some((Duration::from_millis(62), GapKind::Mount)));
+        assert_eq!(GapKind::Mount.log_tag(), "shader-mount-gap");
+    }
+
+    #[test]
+    fn root_prewarm_uses_placeholder_protection_and_reports_mount_gap() {
+        let mut state = HandoffState::default();
+        let t0 = Instant::now();
+        let mut inputs = base_inputs();
+        inputs.is_root = true;
+        inputs.is_mount_or_prewarm = true;
+        inputs.has_mounted_direct = false;
+        inputs.export_requested = true;
+        inputs.desired_surface_ready = true;
+
+        let (out, _) = state.prepare_target(inputs, t0);
+        assert!(out.repaint_outer);
+        assert_eq!(state.active_fill(), Some(DARK_BG));
+        state.note_target_updated(true, false, t0);
+        inputs.active_target_is_texture = true;
+        // Even if a shader toggles on before pre-warm reveal finishes, GapKind::Mount stays latched.
+        inputs.is_mount_or_prewarm = false;
+        let _ = state.prepare_target(inputs, t0 + Duration::from_millis(30));
+
+        let (stopped, gap) = state.note_revealed(t0 + Duration::from_millis(110));
+        assert!(stopped);
+        assert_eq!(gap, Some((Duration::from_millis(110), GapKind::Mount)));
     }
 
     #[test]
@@ -417,7 +561,10 @@ mod tests {
         state.note_target_updated(true, false, t0);
         let (stopped, gap) = state.note_revealed(t0 + Duration::from_millis(95));
         assert!(!stopped);
-        assert_eq!(gap, Some(Duration::from_millis(95)));
+        assert_eq!(
+            gap,
+            Some((Duration::from_millis(95), GapKind::FallbackCutover))
+        );
     }
 
     #[test]
@@ -451,6 +598,8 @@ mod tests {
         let mut state = HandoffState::default();
         let t0 = Instant::now();
         let mut inputs = base_inputs();
+        inputs.is_root = true;
+        inputs.is_mount_or_prewarm = true;
         inputs.has_mounted_direct = false;
         inputs.export_requested = true;
         inputs.desired_surface_ready = true;
@@ -461,16 +610,17 @@ mod tests {
         inputs.active_target_is_texture = true;
         assert_eq!(state.active_fill(), Some(DARK_BG));
 
-        // Temporary navigation capture finishes before Presentation reveals -> back to DirectRoot.
+        // Cancelled before Presentation reveals -> back to DirectRoot.
         inputs.export_requested = false;
         inputs.desired_surface_ready = false;
         inputs.active_target_is_texture = false;
         let (out, gap) = state.prepare_target(inputs, t0 + Duration::from_millis(64));
         assert!(out.repaint_outer);
         assert_eq!(state.active_fill(), None);
-        let (dur, outcome) = gap.expect("cancelled gap");
+        let (dur, outcome, kind) = gap.expect("cancelled gap");
         assert_eq!(dur, Duration::from_millis(64));
         assert_eq!(outcome, GapOutcome::Cancelled);
+        assert_eq!(kind, GapKind::Mount);
         assert_eq!(outcome.as_str(), "cancelled");
     }
 
@@ -502,6 +652,7 @@ mod tests {
         let mut state = HandoffState::default();
         let t0 = Instant::now();
         let mut inputs = base_inputs();
+        inputs.is_root = true;
         inputs.has_mounted_direct = false;
         inputs.export_requested = true;
         inputs.desired_surface_ready = true;
@@ -516,7 +667,11 @@ mod tests {
         assert_eq!(state.active_fill(), None);
         assert_eq!(
             gap,
-            Some((Duration::from_millis(140), GapOutcome::Revealed))
+            Some((
+                Duration::from_millis(140),
+                GapOutcome::Revealed,
+                GapKind::FallbackCutover
+            ))
         );
     }
 }

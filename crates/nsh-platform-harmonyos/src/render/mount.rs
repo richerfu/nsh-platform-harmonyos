@@ -204,6 +204,7 @@ impl Mounter {
         let density_changed =
             self.scale.replace(environment.pixel_ratio) != environment.pixel_ratio;
         let reduce_motion_changed = self.platform.get().reduce_motion != environment.reduce_motion;
+        let was_background = self.platform.get().lifecycle == nsh_engine::Lifecycle::Background;
         self.platform.set(environment);
         for node in self.slots.iter().flatten() {
             if density_changed {
@@ -222,7 +223,7 @@ impl Mounter {
         if background {
             self.shaders.cancel_navigation("background")?;
         }
-        if reduce_motion_changed || background {
+        if reduce_motion_changed || background || was_background {
             self.reconcile_navigation_capture()?;
             self.flush_arkui()?;
         }
@@ -1112,6 +1113,12 @@ impl Mounter {
                         if !self.frozen(id) {
                             let configured = shader.is_some();
                             let node = self.node(id)?;
+                            if let Some(spec) = &shader
+                                && let Ok(worker) =
+                                    crate::render::composition::worker::Worker::for_owner(node)
+                            {
+                                worker.precompile(spec.layer.clone());
+                            }
                             *node.navigation_shader.borrow_mut() = shader;
                             if !configured {
                                 self.shaders.end_navigation(id)?;
@@ -1587,7 +1594,7 @@ impl Mounter {
                     deleted_any = true;
                 }
             }
-            if deleted_any {
+            if settled_leaving || deleted_any {
                 self.reconcile_navigation_capture()?;
             }
         }

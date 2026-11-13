@@ -108,6 +108,26 @@ impl Shaders {
         }
     }
 
+    pub(crate) fn surface_active(&self) -> bool {
+        self.effects.surface_active()
+    }
+    pub(crate) fn keep_alive(&self, id: NodeId) -> bool {
+        self.effects.keep_alive(id)
+    }
+    pub(crate) fn has_navigation_layer(&self, target_id: NodeId) -> bool {
+        self.effects.has_navigation_layer(target_id)
+    }
+    fn reconcile_hosts(&self) -> Result<()> {
+        let has_fill_in_root = self.views.borrow().values().any(|state| {
+            state
+                .owner
+                .upgrade()
+                .is_some_and(|owner| effects::mounted_and_unhidden_in_root(&owner))
+        });
+        let fill_count = self.views.borrow().len();
+        self.effects.reconcile_hosts(has_fill_in_root, fill_count)
+    }
+
     pub(crate) fn set(&self, owner: &Rc<Node>, layer: Option<Arc<ShaderLayer>>) -> Result<()> {
         let Some(layer) = layer else {
             self.remove(owner.id);
@@ -117,7 +137,11 @@ impl Shaders {
             if self.views.borrow().contains_key(&owner.id) {
                 self.remove(owner.id);
             }
-            return self.effects.set(owner, layer);
+            self.effects.set(owner, layer)?;
+            if !owner.flushing_batch.get() {
+                self.reconcile_hosts()?;
+            }
+            return Ok(());
         }
         self.effects.remove(owner.id)?;
         if !self.views.borrow().contains_key(&owner.id)
@@ -143,6 +167,7 @@ impl Shaders {
                 }
             });
         let overflow = layer.overflow.0.max(0.0);
+        worker.precompile(layer.clone());
         worker.fill(Command::Layer(key, layer));
         if !self.views.borrow().contains_key(&owner.id) {
             let surface = match surface::Surface::new(
@@ -187,6 +212,9 @@ impl Shaders {
         }
         owner.invalidate_composites();
         owner.animator.request_frame();
+        if !owner.flushing_batch.get() {
+            self.reconcile_hosts()?;
+        }
         Ok(())
     }
 
@@ -214,7 +242,9 @@ impl Shaders {
         self.effects.end_navigation(id)
     }
     pub(crate) fn reconcile_navigation_capture(&self, reduce_motion: bool) -> Result<()> {
-        self.effects.reconcile_navigation_capture(reduce_motion)
+        let capture = self.effects.reconcile_navigation_capture(reduce_motion);
+        let hosts = self.reconcile_hosts();
+        capture.and(hosts)
     }
     pub(crate) fn cancel_navigation(&self, reason: &str) -> Result<()> {
         self.effects.cancel_navigation(reason)
@@ -232,6 +262,7 @@ impl Shaders {
             .borrow()
             .get(&id)
             .map_or(0.0, |state| state.overflow)
+            .max(self.effects.max_overflow(id))
     }
     pub(crate) fn native(&self, id: NodeId) -> Option<NativeNode> {
         self.views
@@ -243,23 +274,29 @@ impl Shaders {
     pub(crate) fn remove(&self, id: NodeId) {
         self.visibility.borrow_mut().remove(&id);
         callback(|| self.effects.remove(id));
-        let Some(state) = self.views.borrow_mut().remove(&id) else {
-            return;
-        };
-        if let Some(owner) = state.owner.upgrade() {
-            owner.invalidate_composites();
+        if let Some(state) = self.views.borrow_mut().remove(&id) {
+            if let Some(owner) = state.owner.upgrade() {
+                owner.invalidate_composites();
+            }
+            if let Some(worker) = self.worker.borrow().as_ref() {
+                worker.fill(Command::Remove(state.key));
+                self.retiring.borrow_mut().push((
+                    state.key,
+                    Retiring {
+                        surface: state.surface,
+                        parent: state.parent,
+                    },
+                ));
+            } else {
+                callback(|| state.surface.dispose(Some(&state.parent)));
+            }
         }
-        if let Some(worker) = self.worker.borrow().as_ref() {
-            worker.fill(Command::Remove(state.key));
-            self.retiring.borrow_mut().push((
-                state.key,
-                Retiring {
-                    surface: state.surface,
-                    parent: state.parent,
-                },
-            ));
-        } else {
-            callback(|| state.surface.dispose(Some(&state.parent)));
+        if self
+            .effects
+            .root_node()
+            .is_some_and(|root| !root.flushing_batch.get())
+        {
+            callback(|| self.reconcile_hosts());
         }
     }
 
@@ -321,7 +358,13 @@ impl Shaders {
     /// away left the worker waiting for a command.
     pub(crate) fn wake(&self) {
         self.effects.wake();
-        if let Some(worker) = self.worker.borrow().as_ref() {
+        let _ = self.reconcile_hosts();
+        if let Some(root) = self.effects.root_node() {
+            let _ = root.flush_arkui();
+        }
+        if self.effects.surface_active()
+            && let Some(worker) = self.worker.borrow().as_ref()
+        {
             worker.wake();
         }
     }
