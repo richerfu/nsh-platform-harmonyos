@@ -107,6 +107,14 @@ impl Plane {
     pub(crate) fn key(&self) -> Option<Key> {
         self.composite.borrow().as_ref().map(Composite::key)
     }
+    pub(crate) fn active_target_id(&self) -> Option<u32> {
+        self.settings
+            .try_borrow()
+            .ok()?
+            .as_ref()
+            .filter(|settings| settings.texture_surface.is_some())
+            .map(|settings| settings.target_id)
+    }
     fn replace_target(&self, owner: &Node) -> Result<u32> {
         let target = NativeAttachment::for_subtree(&self.outer, &self.inner)?;
         let id = target.id();

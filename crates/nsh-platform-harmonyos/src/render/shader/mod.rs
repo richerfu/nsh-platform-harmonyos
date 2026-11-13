@@ -133,6 +133,7 @@ impl Shaders {
             self.remove(owner.id);
             return Ok(());
         };
+        self.effects.prewarm_root_early(owner)?;
         if layer.role != nsh_core::shader::ShaderRole::Fill {
             if self.views.borrow().contains_key(&owner.id) {
                 self.remove(owner.id);

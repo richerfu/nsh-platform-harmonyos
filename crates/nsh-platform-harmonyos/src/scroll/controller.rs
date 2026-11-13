@@ -71,6 +71,7 @@ pub(crate) struct Scroller {
     snap_limit: Cell<Option<f32>>,
     pinch: RefCell<Option<ohos_arkui_binding::gesture::inner_gesture::Gesture>>,
     selection_progress: RefCell<crate::text::selection::scroll::Progress>,
+    export_paint_offset: Cell<Option<(u32, f32, f32)>>,
 }
 
 impl Scroller {
@@ -197,6 +198,7 @@ impl Scroller {
             snap_limit: Cell::new(None),
             pinch: RefCell::default(),
             selection_progress: RefCell::default(),
+            export_paint_offset: Cell::new(None),
         });
         let weak = Rc::downgrade(&scroll);
         scroll.content.borrow_mut().on_custom_measure(move |event| {
@@ -317,10 +319,14 @@ impl Scroller {
                 // UIKit/Android. Gestures use OnDidScroll once layout settles:
                 // ArkUI OnScroll also exposes intermediate animation steps within
                 // one frame, which must not race a synchronized peer's commands.
-                callback(|| match weak.upgrade() {
-                    Some(scroll) if scroll.applying_offset.get() => scroll.report(),
-                    Some(_) => Ok(()),
-                    None => Ok(()),
+                callback(|| {
+                    if let Some(scroll) = weak.upgrade() {
+                        if scroll.applying_offset.get() {
+                            scroll.report()?;
+                        }
+                        scroll.invalidate_exported_scroll(false)?;
+                    }
+                    Ok(())
                 })
             });
         let weak = Rc::downgrade(&scroll);
@@ -331,9 +337,12 @@ impl Scroller {
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
                         if scroll.applying_offset.get() {
-                            return scroll.report();
+                            scroll.report()?;
+                            scroll.invalidate_exported_scroll(false)?;
+                            return Ok(());
                         }
                         scroll.queue_report()?;
+                        scroll.invalidate_exported_scroll(false)?;
                         scroll.phase(event.component_i32(2).unwrap_or(0))?;
                     }
                     Ok(())
@@ -347,9 +356,12 @@ impl Scroller {
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
                         if scroll.applying_offset.get() {
-                            return scroll.report();
+                            scroll.report()?;
+                            scroll.invalidate_exported_scroll(true)?;
+                            return Ok(());
                         }
                         scroll.queue_report()?;
+                        scroll.invalidate_exported_scroll(true)?;
                         scroll.phase(0)?;
                     }
                     Ok(())
@@ -426,6 +438,9 @@ impl Scroller {
             .mark_dirty(NodeDirtyFlag::NeedLayout)?;
         if let Some(owner) = self.owner.upgrade() {
             owner.scroll_watchers.resized(owner.id);
+        }
+        if previous.width != size.width || previous.height != size.height {
+            self.invalidate_exported_scroll(true)?;
         }
         Ok(())
     }
@@ -622,6 +637,7 @@ impl Scroller {
         if dx != 0.0 || dy != 0.0 {
             self.pay_owed(dx, dy)?;
         }
+        self.invalidate_exported_scroll(true)?;
         Ok(())
     }
     pub(crate) fn to(&self, x: f32, y: f32, animated: bool) -> Result<()> {
@@ -631,7 +647,7 @@ impl Scroller {
                 .upgrade()
                 .is_some_and(|owner| !owner.platform.get().reduce_motion);
         let was_applying = self.applying_offset.replace(true);
-        let result = (|| {
+        let result = (|| -> Result<()> {
             if let Some(cross) = self.cross.borrow().as_ref()
                 && self.behavior.borrow().zooms()
             {
@@ -659,7 +675,8 @@ impl Scroller {
             Ok(())
         })();
         self.applying_offset.set(was_applying);
-        result
+        result?;
+        self.invalidate_exported_scroll(false)
     }
     pub(crate) fn by(&self, dx: f32, dy: f32) -> Result<()> {
         self.corrections.set(self.corrections.get().wrapping_add(1));
@@ -706,6 +723,36 @@ impl Scroller {
             ));
         }
         self.report()?;
+        self.invalidate_exported_scroll(false)?;
+        Ok(())
+    }
+    /// Under `RenderType.RENDER_TYPE_TEXTURE`, ArkUI culls `on_custom_draw` for
+    /// custom nodes outside the scroll viewport while clearing `NeedRender`.
+    /// Re-mark custom-draw descendants as the scroll viewport moves so newly
+    /// revealed text and canvas nodes record into their exported `RSCanvasNode`s.
+    fn invalidate_exported_scroll(&self, force: bool) -> Result<()> {
+        let Some(owner) = self.owner.upgrade() else {
+            self.export_paint_offset.set(None);
+            return Ok(());
+        };
+        let Some(target_id) = owner.active_export_target_id() else {
+            self.export_paint_offset.set(None);
+            return Ok(());
+        };
+        let offset = self
+            .read_native_offset()?
+            .unwrap_or_else(|| self.offset.get());
+        let should_repaint = match self.export_paint_offset.get() {
+            Some((prev_target, px, py)) if prev_target == target_id && !force => {
+                (offset.0 - px).abs() >= 0.5 || (offset.1 - py).abs() >= 0.5
+            }
+            _ => true,
+        };
+        if should_repaint {
+            self.export_paint_offset
+                .set(Some((target_id, offset.0, offset.1)));
+            owner.repaint_subtree_now_and_schedule(2)?;
+        }
         Ok(())
     }
     fn read_native_offset(&self) -> Result<Option<(f32, f32)>> {
@@ -1208,9 +1255,12 @@ impl Scroller {
                         callback(|| {
                             if let Some(scroll) = weak.upgrade() {
                                 if scroll.applying_offset.get() {
-                                    return scroll.report();
+                                    scroll.report()?;
+                                    scroll.invalidate_exported_scroll(false)?;
+                                    return Ok(());
                                 }
                                 scroll.queue_report()?;
+                                scroll.invalidate_exported_scroll(false)?;
                             }
                             Ok(())
                         });

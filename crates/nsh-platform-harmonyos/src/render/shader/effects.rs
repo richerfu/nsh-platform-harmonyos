@@ -528,6 +528,35 @@ impl Effects {
         *self.root.borrow_mut() = Rc::downgrade(root);
     }
 
+    pub(super) fn prewarm_root_early(&self, owner: &Rc<Node>) -> Result<()> {
+        if !self.surface_active() || !unhidden_chain(owner) {
+            return Ok(());
+        }
+        let Some(root) = self.root.borrow().upgrade() else {
+            return Ok(());
+        };
+        if !mounted_and_unhidden_in_root(&root) {
+            return Ok(());
+        }
+        let already_warm = self.keep_alive(root.id)
+            && root
+                .wrapper
+                .borrow()
+                .as_ref()
+                .is_some_and(|wrapper| wrapper.composite.borrow().is_some());
+        if already_warm {
+            return Ok(());
+        }
+        self.keep_alive_active.borrow_mut().insert(root.id, true);
+        root.invalidate_composites();
+        if let Some(scene) = root.scene.borrow().as_ref() {
+            scene.require(&root);
+        }
+        root.ensure_wrapper()?;
+        root.restore_style()?;
+        Ok(())
+    }
+
     pub(super) fn set(&self, owner: &Rc<Node>, layer: Arc<ShaderLayer>) -> Result<()> {
         let target = if matches!(
             layer.role,

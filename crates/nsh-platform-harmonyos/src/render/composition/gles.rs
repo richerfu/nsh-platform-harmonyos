@@ -296,6 +296,9 @@ struct Program {
     buffers: [glow::Buffer; 2],
     empty: Target,
 }
+pub(super) fn is_compiled(gpu: &TextureContext, layer: &ShaderLayer) -> bool {
+    gpu.programs.borrow().contains_key(&layer.shader.hash())
+}
 pub(super) fn precompile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<()> {
     Program::compile(gpu, layer).map(|_| ())
 }

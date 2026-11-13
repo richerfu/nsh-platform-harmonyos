@@ -251,6 +251,16 @@ impl Node {
                 .borrow()
                 .mark_dirty(NodeDirtyFlag::NeedRender)?;
         }
+        if let Some(scroll) = self.scroll.borrow().as_ref() {
+            scroll
+                .native
+                .borrow()
+                .mark_dirty(NodeDirtyFlag::NeedRender)?;
+            scroll
+                .content
+                .borrow()
+                .mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
         if let Some(screen) = self.screen.borrow().as_ref() {
             screen.invalidate_paint()?;
         }
@@ -272,6 +282,19 @@ impl Node {
         }
         Ok(())
     }
+    pub(crate) fn repaint_subtree_now_and_schedule(&self, frames: u8) -> Result<()> {
+        self.invalidate_subtree_paint()?;
+        let Some(owner) = self.weak.upgrade() else {
+            return Ok(());
+        };
+        let Some(plan) = plan_schedule(&owner, frames) else {
+            return Ok(());
+        };
+        if commit_schedule(&owner, plan) {
+            Self::arm_subtree_paint(self.weak.clone());
+        }
+        Ok(())
+    }
     pub(crate) fn schedule_subtree_paint(&self, frames: u8) -> Result<()> {
         let Some(owner) = self.weak.upgrade() else {
             return Ok(());
@@ -287,6 +310,46 @@ impl Node {
         }
         Ok(())
     }
+    fn post_subtree_frame_callback(
+        owner: &Rc<Self>,
+        callback_fn: impl Fn(u64, u32) + 'static,
+    ) -> bool {
+        let mut candidates: Vec<super::NativeNode> = Vec::new();
+        let mut at = Some(owner.clone());
+        while let Some(node) = at {
+            let mounted = node.mounted();
+            if !candidates
+                .iter()
+                .any(|existing| Rc::ptr_eq(existing, &mounted))
+            {
+                candidates.push(mounted);
+            }
+            if !candidates
+                .iter()
+                .any(|existing| Rc::ptr_eq(existing, &node.native))
+            {
+                candidates.push(node.native.clone());
+            }
+            at = node.parent_node.borrow().upgrade().or_else(|| {
+                node.retained
+                    .get()
+                    .then(|| node.retained_owner.borrow().upgrade())
+                    .flatten()
+            });
+        }
+        let callback_fn = Rc::new(callback_fn);
+        for candidate in candidates {
+            let cb = callback_fn.clone();
+            if candidate
+                .borrow()
+                .post_frame_callback(move |timestamp, frame_count| cb(timestamp, frame_count))
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    }
     fn arm_subtree_paint(weak: Weak<Self>) {
         let Some(owner) = weak.upgrade() else {
             return;
@@ -295,22 +358,19 @@ impl Node {
             owner.paint_state.set(owner.paint_state.get().reset());
             return;
         }
-        let status = owner
-            .native
-            .borrow()
-            .post_frame_callback(move |timestamp, frame_count| {
-                let Some(owner) = weak.upgrade() else {
-                    return;
-                };
-                let tick = step_frame(&owner, (timestamp, u64::from(frame_count)));
-                if tick.invalidate {
-                    callback(|| owner.invalidate_subtree_paint());
-                }
-                if tick.rearm {
-                    Self::arm_subtree_paint(weak);
-                }
-            });
-        if status.is_err() {
+        let next = weak.clone();
+        if !Self::post_subtree_frame_callback(&owner, move |timestamp, frame_count| {
+            let Some(owner) = next.upgrade() else {
+                return;
+            };
+            let tick = step_frame(&owner, (timestamp, u64::from(frame_count)));
+            if tick.invalidate {
+                callback(|| owner.invalidate_subtree_paint());
+            }
+            if tick.rearm {
+                Self::arm_subtree_paint(next.clone());
+            }
+        }) {
             owner.paint_state.set(owner.paint_state.get().reset());
         }
     }

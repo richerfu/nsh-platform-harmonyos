@@ -45,6 +45,9 @@ pub(crate) struct Wrapper {
     semantics: Cell<Option<(i32, bool)>>,
     /// The frame size the outer node was last asked to measure at.
     measured: Cell<Option<(f32, f32)>>,
+    /// Set when backgrounding retired an active composite so foreground resume
+    /// reports `shader-mount-gap` rather than `handoff-gap`.
+    retired_for_background: Cell<bool>,
 }
 fn draw_placeholder_fill(
     canvas: &ohos_drawing_binding::Canvas,
@@ -300,14 +303,20 @@ impl Wrapper {
         self.settings.borrow_mut().take();
         self.route.borrow_mut().take();
         self.handoff.borrow_mut().reset();
+        self.retired_for_background.set(false);
         self.context_live.set(false);
         // Keep the old target through SDK lifecycle cleanup; replacement queues its final owner.
     }
-    pub(crate) fn active_target_is_texture(&self) -> bool {
+    pub(crate) fn active_target_id(&self) -> Option<u32> {
         self.settings
-            .borrow()
+            .try_borrow()
+            .ok()?
             .as_ref()
-            .is_some_and(|settings| settings.texture_surface.is_some())
+            .filter(|settings| settings.texture_surface.is_some())
+            .map(|settings| settings.target_id)
+    }
+    pub(crate) fn active_target_is_texture(&self) -> bool {
+        self.active_target_id().is_some()
     }
     fn replace_target(&self, owner: &Node) -> Result<u32> {
         let target = NativeAttachment::for_subtree(&self.outer, &owner.native)?;
@@ -562,6 +571,7 @@ impl Wrapper {
             lingering: std::cell::RefCell::default(),
             semantics: Cell::new(None),
             measured: Cell::new(None),
+            retired_for_background: Cell::new(false),
         })
     }
     /// Sends the ArkTS view its settings; whether they changed.
@@ -594,7 +604,11 @@ impl Wrapper {
             self.handoff.borrow_mut().begin_mount_export(now);
             return Ok(false);
         }
+        if (!export_requested && owner.shaders.surface_active()) || revealed {
+            self.retired_for_background.set(false);
+        }
         let is_mount_or_prewarm = !has_mounted_direct
+            || self.retired_for_background.get()
             || (owner.shaders.keep_alive(owner.id) && owner.shader_layers.borrow().is_empty());
         let inputs = crate::interop::handoff::HandoffInputs {
             closed: self.closed.get(),
@@ -733,6 +747,7 @@ impl Wrapper {
     pub(crate) fn close(&self, owner: &Node) -> Result<()> {
         self.closed.set(true);
         self.retiring.set(None);
+        self.retired_for_background.set(false);
         self.handoff.borrow_mut().reset();
         self.route.borrow_mut().take();
         if let Some(old) = self.target.borrow_mut().take() {
@@ -912,6 +927,9 @@ impl Node {
                 if let Some(wrapper) = self.wrapper.borrow().as_ref() {
                     wrapper.retiring.set(None);
                     if wrapper.composite.borrow_mut().take().is_some() {
+                        if !self.shaders.surface_active() {
+                            wrapper.retired_for_background.set(true);
+                        }
                         wrapper
                             .outer
                             .borrow()
@@ -1044,6 +1062,51 @@ impl Node {
     pub(crate) fn visual_node(&self) -> NativeNode {
         self.mounted()
     }
+    pub(crate) fn active_export_target_id(&self) -> Option<u32> {
+        let own_target = |node: &Self| -> Option<u32> {
+            if let Some(id) = node.scroll.try_borrow().ok().and_then(|scroll| {
+                scroll
+                    .as_ref()?
+                    .overlay
+                    .try_borrow()
+                    .ok()?
+                    .as_ref()?
+                    .active_target_id()
+            }) {
+                return Some(id);
+            }
+            node.wrapper
+                .try_borrow()
+                .ok()
+                .and_then(|wrapper| wrapper.as_ref()?.active_target_id())
+        };
+        if let Some(id) = own_target(self) {
+            return Some(id);
+        }
+        let next_parent = |node: &Self| -> Option<Rc<Self>> {
+            node.parent_node
+                .try_borrow()
+                .ok()
+                .and_then(|parent| parent.upgrade())
+                .or_else(|| {
+                    node.retained
+                        .get()
+                        .then(|| node.retained_owner.try_borrow().ok()?.upgrade())
+                        .flatten()
+                })
+        };
+        let mut at = next_parent(self);
+        while let Some(node) = at {
+            if let Some(id) = own_target(&node) {
+                return Some(id);
+            }
+            at = next_parent(&node);
+        }
+        None
+    }
+    pub(crate) fn inside_texture_export(&self) -> bool {
+        self.active_export_target_id().is_some()
+    }
     pub(crate) fn composite_ready(&self, generation: u32) -> Result<()> {
         let mut initialized = false;
         let mut revealed = false;
@@ -1070,6 +1133,7 @@ impl Node {
             {
                 (initialized, revealed) = composite.ready();
                 if revealed {
+                    wrapper.retired_for_background.set(false);
                     let (_, gap) = wrapper
                         .handoff
                         .borrow_mut()

@@ -293,13 +293,49 @@ impl Worker {
                 let mut fills = super::fill::Fills::default();
                 let mut frame_pending = false;
                 let mut scene_dirty = false;
+                let mut pending_precompiles: std::collections::VecDeque<Arc<ShaderLayer>> =
+                    std::collections::VecDeque::new();
                 let mut pending_captures: Vec<PendingCapture> = Vec::new();
                 let mut captured: Vec<(
                     crate::render::shader::navigation::Key,
                     Snapshot,
                     std::time::Instant,
                 )> = Vec::new();
-                while let Ok(task) = receive.recv() {
+                loop {
+                    let task = if pending_precompiles.is_empty() {
+                        match receive.recv() {
+                            Ok(task) => task,
+                            Err(()) => break,
+                        }
+                    } else if let Some(task) = receive.try_recv() {
+                        task
+                    } else {
+                        if gpu.is_none() {
+                            match TextureContext::new() {
+                                Ok(ctx) => {
+                                    gpu = Some(ctx);
+                                    gpu_error_reported = false;
+                                }
+                                Err(error) => {
+                                    log::warn!("shader precompile context: {error}");
+                                    pending_precompiles.clear();
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(gpu) = gpu.as_ref() {
+                            while let Some(layer) = pending_precompiles.pop_front() {
+                                if super::gles::is_compiled(gpu, &layer) {
+                                    continue;
+                                }
+                                if let Err(error) = super::gles::precompile(gpu, &layer) {
+                                    log::warn!("shader precompile: {error}");
+                                }
+                                break;
+                            }
+                        }
+                        continue;
+                    };
                     let frame = matches!(&task, Task::Frame);
                     let mut repaint = false;
                     let mut fill_frame = false;
@@ -308,6 +344,7 @@ impl Worker {
                         Task::Drain => {
                             scene = None;
                             scene_stats.reset_idle();
+                            pending_precompiles.clear();
                             captured.clear();
                             if let Some(route) = route.upgrade() {
                                 for pending in pending_captures.drain(..) {
@@ -336,24 +373,7 @@ impl Worker {
                             }
                         }
                         Task::Precompile(layers) => {
-                            if gpu.is_none() {
-                                match TextureContext::new() {
-                                    Ok(ctx) => {
-                                        gpu = Some(ctx);
-                                        gpu_error_reported = false;
-                                    }
-                                    Err(error) => {
-                                        log::warn!("shader precompile context: {error}");
-                                    }
-                                }
-                            }
-                            if let Some(gpu) = gpu.as_ref() {
-                                for layer in &layers {
-                                    if let Err(error) = super::gles::precompile(gpu, layer) {
-                                        log::warn!("shader precompile: {error}");
-                                    }
-                                }
-                            }
+                            pending_precompiles.extend(layers);
                         }
                         Task::Fill(super::fill::Command::Remove(key)) => {
                             fills.remove(key);
@@ -456,13 +476,8 @@ impl Worker {
                                         TextureContext::new().map_err(|error| error.to_string())?,
                                     );
                                 }
-                                for (_, layer) in &settings.shaders {
-                                    if let Err(error) =
-                                        super::gles::precompile(gpu.as_ref().unwrap(), layer)
-                                    {
-                                        log::warn!("shader precompile: {error}");
-                                    }
-                                }
+                                pending_precompiles
+                                    .extend(settings.shaders.iter().map(|(_, layer)| layer.clone()));
                                 let mut reader =
                                     TextureReader::with_context(gpu.as_ref().unwrap(), move || {
                                         if let Some(shared) = weak.upgrade() {

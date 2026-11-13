@@ -146,6 +146,8 @@ impl Node {
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             }
+        } else if self.inside_texture_export() {
+            self.schedule_subtree_paint(2)?;
         }
         // Size changes request measure/layout through LayoutRect. Position is a
         // native render property, so moving a node does not measure its subtree.

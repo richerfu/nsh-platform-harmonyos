@@ -674,4 +674,33 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn foreground_rewarm_from_direct_root_logs_shader_mount_gap() {
+        let mut state = HandoffState::default();
+        let t0 = Instant::now();
+        let mut inputs = base_inputs();
+        inputs.has_mounted_direct = true;
+        inputs.is_mount_or_prewarm = true;
+        inputs.export_requested = true;
+        inputs.desired_surface_ready = true;
+
+        let (out, _) = state.prepare_target(inputs, t0);
+        let generation = out.arm_frame_callback.expect("armed");
+        assert!(out.hold_direct_target);
+        assert_eq!(state.note_placeholder_drawn(), None);
+        assert_eq!(
+            state.on_frame_callback(generation),
+            FrameCallbackStep::ReadyToDetach
+        );
+
+        let (out2, _) = state.prepare_target(inputs, t0 + Duration::from_millis(8));
+        assert!(!out2.hold_direct_target);
+        state.note_target_updated(true, false, t0 + Duration::from_millis(8));
+
+        let (stopped, gap) = state.note_revealed(t0 + Duration::from_millis(120));
+        assert!(stopped);
+        assert_eq!(gap, Some((Duration::from_millis(112), GapKind::Mount)));
+        assert_eq!(GapKind::Mount.log_tag(), "shader-mount-gap");
+    }
 }
