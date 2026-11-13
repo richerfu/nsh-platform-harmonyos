@@ -64,6 +64,7 @@ pub(crate) struct Wrapper {
     handoff: RefCell<crate::interop::handoff::HandoffState>,
     bridge: RefCell<Option<Rc<RootBridge>>>,
     pending_reattach: RefCell<crate::interop::handoff::PendingReattachQueue<PendingBridgeNodes>>,
+    reattach_export: RefCell<Option<Rc<crate::interop::texture_export::Export>>>,
     context_live: Cell<bool>,
     owner: std::rc::Weak<Node>,
     settings: std::cell::RefCell<Option<ViewOptions>>,
@@ -201,6 +202,9 @@ impl Wrapper {
         };
         if !bridge.hosted_on_outer.get() {
             let _ = self.pending_reattach.borrow_mut().take_peer(peer.id);
+            if let Some(old_export) = self.reattach_export.borrow_mut().take() {
+                old_export.restore();
+            }
             peer.snapshot_subtree_scroll_offsets();
             let mounted = peer.mounted();
             let detach = peer.mount_parent.borrow().upgrade().and_then(|parent| {
@@ -309,14 +313,40 @@ impl Wrapper {
         Ok(())
     }
     fn finish_bridge_reattach(
+        root_owner: Option<&Node>,
         stack_weak: &std::rc::Weak<Node>,
         peer_weak: &std::rc::Weak<Node>,
     ) -> Result<()> {
+        if let Some(root) = root_owner
+            && let Some(old_export) = root
+                .wrapper
+                .try_borrow()
+                .ok()
+                .and_then(|b| b.as_ref()?.reattach_export.borrow_mut().take())
+        {
+            old_export.restore();
+        }
         let Some(peer) = peer_weak.upgrade() else {
             return Ok(());
         };
         peer.bridged_on_root_outer.set(false);
         let mounted = peer.mounted();
+        if peer.active.get() {
+            let reset_hit_test = peer.wrapper.borrow().is_some() && mounted.borrow().is_owned();
+            if reset_hit_test {
+                mounted.borrow().set_i32_attribute(
+                    ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::HitTestBehavior,
+                    ohos_arkui_binding::types::view::HitTestMode::Default.into(),
+                )?;
+            }
+            let inherited = peer
+                .parent_node
+                .borrow()
+                .upgrade()
+                .is_some_and(|parent| parent.interaction.blocks_children());
+            peer.interaction.pointer(&peer, inherited)?;
+        }
+        Self::cleanup_peer_bridge_state(stack_weak, &peer)?;
         let reattach = if peer.active.get() && !peer.retained.get() {
             stack_weak
                 .upgrade()
@@ -340,35 +370,49 @@ impl Wrapper {
                 .children()
                 .iter()
                 .any(|c| Rc::ptr_eq(c, &mounted));
-            if !already_mounted {
-                container
+            let repair =
+                if !already_mounted && stack.inside_texture_export() && root_owner.is_some() {
+                    let export = Rc::new(crate::interop::texture_export::Export::default());
+                    export.enabled.set(true);
+                    export.prepare(&peer, &mounted)?;
+                    Some(export)
+                } else {
+                    None
+                };
+            if !already_mounted
+                && let Err(error) = container
                     .borrow_mut()
-                    .insert_child(mounted.clone(), native_idx)?;
+                    .insert_child(mounted.clone(), native_idx)
+            {
+                if let Some(export) = repair {
+                    export.restore();
+                }
+                return Err(error.into());
             }
             *peer.mount_parent.borrow_mut() = Rc::downgrade(&container);
             container.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             container.borrow().mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            container.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            if peer.active.get() {
+                peer.invalidate_mounted_geometry();
+                peer.update_layout_bounds()?;
+            }
+            if let Some(export) = repair {
+                if let Some(root) = root_owner
+                    && let Ok(borrow) = root.wrapper.try_borrow()
+                    && let Some(wrapper) = borrow.as_ref()
+                {
+                    *wrapper.reattach_export.borrow_mut() = Some(export.clone());
+                }
+                let _ = export.after_attach(&container);
+            }
         } else {
             *peer.mount_parent.borrow_mut() = std::rc::Weak::new();
-        }
-        if peer.active.get() {
-            let reset_hit_test = peer.wrapper.borrow().is_some() && mounted.borrow().is_owned();
-            if reset_hit_test {
-                mounted.borrow().set_i32_attribute(
-                    ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::HitTestBehavior,
-                    ohos_arkui_binding::types::view::HitTestMode::Default.into(),
-                )?;
+            if peer.active.get() {
+                peer.invalidate_mounted_geometry();
+                peer.update_layout_bounds()?;
             }
-            let inherited = peer
-                .parent_node
-                .borrow()
-                .upgrade()
-                .is_some_and(|parent| parent.interaction.blocks_children());
-            peer.interaction.pointer(&peer, inherited)?;
-            peer.invalidate_mounted_geometry();
-            peer.update_layout_bounds()?;
         }
-        Self::cleanup_peer_bridge_state(stack_weak, &peer)?;
         if peer.active.get() {
             peer.restore_subtree_scroll_offsets(true)?;
         } else {
@@ -434,13 +478,13 @@ impl Wrapper {
                             .as_ref()
                             .and_then(|w| w.pending_reattach.borrow_mut().take_by_id(id));
                         if let Some(entry) = fallback {
-                            Self::finish_bridge_reattach(&entry.stack, &entry.peer)?;
+                            Self::finish_bridge_reattach(Some(&node), &entry.stack, &entry.peer)?;
                             node.flush_arkui()?;
                         }
                     }
                 }
                 crate::interop::handoff::ReattachTick::Complete(entry) => {
-                    Self::finish_bridge_reattach(&entry.stack, &entry.peer)?;
+                    Self::finish_bridge_reattach(Some(&node), &entry.stack, &entry.peer)?;
                     node.flush_arkui()?;
                 }
             }
@@ -534,12 +578,18 @@ impl Wrapper {
                         {
                             let fallback = self.pending_reattach.borrow_mut().take_by_id(id);
                             if let Some(entry) = fallback {
-                                Self::finish_bridge_reattach(&entry.stack, &entry.peer)?;
+                                let root = self.owner.upgrade();
+                                Self::finish_bridge_reattach(
+                                    root.as_deref(),
+                                    &entry.stack,
+                                    &entry.peer,
+                                )?;
                             }
                         }
                     }
                     _ => {
-                        Self::finish_bridge_reattach(&bridge.stack, &bridge.peer)?;
+                        let root = self.owner.upgrade();
+                        Self::finish_bridge_reattach(root.as_deref(), &bridge.stack, &bridge.peer)?;
                     }
                 }
             } else if outer_owned {
@@ -768,10 +818,14 @@ impl Wrapper {
     }
     pub(crate) fn invalidate_context(&self) {
         self.context_live.set(false);
+        if let Some(old_export) = self.reattach_export.borrow_mut().take() {
+            old_export.restore();
+        }
         let _ = self.release_bridge();
         let drained = self.pending_reattach.borrow_mut().drain_all();
+        let root = self.owner.upgrade();
         for entry in drained {
-            let _ = Self::finish_bridge_reattach(&entry.stack, &entry.peer);
+            let _ = Self::finish_bridge_reattach(root.as_deref(), &entry.stack, &entry.peer);
         }
         self.settings.borrow_mut().take();
         self.route.borrow_mut().take();
@@ -791,6 +845,9 @@ impl Wrapper {
         self.active_target_id().is_some()
     }
     fn replace_target(&self, owner: &Node) -> Result<u32> {
+        if let Some(old_export) = self.reattach_export.borrow_mut().take() {
+            old_export.restore();
+        }
         let target = NativeAttachment::for_subtree(&self.outer, &owner.native)?;
         let id = target.id();
         if let Some(old) = self.target.replace(Some(target)) {
@@ -1044,6 +1101,7 @@ impl Wrapper {
             handoff: RefCell::default(),
             bridge: RefCell::default(),
             pending_reattach: RefCell::default(),
+            reattach_export: RefCell::default(),
             context_live: Cell::new(true),
             owner: Rc::downgrade(owner),
             settings: std::cell::RefCell::default(),
@@ -1237,6 +1295,9 @@ impl Wrapper {
     }
     pub(crate) fn close(&self, owner: &Node) -> Result<()> {
         self.closed.set(true);
+        if let Some(old_export) = self.reattach_export.borrow_mut().take() {
+            old_export.restore();
+        }
         let _ = self.release_bridge();
         let drained = self.pending_reattach.borrow_mut().drain_all();
         for entry in drained {
@@ -1615,7 +1676,7 @@ impl Node {
             })
             .unwrap_or_default();
         for entry in drained {
-            Wrapper::finish_bridge_reattach(&entry.stack, &entry.peer)?;
+            Wrapper::finish_bridge_reattach(Some(self), &entry.stack, &entry.peer)?;
         }
         Ok(())
     }

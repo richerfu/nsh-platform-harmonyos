@@ -1543,6 +1543,33 @@ impl Scroller {
         self.invalidate_exported_scroll(true)
     }
 
+    fn advance_reparent_restore(weak: Weak<Self>, remaining: u8) {
+        let Some(scroll) = weak.upgrade() else {
+            return;
+        };
+        callback(|| {
+            if scroll.reparent_offset.get().is_none() {
+                return Ok(());
+            }
+            scroll.sync_saved_offset()?;
+            if remaining > 1 && scroll.native.borrow().is_owned() {
+                let next = Rc::downgrade(&scroll);
+                if scroll
+                    .native
+                    .borrow()
+                    .post_frame_callback(move |_, _| {
+                        Self::advance_reparent_restore(next, remaining - 1);
+                    })
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            scroll.reparent_offset.set(None);
+            Ok(())
+        });
+    }
+
     pub(crate) fn restore_after_reparent(self: &Rc<Self>, clear_after_frame: bool) -> Result<()> {
         self.sync_saved_offset()?;
         if clear_after_frame {
@@ -1556,15 +1583,7 @@ impl Scroller {
                     .native
                     .borrow()
                     .post_frame_callback(move |_, _| {
-                        callback(|| {
-                            if let Some(scroll) = weak.upgrade()
-                                && scroll.reparent_offset.get().is_some()
-                            {
-                                scroll.sync_saved_offset()?;
-                                scroll.reparent_offset.set(None);
-                            }
-                            Ok(())
-                        });
+                        Self::advance_reparent_restore(weak, 3);
                     })
                     .is_err()
                 {
