@@ -86,7 +86,7 @@ impl Navigation {
     }
 
     pub(crate) fn mark_fallback(&self, key: Key) -> bool {
-        if self.key != key || self.phase.get() != Phase::Capturing {
+        if self.key != key || !matches!(self.phase.get(), Phase::Capturing | Phase::Running) {
             return false;
         }
         self.fallback_pending.set(true);
@@ -99,7 +99,7 @@ impl Navigation {
     }
 
     pub(crate) fn complete(&self, key: Key) -> bool {
-        if self.key != key {
+        if self.key != key || matches!(self.phase.get(), Phase::Complete | Phase::Fallback) {
             return false;
         }
         self.fallback_pending.set(false);
@@ -225,6 +225,111 @@ impl CaptureDemands {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeldView {
+    view_owner: NodeId,
+    target: NodeId,
+    holder: Key,
+}
+
+/// Keeps interrupted navigation shader layers attached on `target` while a
+/// replacement capture is pending so `Composite::update` neither wipes live
+/// mid-transition shader output ahead of `Task::Capture` nor retires an active
+/// modal `Composite` while `ROOT_ID` cold-captures.
+#[derive(Default)]
+pub(crate) struct HeldViews {
+    entries: Vec<HeldView>,
+}
+
+impl HeldViews {
+    pub(crate) fn hold(&mut self, view_owner: NodeId, target: NodeId, holder: Key) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.view_owner == view_owner)
+        {
+            existing.target = target;
+            existing.holder = holder;
+        } else {
+            self.entries.push(HeldView {
+                view_owner,
+                target,
+                holder,
+            });
+        }
+    }
+
+    pub(crate) fn transfer_or_release(
+        &mut self,
+        old_holder: Key,
+        new_holder: Key,
+        new_target: NodeId,
+    ) -> Vec<NodeId> {
+        let mut detach = Vec::new();
+        self.entries.retain_mut(|entry| {
+            if entry.holder != old_holder {
+                return true;
+            }
+            if entry.target == new_target {
+                entry.holder = new_holder;
+                true
+            } else {
+                detach.push(entry.view_owner);
+                false
+            }
+        });
+        detach
+    }
+
+    pub(crate) fn release_holder(
+        &mut self,
+        holder: Key,
+        replaced_in_place: Option<NodeId>,
+    ) -> Vec<NodeId> {
+        let mut detach = Vec::new();
+        self.entries.retain(|entry| {
+            if entry.holder == holder {
+                if replaced_in_place != Some(entry.view_owner) {
+                    detach.push(entry.view_owner);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        detach
+    }
+
+    pub(crate) fn remove_view(&mut self, view_owner: NodeId) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.view_owner != view_owner);
+        self.entries.len() != before
+    }
+
+    pub(crate) fn remove_target(&mut self, target: NodeId) -> Vec<NodeId> {
+        let mut detach = Vec::new();
+        self.entries.retain(|entry| {
+            if entry.target == target {
+                detach.push(entry.view_owner);
+                false
+            } else {
+                true
+            }
+        });
+        detach
+    }
+
+    pub(crate) fn is_held(&self, view_owner: NodeId) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.view_owner == view_owner)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +343,8 @@ mod tests {
         assert!(current.running());
         assert!(current.complete(current.key));
         assert!(!current.running());
+        // Duplicate completion from a superseded worker task is ignored.
+        assert!(!current.complete(current.key));
     }
 
     #[test]
@@ -259,7 +366,7 @@ mod tests {
         assert_eq!(demands.request(nav.key, 1, now + CAPTURE_DEADLINE), None);
         assert!(demands.contains_picture(1));
 
-        // Stale key cannot promote or complete.
+        // Stale key cannot promote, fail, or complete.
         let stale = Key {
             owner: 12,
             generation: nav.key.generation - 1,
@@ -273,15 +380,86 @@ mod tests {
         assert!(demands.release(nav.key));
         assert!(!demands.contains_picture(1));
 
-        // Fallback cannot fire once running.
-        assert!(!nav.mark_fallback(nav.key));
-        assert!(!nav.take_fallback());
+        assert!(!nav.mark_fallback(stale));
+        assert!(nav.running());
 
         assert_eq!(Event::Captured(nav.key).key(), nav.key);
         assert_eq!(Event::Failed(nav.key).key(), nav.key);
         assert_eq!(Event::Completed(nav.key).key(), nav.key);
         assert!(nav.complete(nav.key));
         assert!(!nav.running());
+        // Once completed, late fallback cannot revive or set fallback_pending.
+        assert!(!nav.mark_fallback(nav.key));
+        assert!(!nav.take_fallback());
+    }
+
+    #[test]
+    fn running_failure_after_capture_marks_fallback_and_stops_running() {
+        // Reproduces Event::Failed arriving from Task::Navigation (missing/expired
+        // snapshot) after Event::Captured already moved Navigation into Running.
+        let nav = Navigation::new(50, false).unwrap();
+        assert!(nav.mark_running(nav.key));
+        assert!(nav.running());
+
+        assert!(nav.mark_fallback(nav.key));
+        assert!(!nav.capturing());
+        assert!(!nav.running());
+        assert!(nav.take_fallback());
+        assert!(!nav.take_fallback());
+        assert!(!nav.complete(nav.key));
+        assert!(!nav.mark_fallback(nav.key));
+    }
+
+    #[test]
+    fn held_views_preserve_interrupted_layers_until_replacement_resolves() {
+        let mut held = HeldViews::default();
+
+        // 1. Same-owner interruption (e.g. Modal close interrupting mid-IRIS Modal open):
+        //    modal 20's layer on target 20 stays held during ROOT_ID capture, then is
+        //    replaced in place by set_on without detaching modal 20's Composite.
+        let modal_close = Navigation::new(20, true).unwrap();
+        held.hold(20, 20, modal_close.key);
+        assert!(held.is_held(20));
+        assert_eq!(
+            held.release_holder(modal_close.key, Some(20)),
+            Vec::<NodeId>::new()
+        );
+        assert!(!held.is_held(20));
+
+        // 2. Cross-owner interruption (Screen 11 push interrupting Screen 10 push on root 1),
+        //    followed by a third Screen 12 superseding Screen 11 before capture lands:
+        //    Screen 10's layer stays held across the transfer, then detaches after Screen 12's
+        //    layer is attached via set_on.
+        let screen_11 = Navigation::new(11, false).unwrap();
+        let screen_12 = Navigation::new(12, false).unwrap();
+        held.hold(10, 1, screen_11.key);
+        assert!(held.is_held(10));
+        assert_eq!(
+            held.transfer_or_release(screen_11.key, screen_12.key, 1),
+            Vec::<NodeId>::new()
+        );
+        assert!(held.is_held(10));
+        assert_eq!(held.release_holder(screen_12.key, Some(12)), vec![10]);
+        assert!(!held.is_held(10));
+
+        // 3. Failure / deadline / cancellation before set_on detaches even same-owner held views.
+        let retry_close = Navigation::new(20, true).unwrap();
+        held.hold(20, 20, retry_close.key);
+        assert_eq!(held.release_holder(retry_close.key, None), vec![20]);
+        assert!(!held.is_held(20));
+
+        // 4. Node/target removal and clear release matching entries.
+        let nav_a = Navigation::new(30, false).unwrap();
+        let nav_b = Navigation::new(31, false).unwrap();
+        held.hold(30, 1, nav_a.key);
+        held.hold(31, 99, nav_b.key);
+        assert!(held.remove_view(30));
+        assert!(!held.is_held(30));
+        assert_eq!(held.remove_target(99), vec![31]);
+        assert!(!held.is_held(31));
+        held.hold(32, 1, nav_a.key);
+        held.clear();
+        assert!(!held.is_held(32));
     }
 
     #[test]

@@ -624,6 +624,9 @@ impl Screen {
                 self.shader.borrow_mut().take();
                 if let Some(owner) = self.owner.upgrade() {
                     owner.shaders.end_navigation(owner.id)?;
+                    if !backwards && self.progress.get() == 0.0 {
+                        self.progress.set(1.0);
+                    }
                     self.start_motion(&owner, if backwards { 1.0 } else { 0.0 })?;
                 } else {
                     self.settle()?;

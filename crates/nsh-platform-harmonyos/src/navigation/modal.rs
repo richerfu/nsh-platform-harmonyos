@@ -324,6 +324,9 @@ impl Modal {
                 if let Some(owner) = self.owner.upgrade() {
                     owner.shaders.end_navigation(owner.id)?;
                 }
+                if !backwards && self.progress.get() == 1.0 {
+                    self.progress.set(0.0);
+                }
                 self.start_transition(to)?;
             } else {
                 self.finish(to)?;

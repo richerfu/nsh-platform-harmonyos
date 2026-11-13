@@ -14,7 +14,7 @@ use nsh_core::{
 };
 use rustc_hash::FxHashMap;
 
-use super::navigation::{CAPTURE_DEADLINE, CaptureDemands, Event, Key, Navigation};
+use super::navigation::{CAPTURE_DEADLINE, CaptureDemands, Event, HeldViews, Key, Navigation};
 use crate::render::node::{Node, Result};
 
 #[derive(Default)]
@@ -23,6 +23,7 @@ pub(super) struct Effects {
     views: RefCell<FxHashMap<NodeId, State>>,
     pending: RefCell<FxHashMap<NodeId, PendingNavigation>>,
     demands: RefCell<CaptureDemands>,
+    held: RefCell<HeldViews>,
     capture_nodes: RefCell<FxHashMap<NodeId, Weak<Node>>>,
     logged_state: Cell<Option<(usize, usize)>>,
 }
@@ -173,6 +174,7 @@ impl Effects {
 
     pub(super) fn cancel_navigation(&self, reason: &str) -> Result<()> {
         let fallback = reason == "reduce-motion";
+        self.held.borrow_mut().clear();
         let pending: Vec<PendingNavigation> =
             self.pending.borrow_mut().drain().map(|(_, p)| p).collect();
         let cleared = self.demands.borrow_mut().clear();
@@ -216,9 +218,12 @@ impl Effects {
         }
         self.cancel_on_worker(&expired);
         let mut fallen_back = Vec::new();
+        let mut detach_held = Vec::new();
         {
             let mut pending = self.pending.borrow_mut();
+            let mut held = self.held.borrow_mut();
             for &key in &expired {
+                detach_held.extend(held.release_holder(key, None));
                 if pending
                     .get(&key.owner)
                     .is_some_and(|entry| entry.navigation.key == key)
@@ -228,6 +233,7 @@ impl Effects {
                 }
             }
         }
+        self.detach_navigation_views(&detach_held)?;
         for entry in fallen_back {
             entry.navigation.mark_fallback(entry.navigation.key);
             if let Some(owner) = entry.owner.upgrade() {
@@ -276,6 +282,9 @@ impl Effects {
         layer: Arc<ShaderLayer>,
         navigation: Option<Rc<Navigation>>,
     ) -> Result<()> {
+        if navigation.is_none() {
+            self.held.borrow_mut().remove_view(owner.id);
+        }
         let moved = self.views.borrow().get(&owner.id).is_some_and(|state| {
             state
                 .target
@@ -316,6 +325,7 @@ impl Effects {
     }
 
     fn detach_view(&self, id: NodeId) -> Result<()> {
+        self.held.borrow_mut().remove_view(id);
         let state = self.views.borrow_mut().remove(&id);
         if let Some(state) = state
             && let Some(target) = state.target.upgrade()
@@ -336,26 +346,68 @@ impl Effects {
         Ok(())
     }
 
+    fn detach_navigation_views(&self, ids: &[NodeId]) -> Result<()> {
+        for &id in ids {
+            let is_nav = self
+                .views
+                .borrow()
+                .get(&id)
+                .is_some_and(|state| state.navigation.is_some());
+            if is_nav {
+                self.detach_view(id)?;
+            } else {
+                self.held.borrow_mut().remove_view(id);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn end_navigation(&self, id: NodeId) -> Result<()> {
         let pending = self.pending.borrow_mut().remove(&id);
         let mut cancel_keys = Vec::new();
+        let mut detach_held = Vec::new();
         if let Some(pending) = pending {
             pending.navigation.complete(pending.navigation.key);
             cancel_keys.push(pending.navigation.key);
+            detach_held.extend(
+                self.held
+                    .borrow_mut()
+                    .release_holder(pending.navigation.key, None),
+            );
         }
         let released = self.demands.borrow_mut().release_node(id);
         for key in released {
             if !cancel_keys.contains(&key) {
                 cancel_keys.push(key);
             }
+            let matching_other = if key.owner != id {
+                let mut map = self.pending.borrow_mut();
+                if map.get(&key.owner).is_some_and(|p| p.navigation.key == key) {
+                    map.remove(&key.owner)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(other) = matching_other {
+                other.navigation.complete(other.navigation.key);
+                detach_held.extend(self.held.borrow_mut().release_holder(key, None));
+                if let Some(owner) = other.owner.upgrade() {
+                    owner.animator.track(&owner);
+                    owner.animator.request_frame();
+                }
+            }
         }
         self.cancel_on_worker(&cancel_keys);
-        let is_nav = self
-            .views
-            .borrow()
-            .get(&id)
-            .is_some_and(|state| state.navigation.is_some());
-        if is_nav {
+        self.detach_navigation_views(&detach_held)?;
+        let should_detach_self = !self.held.borrow().is_held(id)
+            && self
+                .views
+                .borrow()
+                .get(&id)
+                .is_some_and(|state| state.navigation.is_some());
+        if should_detach_self {
             self.detach_view(id)?;
         }
         self.sync_capture_roots("end", false)
@@ -379,8 +431,14 @@ impl Effects {
             }
         }
         let mut cancel_keys = self.demands.borrow_mut().release_node(id);
+        let mut detach_held = Vec::new();
         for item in removed_pending {
             item.navigation.complete(item.navigation.key);
+            detach_held.extend(
+                self.held
+                    .borrow_mut()
+                    .release_holder(item.navigation.key, None),
+            );
             if !cancel_keys.contains(&item.navigation.key) {
                 cancel_keys.push(item.navigation.key);
             }
@@ -389,7 +447,10 @@ impl Effects {
                 owner.animator.request_frame();
             }
         }
+        self.held.borrow_mut().remove_view(id);
+        detach_held.extend(self.held.borrow_mut().remove_target(id));
         self.cancel_on_worker(&cancel_keys);
+        self.detach_navigation_views(&detach_held)?;
 
         let target_nav_owners: Vec<NodeId> = self
             .views
@@ -465,17 +526,18 @@ impl Effects {
         self.capture_nodes
             .borrow_mut()
             .insert(picture.id, Rc::downgrade(&picture));
-        if let Some(displaced) =
-            self.demands
-                .borrow_mut()
-                .request(navigation.key, picture.id, deadline)
-        {
+        let displaced = self
+            .demands
+            .borrow_mut()
+            .request(navigation.key, picture.id, deadline);
+        if let Some(displaced) = displaced {
             self.cancel_on_worker(&[displaced]);
         }
 
-        // Enable demand-scoped capture on `picture` first so an existing Composite
-        // (e.g. ScreenEffect or mid-transition interruption) stays live and a cold
-        // root creates its Composite before Task::Capture is queued.
+        // Enable demand-scoped capture on `picture` while keeping any interrupted
+        // shader layers on `target` intact so `Composite::update` neither wipes
+        // `shaders.output()` ahead of `Task::Capture` nor retires an active Modal
+        // `Composite` while `ROOT_ID` cold-captures.
         self.sync_capture_roots("begin", false)?;
 
         let captured_queued = picture.wrapper.borrow().as_ref().is_some_and(|wrapper| {
@@ -491,13 +553,28 @@ impl Effects {
         });
         if !captured_queued {
             self.demands.borrow_mut().release(navigation.key);
+            if let Some(displaced) = displaced {
+                let stale_pending = {
+                    let mut pending = self.pending.borrow_mut();
+                    if pending
+                        .get(&owner.id)
+                        .is_some_and(|p| p.navigation.key == displaced)
+                    {
+                        pending.remove(&owner.id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(old) = stale_pending {
+                    old.navigation.complete(old.navigation.key);
+                }
+                let detach_held = self.held.borrow_mut().release_holder(displaced, None);
+                self.detach_navigation_views(&detach_held)?;
+            }
             self.sync_capture_roots("failed", false)?;
             return Ok(None);
         }
 
-        // Interrupt superseded pending captures or running navigations on this
-        // owner or target after queueing Task::Capture so mid-flight GPU output
-        // is snapshotted before old shader layers are detached.
         let superseded_pending: Vec<PendingNavigation> = {
             let mut pending = self.pending.borrow_mut();
             let ids: Vec<NodeId> = pending
@@ -515,8 +592,14 @@ impl Effects {
                 .collect()
         };
         let mut cancel_keys = Vec::new();
+        let mut stale_held = Vec::new();
         for old in superseded_pending {
             old.navigation.complete(old.navigation.key);
+            stale_held.extend(self.held.borrow_mut().transfer_or_release(
+                old.navigation.key,
+                navigation.key,
+                target.id,
+            ));
             if self.demands.borrow_mut().release(old.navigation.key) {
                 cancel_keys.push(old.navigation.key);
             }
@@ -528,30 +611,36 @@ impl Effects {
             }
         }
         self.cancel_on_worker(&cancel_keys);
+        self.detach_navigation_views(&stale_held)?;
 
-        let interrupted: Vec<(Key, Option<Rc<Node>>)> = self
+        // Hold interrupted shader views on `target` until `navigation.key` resolves;
+        // mark their Navigation completed so stale `Event::Completed(old_key)` is ignored.
+        let interrupted: Vec<(NodeId, Rc<Navigation>, Option<Rc<Node>>)> = self
             .views
             .borrow()
-            .values()
-            .filter(|state| {
+            .iter()
+            .filter(|(_, state)| {
                 state
                     .target
                     .upgrade()
                     .is_some_and(|old| Rc::ptr_eq(&old, &target))
             })
-            .filter_map(|state| {
+            .filter_map(|(&view_id, state)| {
                 state
                     .navigation
                     .as_ref()
-                    .map(|n| (n.key, state.owner.upgrade()))
+                    .map(|nav| (view_id, nav.clone(), state.owner.upgrade()))
             })
             .collect();
-        for (key, old_owner) in interrupted {
-            self.navigation_complete(key);
-            self.detach_view(key.owner)?;
+        for (view_id, old_nav, old_owner) in interrupted {
+            old_nav.complete(old_nav.key);
+            self.held
+                .borrow_mut()
+                .hold(view_id, target.id, navigation.key);
             if let Some(old_owner) = old_owner
                 && old_owner.id != owner.id
             {
+                old_owner.animator.track(&old_owner);
                 old_owner.animator.request_frame();
             }
         }
@@ -589,7 +678,9 @@ impl Effects {
         match event {
             Event::Captured(_) => {
                 let Some(pending) = pending else {
-                    if self.demands.borrow_mut().release(key) {
+                    let held = self.held.borrow_mut().release_holder(key, None);
+                    self.detach_navigation_views(&held)?;
+                    if self.demands.borrow_mut().release(key) || !held.is_empty() {
                         self.sync_capture_roots("stale-capture", false)?;
                     }
                     return Ok(());
@@ -608,6 +699,8 @@ impl Effects {
                     } else {
                         pending.navigation.complete(key);
                     }
+                    let held = self.held.borrow_mut().release_holder(key, None);
+                    self.detach_navigation_views(&held)?;
                     self.demands.borrow_mut().release(key);
                     self.sync_capture_roots("cancelled", false)?;
                     if let Some(owner) = owner {
@@ -619,6 +712,8 @@ impl Effects {
                 let owner = owner.unwrap();
                 let target = target.unwrap();
                 if !pending.navigation.mark_running(key) {
+                    let held = self.held.borrow_mut().release_holder(key, None);
+                    self.detach_navigation_views(&held)?;
                     self.demands.borrow_mut().release(key);
                     self.sync_capture_roots("cancelled", false)?;
                     return Ok(());
@@ -633,23 +728,10 @@ impl Effects {
                     modal.on_shader_captured(&pending.navigation)?;
                 }
 
-                // Attach the transition shader layer to `target` BEFORE releasing
-                // `picture`'s capture demand so `target == picture` keeps its
-                // Composite continuously without retiring between phases.
-                self.set_on(
-                    &owner,
-                    &target,
-                    pending.spec.layer,
-                    Some(pending.navigation.clone()),
-                )?;
-                if let Some(modal) = owner.modal.borrow().as_ref() {
-                    modal.refresh_presentation()?;
-                }
-
-                self.demands.borrow_mut().release(key);
-                self.sync_capture_roots("captured", false)?;
-
-                let started = target.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                // When `target` already owns a live Composite, queue `Task::Navigation`
+                // ahead of `set_on`'s `Task::Wake` so the worker installs the new
+                // snapshot before rendering with the updated shader layer list.
+                let mut started = target.wrapper.borrow().as_ref().is_some_and(|wrapper| {
                     wrapper
                         .composite
                         .borrow()
@@ -665,9 +747,47 @@ impl Effects {
                             true
                         })
                 });
+
+                // Attach `owner`'s transition shader layer BEFORE detaching any
+                // cross-owner held layer or releasing `picture`'s demand so `target`
+                // keeps `requires_texture == true` continuously across phases.
+                self.set_on(
+                    &owner,
+                    &target,
+                    pending.spec.layer,
+                    Some(pending.navigation.clone()),
+                )?;
+                let held = self.held.borrow_mut().release_holder(key, Some(owner.id));
+                self.detach_navigation_views(&held)?;
+
+                if let Some(modal) = owner.modal.borrow().as_ref() {
+                    modal.refresh_presentation()?;
+                }
+
+                self.demands.borrow_mut().release(key);
+                self.sync_capture_roots("captured", false)?;
+
+                if !started {
+                    started = target.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                        wrapper
+                            .composite
+                            .borrow()
+                            .as_ref()
+                            .filter(|composite| !composite.is_failed())
+                            .is_some_and(|composite| {
+                                composite.shader_navigation(
+                                    key,
+                                    pending.spec.duration,
+                                    pending.navigation.backwards,
+                                    pending.page && pending.navigation.backwards,
+                                );
+                                true
+                            })
+                    });
+                }
                 if !started {
                     self.detach_view(owner.id)?;
-                    pending.navigation.complete(key);
+                    pending.navigation.mark_fallback(key);
                     owner.animator.track(&owner);
                     owner.animator.request_frame();
                 }
@@ -675,6 +795,8 @@ impl Effects {
             }
             Event::Failed(_) => {
                 let released = self.demands.borrow_mut().release(key);
+                let held = self.held.borrow_mut().release_holder(key, None);
+                self.detach_navigation_views(&held)?;
                 if let Some(pending) = pending {
                     pending.navigation.mark_fallback(key);
                     if let Some(owner) = pending.owner.upgrade() {
@@ -682,13 +804,38 @@ impl Effects {
                         owner.animator.request_frame();
                     }
                     self.sync_capture_roots("fallback", false)?;
-                } else if released {
-                    self.sync_capture_roots("fallback", false)?;
+                } else {
+                    let running_owner = {
+                        let views = self.views.borrow();
+                        views
+                            .get(&key.owner)
+                            .filter(|state| {
+                                state.navigation.as_ref().is_some_and(|nav| nav.key == key)
+                            })
+                            .map(|state| {
+                                if let Some(nav) = &state.navigation {
+                                    nav.mark_fallback(key);
+                                }
+                                state.owner.upgrade()
+                            })
+                    };
+                    if let Some(owner) = running_owner {
+                        self.detach_view(key.owner)?;
+                        if let Some(owner) = owner {
+                            owner.animator.track(&owner);
+                            owner.animator.request_frame();
+                        }
+                        self.sync_capture_roots("fallback", false)?;
+                    } else if released || !held.is_empty() {
+                        self.sync_capture_roots("fallback", false)?;
+                    }
                 }
                 Ok(())
             }
             Event::Completed(_) => {
                 let released = self.demands.borrow_mut().release(key);
+                let held = self.held.borrow_mut().release_holder(key, None);
+                self.detach_navigation_views(&held)?;
                 if let Some(pending) = pending {
                     pending.navigation.complete(key);
                     if let Some(owner) = pending.owner.upgrade() {
@@ -696,32 +843,41 @@ impl Effects {
                         owner.animator.request_frame();
                     }
                 }
-                if released {
+                if released || !held.is_empty() {
                     self.sync_capture_roots("complete", false)?;
                 }
-                self.navigation_complete(key);
+                self.navigation_complete(key)?;
                 Ok(())
             }
         }
     }
 
-    fn navigation_complete(&self, key: Key) {
+    fn navigation_complete(&self, key: Key) -> Result<()> {
+        if self.held.borrow().is_held(key.owner) {
+            return Ok(());
+        }
         let owner = {
             let views = self.views.borrow();
             let Some(state) = views.get(&key.owner) else {
-                return;
+                return Ok(());
             };
             let Some(navigation) = state.navigation.as_ref() else {
-                return;
+                return Ok(());
             };
             if !navigation.complete(key) {
-                return;
+                return Ok(());
             }
-            state.owner.upgrade()
+            Some(state.owner.upgrade())
         };
         if let Some(owner) = owner {
-            owner.animator.request_frame();
+            if let Some(owner) = owner {
+                owner.animator.track(&owner);
+                owner.animator.request_frame();
+            } else {
+                self.detach_view(key.owner)?;
+            }
         }
+        Ok(())
     }
 
     pub(super) fn slot(&self, id: NodeId, slot: u16, value: AnimationValue) {
