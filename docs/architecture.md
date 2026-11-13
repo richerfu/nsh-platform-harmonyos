@@ -73,7 +73,7 @@ Features:
      wrapped subtree via ArkTS `BuilderNode` texture export (`RENDER_TYPE_TEXTURE` -> `OH_NativeImage` OES external
      texture) into a presentation `XComponent` without CPU readback or synchronous wrapper-preview `PixelMap` snapshots.
      Navigation `transitionShader` capture is demand-driven per active transition—reusing an existing `Composite`'s GPU
-     output immediately or exporting only the leaving picture root until its snapshot lands (`100` ms fallback deadline
+     output immediately or exporting only the leaving picture root until its snapshot lands (`500` ms fallback deadline
      to standard motion), causing zero idle texture exports or backdrop-blur `Scene` promotions. Fill shaders retain
      `dirty = true` with bounded backoff retries across transient GL/window errors (failing immediately without retry on
      shader compilation errors and preserving any previous bound window on `Window` bind errors).
