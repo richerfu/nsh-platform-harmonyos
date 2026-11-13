@@ -57,6 +57,7 @@ struct State {
     settings: Settings,
     screen_origin: Option<(i32, i32)>,
     output: Option<Output>,
+    presented: bool,
     surface: Option<std::result::Result<u64, String>>,
     closed: bool,
 }
@@ -864,8 +865,17 @@ impl Worker {
                         }
                     }
                     if !pending_captures.is_empty() {
-                        let now = std::time::Instant::now();
                         let upgraded = route.upgrade();
+                        if frame {
+                            fulfill_captures(
+                                &mut entries,
+                                &mut pending_captures,
+                                &mut captured,
+                                None,
+                                upgraded.as_deref(),
+                            );
+                        }
+                        let now = std::time::Instant::now();
                         pending_captures.retain(|pending| {
                             let live = entries
                                 .get(pending.source.slot())
@@ -1419,6 +1429,7 @@ impl Entry {
         };
         let mut state = self.shared.state.lock().unwrap();
         state.output = Some(Output { frame, x, y });
+        state.presented = true;
         Ok(true)
     }
 }
@@ -1575,6 +1586,17 @@ impl Composite {
     pub(crate) fn is_failed(&self) -> bool {
         self.failed.get()
     }
+    pub(crate) fn has_presented(&self, owner: &Node) -> bool {
+        if owner.scene_active() {
+            owner
+                .scene
+                .borrow()
+                .as_ref()
+                .is_some_and(|scene| scene.has_output())
+        } else {
+            self.shared.state.lock().unwrap().presented
+        }
+    }
     pub(crate) fn new(owner: &Rc<Node>) -> Result<Self> {
         Self::create(owner, false)
     }
@@ -1598,6 +1620,7 @@ impl Composite {
                 settings: initial_settings.clone(),
                 screen_origin: initial_origin,
                 output: None,
+                presented: false,
                 surface: None,
                 closed: false,
             }),

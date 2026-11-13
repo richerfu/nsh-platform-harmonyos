@@ -10,13 +10,20 @@ use nsh_core::NodeId;
 /// Maximum wait for a demand-driven leaving-side snapshot before falling back
 /// to the platform's standard non-shader transition.
 ///
-/// Cold `RENDER_TYPE_TEXTURE` export requires `Task::Create` (`OH_NativeImage`
-/// allocation), `Message::Composite` + `BuilderNode(RENDER_TYPE_TEXTURE)`
-/// subtree attachment, 1–2 RenderService frames (~16.7–33.3 ms at 60 Hz), and
-/// `FrameWake` -> `Entry::snapshot()`. 100 ms (~6 frames at 60 Hz) absorbs cold
-/// GPU/RS scheduling jitter on API 20 devices without false fallbacks while
-/// keeping worst-case fallback latency below perceptual stall thresholds.
-pub(crate) const CAPTURE_DEADLINE: Duration = Duration::from_millis(100);
+/// Calibrated against OpenHarmony 6.0 (`1260x2720`) device measurements:
+/// - Warm `Composite` reuse: ~8–10 ms.
+/// - Cold `ROOT_ID` `BuilderNode(RENDER_TYPE_TEXTURE)` export + in-process Skia
+///   rasterization + `OH_NativeImage` + GLES `Target::copy`: ~73–119 ms steady
+///   state (~110–200 ms under scroll load).
+/// - First-time in-process Skia GPU pipeline warm-up in an Ability lifetime
+///   (since idle `NavShader` exports 0 textures): up to ~357 ms (`Submit task`).
+///
+/// 500 ms (~30 frames at 60 Hz) gives ~4x headroom over steady-state cold
+/// `ROOT_ID` export and absorbs first-use Skia shader compilation without false
+/// fallbacks, while bounding worst-case recovery if a surface stalls. Notice
+/// healthy captures resolve immediately on `Event::Captured` (8–120 ms) and
+/// never wait out the deadline.
+pub(crate) const CAPTURE_DEADLINE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Key {
@@ -136,9 +143,9 @@ pub(crate) fn screen_paint_visible(
 
 /// Whether an opening `Modal` must stay transparent (`presentation = 0.0`) so its
 /// un-shaded `DirectRoot` never flashes while the underlying surface captures or
-/// before the modal's own `RENDER_TYPE_TEXTURE` surface is ready.
-pub(crate) fn modal_open_waiting(shader: &Navigation, has_texture_surface: bool) -> bool {
-    !shader.backwards && (shader.capturing() || !has_texture_surface)
+/// before the modal's own `Composite` has swapped its first shaded frame.
+pub(crate) fn modal_open_waiting(shader: &Navigation, has_presented_frame: bool) -> bool {
+    !shader.backwards && (shader.capturing() || !has_presented_frame)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,7 +476,10 @@ mod tests {
         let nav = Navigation::new(21, true).unwrap();
         demands.request(nav.key, 1, t0 + CAPTURE_DEADLINE);
 
-        assert!(demands.expire(t0 + Duration::from_millis(50)).is_empty());
+        // Measured OHOS cold ROOT_ID export (102–119 ms) and first-use Skia
+        // pipeline init (~357 ms) stay well within CAPTURE_DEADLINE.
+        assert!(demands.expire(t0 + Duration::from_millis(120)).is_empty());
+        assert!(demands.expire(t0 + Duration::from_millis(360)).is_empty());
         assert_eq!(demands.len(), 1);
 
         let expired = demands.expire(t0 + CAPTURE_DEADLINE);

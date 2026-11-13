@@ -354,15 +354,15 @@ impl Modal {
     fn paint(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
             if let Some(nav) = self.shader.borrow().as_ref() {
-                let has_surface = owner.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                let has_presented = owner.wrapper.borrow().as_ref().is_some_and(|wrapper| {
                     wrapper
                         .composite
                         .borrow()
                         .as_ref()
-                        .is_some_and(|composite| composite.surface().is_some())
+                        .is_some_and(|composite| composite.has_presented(&owner))
                 });
                 let waiting_open =
-                    crate::render::shader::navigation::modal_open_waiting(nav, has_surface);
+                    crate::render::shader::navigation::modal_open_waiting(nav, has_presented);
                 return owner.presentation(if waiting_open { 0.0 } else { 1.0 }, 0.0);
             }
             let progress = self.progress.get();
