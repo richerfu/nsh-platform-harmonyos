@@ -400,7 +400,10 @@ pub(crate) const BRIDGE_REATTACH_SETTLE_FRAMES: u8 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BridgeReattachPlan {
     Immediate,
-    Defer { remaining_frames: u8 },
+    Defer {
+        flush_alpha_on_outer: bool,
+        settle_frames: u8,
+    },
 }
 
 /// Places a bridged `Screen` after the active `NativeAttachment` child (if mounted on
@@ -416,11 +419,18 @@ pub(crate) fn plan_bridge_reattach(
 ) -> BridgeReattachPlan {
     if !closed && outer_owned && destination_is_texture_export {
         BridgeReattachPlan::Defer {
-            remaining_frames: BRIDGE_REATTACH_SETTLE_FRAMES,
+            flush_alpha_on_outer: true,
+            settle_frames: BRIDGE_REATTACH_SETTLE_FRAMES,
         }
     } else {
         BridgeReattachPlan::Immediate
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReattachPhase {
+    FlushAlphaOnOuter { settle_frames: u8 },
+    SettleDetached { remaining_frames: u8 },
 }
 
 #[derive(Debug)]
@@ -428,13 +438,14 @@ pub(crate) struct PendingReattachEntry<T> {
     pub id: u64,
     pub stack_id: u32,
     pub peer_id: u32,
-    pub remaining_frames: u8,
+    phase: ReattachPhase,
     pub payload: T,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReattachTick<T> {
     Stale,
+    DetachFromOuter(T),
     WaitMore,
     Complete(T),
 }
@@ -459,32 +470,64 @@ impl<T> PendingReattachQueue<T> {
         &mut self,
         stack_id: u32,
         peer_id: u32,
-        remaining_frames: u8,
+        flush_alpha_on_outer: bool,
+        settle_frames: u8,
         payload: T,
-    ) -> u64 {
-        self.entries.retain(|entry| entry.peer_id != peer_id);
+    ) -> (u64, Option<T>) {
+        let displaced = self.take_peer(peer_id);
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
+        let phase = if flush_alpha_on_outer {
+            ReattachPhase::FlushAlphaOnOuter {
+                settle_frames: settle_frames.max(1),
+            }
+        } else {
+            ReattachPhase::SettleDetached {
+                remaining_frames: settle_frames.max(1),
+            }
+        };
         self.entries.push(PendingReattachEntry {
             id,
             stack_id,
             peer_id,
-            remaining_frames: remaining_frames.max(1),
+            phase,
             payload,
         });
-        id
+        (id, displaced)
     }
 
-    pub(crate) fn on_frame_callback(&mut self, id: u64) -> ReattachTick<T> {
+    pub(crate) fn on_frame_callback(&mut self, id: u64) -> ReattachTick<T>
+    where
+        T: Clone,
+    {
         let Some(pos) = self.entries.iter().position(|entry| entry.id == id) else {
             return ReattachTick::Stale;
         };
-        if self.entries[pos].remaining_frames > 1 {
-            self.entries[pos].remaining_frames -= 1;
-            ReattachTick::WaitMore
-        } else {
-            ReattachTick::Complete(self.entries.remove(pos).payload)
+        match self.entries[pos].phase {
+            ReattachPhase::FlushAlphaOnOuter { settle_frames } => {
+                self.entries[pos].phase = ReattachPhase::SettleDetached {
+                    remaining_frames: settle_frames.max(1),
+                };
+                ReattachTick::DetachFromOuter(self.entries[pos].payload.clone())
+            }
+            ReattachPhase::SettleDetached { remaining_frames } => {
+                if remaining_frames > 1 {
+                    self.entries[pos].phase = ReattachPhase::SettleDetached {
+                        remaining_frames: remaining_frames - 1,
+                    };
+                    ReattachTick::WaitMore
+                } else {
+                    ReattachTick::Complete(self.entries.remove(pos).payload)
+                }
+            }
         }
+    }
+
+    pub(crate) fn iter_on_outer(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().filter_map(|entry| match entry.phase {
+            ReattachPhase::FlushAlphaOnOuter { .. } => Some(&entry.payload),
+            ReattachPhase::SettleDetached { .. } => None,
+        })
     }
 
     pub(crate) fn take_by_id(&mut self, id: u64) -> Option<T> {
@@ -897,7 +940,8 @@ mod tests {
         assert_eq!(
             plan_bridge_reattach(false, true, true),
             BridgeReattachPlan::Defer {
-                remaining_frames: BRIDGE_REATTACH_SETTLE_FRAMES
+                flush_alpha_on_outer: true,
+                settle_frames: BRIDGE_REATTACH_SETTLE_FRAMES,
             }
         );
         assert_eq!(
@@ -915,20 +959,42 @@ mod tests {
     }
 
     #[test]
-    fn pending_reattach_queue_waits_two_frames_and_handles_cancel_and_drain() {
+    fn pending_reattach_queue_flushes_alpha_on_outer_then_settles_and_handles_cancel() {
         let mut queue = PendingReattachQueue::default();
-        let id1 = queue.enqueue(10, 20, BRIDGE_REATTACH_SETTLE_FRAMES, "home");
+        let (id1, displaced) = queue.enqueue(10, 20, true, BRIDGE_REATTACH_SETTLE_FRAMES, "home");
+        assert_eq!(displaced, None);
+        assert_eq!(queue.iter_on_outer().copied().collect::<Vec<_>>(), ["home"]);
 
-        // Frame callback 1 (after `outer` flushed RemoveChild on RenderService): wait 1 more frame.
+        // Callback 1: `outer` flushed `RSNode::SetAlpha(0.0)` while `home` was still on main tree;
+        // now detach `home` from `outer` and begin the 2-frame RS tree settle.
+        assert_eq!(
+            queue.on_frame_callback(id1),
+            ReattachTick::DetachFromOuter("home")
+        );
+        assert!(queue.iter_on_outer().next().is_none());
+        // Callback 2: `outer` rebuilt RS child list without `home`; wait 1 more settle frame.
         assert_eq!(queue.on_frame_callback(id1), ReattachTick::WaitMore);
-        // Frame callback 2 (one complete RS rebuild elapsed): complete reattach into BuilderNode.
+        // Callback 3: RS settle complete; finish reattach into BuilderNode.
         assert_eq!(queue.on_frame_callback(id1), ReattachTick::Complete("home"));
         // Subsequent stale callbacks are ignored.
         assert_eq!(queue.on_frame_callback(id1), ReattachTick::Stale);
 
+        // Enqueuing a duplicate `peer_id` returns the displaced payload so callers never leak state.
+        let (old_id, None) = queue.enqueue(10, 20, true, BRIDGE_REATTACH_SETTLE_FRAMES, "old")
+        else {
+            panic!("expected no prior entry");
+        };
+        let (new_id, displaced) = queue.enqueue(10, 20, false, 1, "new");
+        assert_eq!(displaced, Some("old"));
+        assert_eq!(queue.on_frame_callback(old_id), ReattachTick::Stale);
+        assert_eq!(
+            queue.on_frame_callback(new_id),
+            ReattachTick::Complete("new")
+        );
+
         // Unlinking either `peer` or `stack` cancels without re-inserting.
-        let id2 = queue.enqueue(10, 21, BRIDGE_REATTACH_SETTLE_FRAMES, "peer_a");
-        let id3 = queue.enqueue(11, 22, BRIDGE_REATTACH_SETTLE_FRAMES, "peer_b");
+        let (id2, _) = queue.enqueue(10, 21, true, BRIDGE_REATTACH_SETTLE_FRAMES, "peer_a");
+        let (id3, _) = queue.enqueue(11, 22, true, BRIDGE_REATTACH_SETTLE_FRAMES, "peer_b");
         assert_eq!(queue.take_referencing(21), vec!["peer_a"]);
         assert_eq!(queue.on_frame_callback(id2), ReattachTick::Stale);
         // Unlinking an unrelated screen (`screen_owner` id = 99) leaves pending reattach intact.
@@ -938,17 +1004,17 @@ mod tests {
 
         // Re-bridging the same `peer`, failed callback fallback (`take_by_id`), or returning to
         // `DirectRoot` drains cleanly.
-        let id4 = queue.enqueue(10, 30, BRIDGE_REATTACH_SETTLE_FRAMES, "rebridged");
+        let (id4, _) = queue.enqueue(10, 30, true, BRIDGE_REATTACH_SETTLE_FRAMES, "rebridged");
         assert_eq!(queue.take_peer(30), Some("rebridged"));
         assert_eq!(queue.on_frame_callback(id4), ReattachTick::Stale);
 
-        let id5 = queue.enqueue(10, 33, BRIDGE_REATTACH_SETTLE_FRAMES, "fallback");
+        let (id5, _) = queue.enqueue(10, 33, true, BRIDGE_REATTACH_SETTLE_FRAMES, "fallback");
         assert_eq!(queue.take_by_id(id5), Some("fallback"));
         assert_eq!(queue.take_by_id(id5), None);
         assert_eq!(queue.on_frame_callback(id5), ReattachTick::Stale);
 
-        let _ = queue.enqueue(10, 31, BRIDGE_REATTACH_SETTLE_FRAMES, "d1");
-        let _ = queue.enqueue(10, 32, BRIDGE_REATTACH_SETTLE_FRAMES, "d2");
+        let _ = queue.enqueue(10, 31, true, BRIDGE_REATTACH_SETTLE_FRAMES, "d1");
+        let _ = queue.enqueue(10, 32, false, BRIDGE_REATTACH_SETTLE_FRAMES, "d2");
         assert_eq!(queue.drain_all(), vec!["d1", "d2"]);
         assert!(queue.drain_all().is_empty());
     }
