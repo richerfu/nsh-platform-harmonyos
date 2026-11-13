@@ -455,27 +455,15 @@ impl Wrapper {
                 .any(|c| Rc::ptr_eq(c, &mounted));
             let in_export =
                 !already_mounted && stack.inside_texture_export() && root_owner.is_some();
-            let repair = if in_export && peer.desired_visibility() != 0 {
+            Self::release_entry_export_repair(&mut entry);
+            peer.restore_after_export()?;
+            let repair = if in_export {
                 let export = Rc::new(crate::interop::texture_export::Export::default());
                 export.enabled.set(true);
-                let prep = export.prepare(&peer, &mounted);
-                Self::release_entry_export_repair(&mut entry);
-                if let Err(error) = prep {
-                    peer.restore_after_export()?;
-                    return Err(error);
-                }
+                export.prepare(&peer, &mounted)?;
                 Some(export)
             } else {
-                Self::release_entry_export_repair(&mut entry);
-                peer.restore_after_export()?;
-                if in_export {
-                    let export = Rc::new(crate::interop::texture_export::Export::default());
-                    export.enabled.set(true);
-                    export.prepare(&peer, &mounted)?;
-                    Some(export)
-                } else {
-                    None
-                }
+                None
             };
             if !already_mounted
                 && let Err(error) = container

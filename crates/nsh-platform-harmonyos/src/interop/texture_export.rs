@@ -18,6 +18,7 @@ use std::{
 use ohos_arkui_binding::{
     component::attribute::ArkUICommonAttribute,
     types::{
+        advanced::NodeDirtyFlag,
         attribute::ArkUINodeAttributeType as A,
         view::{AccessibilityMode, HitTestMode},
     },
@@ -248,6 +249,9 @@ impl Export {
             let Some(native) = hidden.native.upgrade() else {
                 return Ok(());
             };
+            let keep_transparent = owner.as_ref().is_some_and(|owner| {
+                owner.export_repair.get() != 0 || owner.native_visibility_hidden()
+            });
             {
                 let node = native.borrow();
                 if !node.is_owned() {
@@ -258,7 +262,11 @@ impl Export {
                     .is_none_or(|owner| Rc::ptr_eq(&native, &owner.visual_node()))
                 {
                     node.set_i32_attribute(A::Visibility, hidden.visibility)?;
-                    node.opacity(hidden.opacity)?;
+                    node.opacity(if keep_transparent {
+                        0.0
+                    } else {
+                        hidden.opacity
+                    })?;
                 }
                 node.set_i32_attribute(A::HitTestBehavior, hidden.hit_test)?;
                 node.set_i32_attribute(A::AccessibilityMode, hidden.accessibility)?;
@@ -267,9 +275,24 @@ impl Export {
             if let Some(owner) = owner {
                 owner.restore_after_export()?;
                 owner.invalidate_subtree_paint()?;
+                if owner.native_visibility_hidden()
+                    && let Some(parent) = owner.mount_parent.borrow().upgrade()
+                    && let Ok(parent_node) = parent.try_borrow()
+                    && parent_node.is_owned()
+                {
+                    parent_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+                    parent_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
+                }
             }
             if let Some(controls) = hidden.controls.and_then(|node| node.upgrade()) {
                 controls.restore_export_controls()?;
+                if hidden.visibility != 0
+                    && let Ok(parent_node) = controls.native.try_borrow()
+                    && parent_node.is_owned()
+                {
+                    parent_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+                    parent_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
+                }
             }
             Ok(())
         });

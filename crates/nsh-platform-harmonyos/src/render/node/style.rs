@@ -262,8 +262,8 @@ impl Node {
         self.sync_visual_node(&visual);
         self.apply_effects(style)?;
         self.apply_z_index()?;
-        self.apply_opacity(style.opacity)?;
         self.transform(style, |_| None)?;
+        self.apply_opacity(style.opacity)?;
         self.animator.apply_node(self)?;
         Ok(())
     }
@@ -285,13 +285,12 @@ impl Node {
         }
         self.interaction.opacity(
             self,
-            if self.export_repair.get() != 0 {
-                0.0
-            } else if scene_active {
-                1.0
-            } else {
-                self.visual_opacity_for(style_opacity)
-            },
+            crate::render::effects::resolve_native_node_opacity(
+                self.export_repair.get(),
+                self.native_visibility_hidden(),
+                scene_active,
+                self.visual_opacity_for(style_opacity),
+            ),
         )
     }
     pub(super) fn apply_background_color(&self, color: nsh_core::Color) -> Result<()> {

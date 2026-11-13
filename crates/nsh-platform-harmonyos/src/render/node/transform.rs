@@ -4,7 +4,7 @@ use nsh_core::{Points, ViewStyle};
 use ohos_arkui_binding::{
     common::attribute::ArkUINodeAttributeNumber as Number,
     component::attribute::ArkUICommonAttribute,
-    types::attribute::ArkUINodeAttributeType as Attribute,
+    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
 };
 
 use super::{Node, Result};
@@ -23,6 +23,19 @@ impl Node {
         } else {
             i32::from(self.style.borrow().hidden)
         }
+    }
+    pub(crate) fn native_visibility_hidden(&self) -> bool {
+        self.desired_visibility() != 0 || self.backface_away.get()
+    }
+    fn notify_mount_parent_visibility_hidden(&self) -> Result<()> {
+        if let Some(parent) = self.mount_parent.borrow().upgrade()
+            && let Ok(parent_node) = parent.try_borrow()
+            && parent_node.is_owned()
+        {
+            parent_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            parent_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
+        Ok(())
     }
     /// Native child-plane transform, calculated once for a hit-test descent.
     pub(crate) fn input_children_transform(&self) -> Result<nsh_core::Matrix> {
@@ -137,9 +150,9 @@ impl Node {
             } else {
                 self.desired_visibility()
             };
-            let revealed =
-                applied.visibility != visibility && applied.visibility != 0 && visibility == 0;
-            if applied.visibility != visibility {
+            let visibility_changed = applied.visibility != visibility;
+            let revealed = visibility_changed && applied.visibility != 0 && visibility == 0;
+            if visibility_changed {
                 native.set_i32_attribute(Attribute::Visibility, visibility)?;
                 applied.visibility = visibility;
             }
@@ -150,6 +163,12 @@ impl Node {
             }
             self.applied.set(applied);
             drop(native);
+            if visibility_changed {
+                self.apply_opacity(style.opacity)?;
+                if visibility != 0 {
+                    self.notify_mount_parent_visibility_hidden()?;
+                }
+            }
             if revealed {
                 self.schedule_subtree_paint(2)?;
             }
@@ -214,9 +233,9 @@ impl Node {
         } else {
             i32::from(style.hidden || self.backface_away.get())
         };
-        let revealed =
-            applied.visibility != visibility && applied.visibility != 0 && visibility == 0;
-        if applied.visibility != visibility {
+        let visibility_changed = applied.visibility != visibility;
+        let revealed = visibility_changed && applied.visibility != 0 && visibility == 0;
+        if visibility_changed {
             native.set_i32_attribute(Attribute::Visibility, visibility)?;
             applied.visibility = visibility;
         }
@@ -245,6 +264,12 @@ impl Node {
         }
         self.applied.set(applied);
         drop(native);
+        if visibility_changed {
+            self.apply_opacity(style.opacity)?;
+            if visibility != 0 {
+                self.notify_mount_parent_visibility_hidden()?;
+            }
+        }
         if revealed {
             self.schedule_subtree_paint(2)?;
         }

@@ -50,6 +50,29 @@ pub(crate) fn resolve_visual_opacity(
     animated_opacity.unwrap_or(style_opacity) * presentation * extra * navigation
 }
 
+/// Resolves the `ArkUINode` `Opacity` (`RSNode::SetAlpha`) written to `visual_node()`.
+///
+/// In ArkUI/Rosen, `Attribute::Opacity` flushes immediately on the child's own
+/// `FlushModifyTask`, whereas `Attribute::Visibility` (`Hidden`/`None`) only
+/// detaches the child's `RSNode` when its parent `FrameNode` runs
+/// `RebuildRenderContextTree()`. Keeping `Opacity == 0.0` whenever a node is
+/// hidden (`native_visibility_hidden`) or under `export_repair` prevents any
+/// 1-frame `Alpha = 1.0` flash before parent render-tree rebuilds.
+pub(crate) fn resolve_native_node_opacity(
+    export_repair: u32,
+    native_visibility_hidden: bool,
+    scene_active: bool,
+    combined_opacity: f32,
+) -> f32 {
+    if export_repair != 0 || native_visibility_hidden {
+        0.0
+    } else if scene_active {
+        1.0
+    } else {
+        combined_opacity
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EffectsContext {
     pub(crate) has_shaders: bool,
@@ -390,5 +413,14 @@ mod tests {
         assert!((resolve_visual_opacity(0.8, Some(0.5), 0.5, 0.8, 0.5) - 0.1).abs() < 1e-6);
         // Unbinding restores the static style opacity without losing presentation factors.
         assert!((resolve_visual_opacity(0.6, None, 0.5, 1.0, 1.0) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn native_node_opacity_stays_zero_while_visibility_hidden_or_under_export_repair() {
+        assert_eq!(resolve_native_node_opacity(1, false, false, 1.0), 0.0);
+        assert_eq!(resolve_native_node_opacity(0, true, false, 1.0), 0.0);
+        assert_eq!(resolve_native_node_opacity(0, true, true, 0.8), 0.0);
+        assert!((resolve_native_node_opacity(0, false, false, 0.75) - 0.75).abs() < 1e-6);
+        assert!((resolve_native_node_opacity(0, false, true, 0.25) - 1.0).abs() < 1e-6);
     }
 }
