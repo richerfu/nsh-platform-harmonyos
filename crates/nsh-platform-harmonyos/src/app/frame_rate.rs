@@ -61,6 +61,16 @@ struct State {
 }
 
 impl State {
+    /// Arbitrates the shared window-associated `NativeVSync` rate range (A08).
+    ///
+    /// Intentional policy: while any GPU shader animation holds a vote
+    /// (`shader_votes > 0`), the shared `NativeVSync` handle must run at full
+    /// panel `hz` so active shaders are never down-throttled by a concurrent
+    /// `UiDemand::Capped` UI animation; as soon as the last shader vote drops,
+    /// any active UI cap immediately resumes. If strict per-animation UI rate
+    /// limiting is ever required alongside an active shader, throttle that
+    /// consumer per-deadline inside `Animator` rather than lowering the shared
+    /// VSync rate range here.
     fn desired(&self) -> RateRange {
         let hz = self.hz as i32;
         if self.shader_votes > 0 {
@@ -231,6 +241,28 @@ pub(crate) fn normalize_display_hz(raw: u32) -> u32 {
     }
 }
 
+/// Parses an optional `NSH_VSYNC_KEEPALIVE` runtime override (`0`/`false`/`off`
+/// disables, `1`/`true`/`on` enables, unset or unrecognized falls back to `default`).
+pub(crate) fn parse_keepalive_switch(raw: Option<&str>, default: bool) -> bool {
+    match raw.map(str::trim) {
+        Some(v)
+            if v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off") =>
+        {
+            false
+        }
+        Some(v)
+            if v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on") =>
+        {
+            true
+        }
+        _ => default,
+    }
+}
+
 #[cfg(target_env = "ohos")]
 pub(crate) fn display_hz() -> u32 {
     normalize_display_hz(ohos_display_binding::default_display_refresh_rate())
@@ -366,5 +398,18 @@ mod tests {
                 expected: 30,
             })
         );
+    }
+
+    #[test]
+    fn keepalive_switch_preserves_default_and_honors_env_values() {
+        assert!(parse_keepalive_switch(None, true));
+        assert!(!parse_keepalive_switch(None, false));
+        assert!(!parse_keepalive_switch(Some("0"), true));
+        assert!(!parse_keepalive_switch(Some("false"), true));
+        assert!(!parse_keepalive_switch(Some("OFF"), true));
+        assert!(parse_keepalive_switch(Some("1"), false));
+        assert!(parse_keepalive_switch(Some("true"), false));
+        assert!(parse_keepalive_switch(Some("On"), false));
+        assert!(parse_keepalive_switch(Some(""), true));
     }
 }

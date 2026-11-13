@@ -339,26 +339,85 @@ impl MountSink for Sink {
     }
 }
 
+/// Runtime default for the LTPO VSync keepalive burst (A15).
+/// Kept `true` by default so existing behavior is unchanged; flip to `false` or
+/// set process env `NSH_VSYNC_KEEPALIVE=0` (`0`/`false`/`off`) to measure on/off
+/// on device without compile-time feature flags.
+const VSYNC_KEEPALIVE_DEFAULT: bool = true;
+
+fn vsync_keepalive_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let raw = std::env::var("NSH_VSYNC_KEEPALIVE").ok();
+        crate::app::frame_rate::parse_keepalive_switch(raw.as_deref(), VSYNC_KEEPALIVE_DEFAULT)
+    })
+}
+
 struct VsyncVote {
     remaining: std::sync::atomic::AtomicU8,
     armed: std::sync::atomic::AtomicBool,
     active: std::sync::atomic::AtomicBool,
+    window_callbacks: std::sync::atomic::AtomicU64,
+    total_callbacks: std::sync::atomic::AtomicU64,
+    last_log_ns: std::sync::atomic::AtomicU64,
+}
+
+impl VsyncVote {
+    fn flush_burst_log(&self) {
+        use std::sync::atomic::Ordering;
+        let callbacks = self.window_callbacks.swap(0, Ordering::AcqRel);
+        if callbacks > 0 {
+            let total = self.total_callbacks.load(Ordering::Relaxed);
+            log::info!(
+                "[NSH] vsync-keepalive enabled={} callbacks={} total_callbacks={}",
+                vsync_keepalive_enabled(),
+                callbacks,
+                total,
+            );
+        }
+    }
 }
 
 fn arm_vsync_vote(vsync: &Arc<Vsync>, vote: &Arc<VsyncVote>) {
     use std::sync::atomic::Ordering;
-    if !vote.active.load(Ordering::Acquire) {
+    if !vote.active.load(Ordering::Acquire) || !vsync_keepalive_enabled() {
         vote.remaining.store(0, Ordering::Release);
         vote.armed.store(false, Ordering::Release);
+        vote.flush_burst_log();
         return;
     }
     let weak = Arc::downgrade(vsync);
     let vote_cb = vote.clone();
-    if vsync.request_frame_once(move |_| {
-        if !vote_cb.active.load(Ordering::Acquire) {
+    if vsync.request_frame_once(move |timestamp| {
+        if !vote_cb.active.load(Ordering::Acquire) || !vsync_keepalive_enabled() {
             vote_cb.remaining.store(0, Ordering::Release);
             vote_cb.armed.store(false, Ordering::Release);
+            vote_cb.flush_burst_log();
             return;
+        }
+        let window = vote_cb.window_callbacks.fetch_add(1, Ordering::Relaxed) + 1;
+        let total = vote_cb.total_callbacks.fetch_add(1, Ordering::Relaxed) + 1;
+        let ts = timestamp.max(0) as u64;
+        let last_ns = vote_cb.last_log_ns.load(Ordering::Relaxed);
+        if last_ns == 0 {
+            let _ =
+                vote_cb
+                    .last_log_ns
+                    .compare_exchange(0, ts, Ordering::Relaxed, Ordering::Relaxed);
+        } else if ts.saturating_sub(last_ns) >= 1_000_000_000
+            && vote_cb
+                .last_log_ns
+                .compare_exchange(last_ns, ts, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let callbacks = vote_cb.window_callbacks.swap(0, Ordering::AcqRel);
+            if callbacks > 0 {
+                log::info!(
+                    "[NSH] vsync-keepalive enabled=true callbacks={} total_callbacks={}",
+                    callbacks.max(window),
+                    total,
+                );
+            }
         }
         let prev = vote_cb
             .remaining
@@ -382,11 +441,15 @@ fn arm_vsync_vote(vsync: &Arc<Vsync>, vote: &Arc<VsyncVote>) {
                     .is_ok()
             {
                 arm_vsync_vote(&vsync, &vote_cb);
+            } else {
+                vote_cb.last_log_ns.store(0, Ordering::Relaxed);
+                vote_cb.flush_burst_log();
             }
         }
     }) != 0
     {
         vote.armed.store(false, Ordering::Release);
+        vote.flush_burst_log();
     }
 }
 
@@ -690,7 +753,7 @@ impl State {
     }
     fn pulse_frame_rate_vote(&self) {
         use std::sync::atomic::Ordering;
-        if !self.is_active() {
+        if !self.is_active() || !vsync_keepalive_enabled() {
             return;
         }
         // Keep the window-associated VSync active across ~33 ms of scroll batches
@@ -968,10 +1031,17 @@ impl Runtime {
                 "failed to configure OHOS native VSync rate: {status}"
             )));
         }
+        let keepalive_enabled = vsync_keepalive_enabled();
+        log::info!(
+            "[NSH] vsync-keepalive enabled={keepalive_enabled} callbacks=0 total_callbacks=0"
+        );
         let vsync_vote = Arc::new(VsyncVote {
             remaining: std::sync::atomic::AtomicU8::new(0),
             armed: std::sync::atomic::AtomicBool::new(false),
             active: std::sync::atomic::AtomicBool::new(true),
+            window_callbacks: std::sync::atomic::AtomicU64::new(0),
+            total_callbacks: std::sync::atomic::AtomicU64::new(0),
+            last_log_ns: std::sync::atomic::AtomicU64::new(0),
         });
         // The shader thread paces itself on the surface's shared FrameRate too.
         let shader_rate = frame_rate.clone();
