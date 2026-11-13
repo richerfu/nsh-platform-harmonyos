@@ -14,7 +14,6 @@ pub(super) struct Presentation {
     origin: (i32, i32),
     size: (u32, u32),
     revealed: bool,
-    committed: bool,
 }
 
 impl Presentation {
@@ -40,7 +39,6 @@ impl Presentation {
             origin: (0, 0),
             size: (0, 0),
             revealed: false,
-            committed: false,
         };
         let frame = owner.frame.get();
         let scale = owner.scale.get();
@@ -54,8 +52,8 @@ impl Presentation {
         Ok(layer)
     }
 
-    pub(super) fn is_committed(&self) -> bool {
-        self.committed
+    pub(super) fn is_revealed(&self) -> bool {
+        self.revealed
     }
 
     pub(super) fn reveal(&mut self) -> Result<bool> {
@@ -67,14 +65,6 @@ impl Presentation {
             return Ok(true);
         }
         Ok(false)
-    }
-
-    pub(super) fn commit(&mut self) -> bool {
-        if self.revealed && !self.committed {
-            self.committed = true;
-            return true;
-        }
-        false
     }
 
     pub(super) fn hide(&self) {

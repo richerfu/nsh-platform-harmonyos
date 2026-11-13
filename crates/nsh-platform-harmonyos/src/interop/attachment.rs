@@ -200,6 +200,7 @@ static NEXT_TARGET_ID: AtomicU32 = AtomicU32::new(1);
 
 thread_local! {
     static TARGETS: RefCell<BTreeMap<u32, Rc<Target>>> = RefCell::default();
+    static SUBTREE_OWNERS: RefCell<BTreeMap<usize, u32>> = RefCell::default();
 }
 
 struct RetainedContent {
@@ -248,8 +249,8 @@ impl Target {
         })
     }
 
-    fn detach_inner(&self) -> Result<()> {
-        let inner = self.inner.borrow();
+    fn detach_subtree_slot(&self) -> Result<bool> {
+        let inner = self.inner.borrow().clone();
         if let (Some(handle), Some(inner)) = (self.slot.get(), inner.as_ref()) {
             if self.inner_receiver_active.get() {
                 inner
@@ -263,7 +264,58 @@ impl Target {
                 .map_err(|error| Error::from_reason(error.to_string()))?;
             self.slot.set(None);
             ohos_arkui_binding::common::node_registry::unregister(&inner.borrow());
+            let inner_key = Rc::as_ptr(inner) as usize;
+            SUBTREE_OWNERS.with(|owners| {
+                let mut owners = owners.borrow_mut();
+                if owners.get(&inner_key) == Some(&self.id) {
+                    owners.remove(&inner_key);
+                }
+            });
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    fn release_handed_off_subtree(&self) -> Result<bool> {
+        let _active = self.state.enter().map_err(|error| {
+            Error::from_reason(format!("Native attachment target {} {error}", self.id))
+        })?;
+        let detached = self.detach_subtree_slot()?;
+        self.inner.borrow_mut().take();
+        Ok(detached)
+    }
+
+    fn mount_subtree_slot(
+        &self,
+        handle: ArkUIHandle,
+        inner: &Rc<RefCell<ArkUINode>>,
+    ) -> Result<()> {
+        NodeContent::from_handle(handle)
+            .add_node(&inner.borrow())
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        self.slot.set(Some(handle));
+        let inner_key = Rc::as_ptr(inner) as usize;
+        SUBTREE_OWNERS.with(|owners| {
+            owners.borrow_mut().insert(inner_key, self.id);
+        });
+        ohos_arkui_binding::common::node_registry::register(&inner.borrow(), inner.clone())
+            .and_then(|()| inner.borrow().add_event_receiver())
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        self.inner_receiver_active.set(true);
+        let _ = inner
+            .borrow()
+            .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure);
+        let _ = inner
+            .borrow()
+            .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout);
+        let _ = inner
+            .borrow()
+            .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
+        Ok(())
+    }
+
+    fn detach_inner(&self) -> Result<()> {
+        self.detach_subtree_slot()?;
         if let Some(child) = self.child.borrow().clone() {
             let parent = self.parent.borrow();
             let parent = parent
@@ -297,6 +349,8 @@ impl Target {
             } else if let Some(index) = index {
                 parent.children_mut().remove(index);
             }
+            let _ =
+                parent.mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
         }
         self.child.borrow_mut().take();
         self.retained.borrow_mut().take();
@@ -353,6 +407,47 @@ fn target(id: u32) -> Result<Rc<Target>> {
     TARGETS
         .with(|targets| targets.borrow().get(&id).cloned())
         .ok_or_else(|| Error::from_reason(format!("Unknown native attachment target {id}")))
+}
+
+fn detach_previous_subtree_owner(
+    claiming_id: u32,
+    inner: &Rc<RefCell<ArkUINode>>,
+    parent: &Rc<RefCell<ArkUINode>>,
+) -> Result<()> {
+    let inner_key = Rc::as_ptr(inner) as usize;
+    let previous_id = SUBTREE_OWNERS.with(|owners| owners.borrow().get(&inner_key).copied());
+    let mut detached_from_slot = false;
+    if let Some(previous_id) = previous_id
+        && previous_id != claiming_id
+    {
+        let previous = TARGETS.with(|targets| targets.borrow().get(&previous_id).cloned());
+        if let Some(previous) = previous {
+            detached_from_slot = previous.release_handed_off_subtree()?;
+        } else {
+            SUBTREE_OWNERS.with(|owners| {
+                owners.borrow_mut().remove(&inner_key);
+            });
+        }
+    }
+    if !detached_from_slot {
+        // Nodes that have not yet been mounted through `add_child` (such as
+        // `ROOT_ID` or nodes transitioning directly from a retired wrapper)
+        // have no active `node_event_receiver`, for which ArkUI returns
+        // `ARKUI_ERROR_CODE_PARAM_INVALID`. Only restore on failure if one
+        // was actually removed here.
+        let removed_receiver = inner.borrow().remove_event_receiver().is_ok();
+        if let Err(error) = inner.borrow().remove_from_parent() {
+            if removed_receiver && let Err(restore_error) = inner.borrow().add_event_receiver() {
+                log::error!("Failed to restore native subtree event receiver: {restore_error}");
+            }
+            return Err(Error::from_reason(error.to_string()));
+        }
+    }
+    parent
+        .borrow_mut()
+        .children_mut()
+        .retain(|child| !Rc::ptr_eq(child, inner));
+    Ok(())
 }
 
 /// The single UI-thread owner of an externally constructed native subtree.
@@ -464,11 +559,12 @@ impl NativeAttachment {
         if target.child.borrow().is_some() {
             return Err(Error::from_reason("Native attachment is already occupied"));
         }
-        let parent = target.parent.borrow();
-        let parent = parent
-            .as_ref()
+        let parent = target
+            .parent
+            .borrow()
+            .clone()
             .ok_or_else(|| Error::from_reason("Native attachment parent is retired"))?;
-        let inner = target.inner.borrow();
+        let inner = target.inner.borrow().clone();
         if slot.is_some() != inner.is_some() {
             return Err(Error::from_reason(
                 "Native attachment subtree does not match its registered target",
@@ -490,23 +586,7 @@ impl NativeAttachment {
             })
             .transpose()?;
         if let Some(inner) = inner.as_ref() {
-            // Nodes that have not yet been mounted through `add_child` (such as
-            // `ROOT_ID` or nodes transitioning directly from a retired wrapper)
-            // have no active `node_event_receiver`, for which ArkUI returns
-            // `ARKUI_ERROR_CODE_PARAM_INVALID`. Only restore on failure if one
-            // was actually removed here.
-            let removed_receiver = inner.borrow().remove_event_receiver().is_ok();
-            if let Err(error) = inner.borrow().remove_from_parent() {
-                if removed_receiver && let Err(restore_error) = inner.borrow().add_event_receiver()
-                {
-                    log::error!("Failed to restore native subtree event receiver: {restore_error}");
-                }
-                return Err(Error::from_reason(error.to_string()));
-            }
-            parent
-                .borrow_mut()
-                .children_mut()
-                .retain(|child| !Rc::ptr_eq(child, inner));
+            detach_previous_subtree_owner(target.id, inner, &parent)?;
         }
         parent
             .borrow_mut()
@@ -514,29 +594,11 @@ impl NativeAttachment {
             .map_err(|error| Error::from_reason(error.to_string()))?;
         *target.child.borrow_mut() = Some(child.clone());
         *target.retained.borrow_mut() = Some(retained);
-        if let (Some(handle), Some(inner)) = (handle, inner.as_ref()) {
-            if let Err(error) = NodeContent::from_handle(handle).add_node(&inner.borrow()) {
-                target.detach_inner()?;
-                return Err(Error::from_reason(error.to_string()));
-            }
-            target.slot.set(Some(handle));
-            if let Err(error) =
-                ohos_arkui_binding::common::node_registry::register(&inner.borrow(), inner.clone())
-                    .and_then(|()| inner.borrow().add_event_receiver())
-            {
-                target.detach_inner()?;
-                return Err(Error::from_reason(error.to_string()));
-            }
-            target.inner_receiver_active.set(true);
-            let _ = inner
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure);
-            let _ = inner
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout);
-            let _ = inner
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
+        if let (Some(handle), Some(inner)) = (handle, inner.as_ref())
+            && let Err(error) = target.mount_subtree_slot(handle, inner)
+        {
+            target.detach_inner()?;
+            return Err(Error::from_reason(error.to_string()));
         }
         let _ = child
             .borrow()
@@ -550,6 +612,9 @@ impl NativeAttachment {
         let _ = parent
             .borrow()
             .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout);
+        let _ = parent
+            .borrow()
+            .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
         Ok(())
     }
 

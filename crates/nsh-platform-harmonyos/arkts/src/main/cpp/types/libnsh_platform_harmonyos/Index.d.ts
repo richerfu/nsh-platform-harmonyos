@@ -362,13 +362,11 @@ export interface TextureInsets {
 
 export interface ViewOptions {
   targetId: number
-  replaces?: number
   width: number
   height: number
   hue: number
   textureSurface?: string
   textureInsets?: TextureInsets
-  textureReady: boolean
   testId?: string
   semantic: boolean
   clickable: boolean

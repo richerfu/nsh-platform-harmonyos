@@ -1825,25 +1825,11 @@ impl Composite {
     pub(crate) fn surface(&self) -> Option<String> {
         self.surface.borrow().clone()
     }
-    pub(crate) fn is_ready(&self, owner: &Node) -> bool {
-        if owner.scene_active() {
-            owner
-                .scene
-                .borrow()
-                .as_ref()
-                .is_some_and(|scene| scene.has_output())
-        } else {
-            self.presentation
-                .borrow()
-                .as_ref()
-                .is_some_and(super::presentation::Presentation::is_committed)
-        }
-    }
-    pub(crate) fn commit_presentation(&self) -> bool {
+    pub(crate) fn is_revealed(&self) -> bool {
         self.presentation
-            .borrow_mut()
-            .as_mut()
-            .is_some_and(super::presentation::Presentation::commit)
+            .borrow()
+            .as_ref()
+            .is_some_and(super::presentation::Presentation::is_revealed)
     }
     pub(crate) fn ready(&self) -> (bool, bool) {
         let surface = self.shared.state.lock().unwrap().surface.take();

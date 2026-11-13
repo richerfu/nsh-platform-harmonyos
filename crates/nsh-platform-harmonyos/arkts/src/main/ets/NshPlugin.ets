@@ -33,12 +33,12 @@ export class NshPlugin {
       }
     };
     runStep((): void => this.editors.remove(batch.removeEditors, context));
-    runStep((): void => this.views.remove(batch.removeViews, context, batch.views));
     runStep((): void => this.webs.remove(batch.removeWebs, context));
     runStep((): void =>
       this.editors.update(batch.editors, failure ? [] : batch.commands, context),
     );
     runStep((): void => this.views.update(batch.views, context));
+    runStep((): void => this.views.remove(batch.removeViews, context));
     runStep((): void =>
       this.webs.update(batch.webs, failure ? [] : batch.webCommands, context),
     );

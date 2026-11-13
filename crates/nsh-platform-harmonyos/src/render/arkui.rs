@@ -215,7 +215,7 @@ impl crate::render::mount::UiContext {
         }
         Ok(())
     }
-    pub(crate) fn view_update(&self, mut settings: ViewOptions) {
+    pub(crate) fn view_update(&self, settings: ViewOptions) {
         let mut pending = self.arkui.borrow_mut();
         let wake = pending.is_empty();
         if let Some(old) = pending
@@ -223,9 +223,6 @@ impl crate::render::mount::UiContext {
             .iter_mut()
             .find(|old| old.target_id == settings.target_id)
         {
-            if settings.replaces.is_none() {
-                settings.replaces = old.replaces;
-            }
             *old = settings;
         } else {
             pending.views.push(settings);
@@ -235,30 +232,21 @@ impl crate::render::mount::UiContext {
             self.editor_wake();
         }
     }
-    pub(crate) fn view_remove(&self, target: NativeAttachment) -> Option<u32> {
+    pub(crate) fn view_remove(&self, target: NativeAttachment) {
         let id = target.id();
-        let mut pending = self.arkui.borrow_mut();
-        let inherited_replaces = pending
+        self.arkui
+            .borrow_mut()
             .views
-            .iter()
-            .find(|update| update.target_id == id)
-            .and_then(|update| update.replaces);
-        pending.views.retain(|update| update.target_id != id);
-        drop(pending);
-        let target = self.retire_unattached(target);
-        let replaced = if let Some(target) = target {
+            .retain(|update| update.target_id != id);
+        if let Some(target) = self.retire_unattached(target) {
             let mut pending = self.arkui.borrow_mut();
             if !pending.remove_views.contains(&id) {
                 pending.remove_views.push(id);
             }
             drop(pending);
             self.arkui_views.borrow_mut().push(target);
-            Some(id)
-        } else {
-            inherited_replaces
-        };
+        }
         self.editor_wake();
-        replaced
     }
 }
 

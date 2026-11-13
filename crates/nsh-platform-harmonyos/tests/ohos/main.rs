@@ -23,6 +23,8 @@ mod features;
 mod geometry;
 #[path = "../../src/media/request.rs"]
 mod image_request;
+#[path = "../../src/interop/handoff.rs"]
+mod interop_handoff;
 #[path = "../../src/navigation/motion.rs"]
 mod navigation_motion;
 #[path = "../../src/scroll/motion.rs"]
