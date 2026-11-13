@@ -11,9 +11,53 @@ use ohos_drawing_binding::Canvas;
 
 use super::{Error, Node, Result, callback};
 use crate::{
-    render::geometry::{Rect, Size},
+    render::{
+        geometry::{Rect, Size},
+        subtree_paint::{
+            SubtreePaint, SubtreePaintNode, commit_schedule, plan_schedule, step_frame,
+        },
+    },
     text::typography::{NativeText, argb},
 };
+
+impl SubtreePaintNode for Rc<Node> {
+    fn is_live(&self) -> bool {
+        self.active.get() && !self.pending_delete.get()
+    }
+
+    fn paint_state(&self) -> SubtreePaint {
+        self.paint_state.get()
+    }
+
+    fn set_paint_state(&self, state: SubtreePaint) {
+        self.paint_state.set(state);
+    }
+
+    fn parent_repaint_owner(&self) -> Option<Self> {
+        self.parent_node.borrow().upgrade().or_else(|| {
+            self.retained
+                .get()
+                .then(|| self.retained_owner.borrow().upgrade())
+                .flatten()
+        })
+    }
+
+    fn for_each_repaint_child(&self, f: &mut dyn FnMut(Self)) {
+        for child in self.children.borrow().iter().filter_map(Weak::upgrade) {
+            f(child);
+        }
+        for child in self
+            .retained_children
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            if child.retained.get() {
+                f(child);
+            }
+        }
+    }
+}
 
 impl Node {
     /// Plain native containers need no recording canvas. Install custom paint
@@ -195,31 +239,6 @@ impl Node {
         self.set_events(self.interaction.mask())?;
         Ok(links_changed)
     }
-    fn has_ancestor_repaint(&self, min_frames: u8) -> bool {
-        let mut cur = self.parent_node.borrow().upgrade().or_else(|| {
-            self.retained
-                .get()
-                .then(|| self.retained_owner.borrow().upgrade())
-                .flatten()
-        });
-        while let Some(ancestor) = cur {
-            if ancestor.active.get()
-                && !ancestor.pending_delete.get()
-                && ancestor.paint_frames.get() >= min_frames
-            {
-                return true;
-            }
-            cur = ancestor.parent_node.borrow().upgrade().or_else(|| {
-                ancestor
-                    .retained
-                    .get()
-                    .then(|| ancestor.retained_owner.borrow().upgrade())
-                    .flatten()
-            });
-        }
-        false
-    }
-
     /// Re-record custom paint after a native visibility or render-target change.
     pub(crate) fn invalidate_subtree_paint(&self) -> Result<()> {
         if !self.active.get() || self.pending_delete.get() {
@@ -254,18 +273,16 @@ impl Node {
         Ok(())
     }
     pub(crate) fn schedule_subtree_paint(&self, frames: u8) -> Result<()> {
-        if !self.active.get() || self.pending_delete.get() {
+        let Some(owner) = self.weak.upgrade() else {
             return Ok(());
-        }
-        if self.has_ancestor_repaint(frames.max(1)) {
+        };
+        let Some(plan) = plan_schedule(&owner, frames) else {
             return Ok(());
-        }
-        if !self.paint_armed.get() {
+        };
+        if !plan.was_armed {
             self.invalidate_subtree_paint()?;
         }
-        let target = self.paint_frames.get().max(frames);
-        self.paint_frames.set(target);
-        if target > 0 && !self.paint_armed.replace(true) {
+        if commit_schedule(&owner, plan) {
             Self::arm_subtree_paint(self.weak.clone());
         }
         Ok(())
@@ -274,38 +291,27 @@ impl Node {
         let Some(owner) = weak.upgrade() else {
             return;
         };
-        if !owner.active.get() || owner.pending_delete.get() || owner.paint_frames.get() == 0 {
-            owner.paint_frames.set(0);
-            owner.paint_armed.set(false);
+        if !owner.is_live() || owner.paint_state.get().frames == 0 {
+            owner.paint_state.set(owner.paint_state.get().reset());
             return;
         }
-        let status = owner.native.borrow().post_frame_callback(move |_, _| {
-            let Some(owner) = weak.upgrade() else {
-                return;
-            };
-            if !owner.active.get() || owner.pending_delete.get() {
-                owner.paint_frames.set(0);
-                owner.paint_armed.set(false);
-                return;
-            }
-            let remaining = owner.paint_frames.get();
-            if remaining == 0 {
-                owner.paint_armed.set(false);
-                return;
-            }
-            owner.paint_frames.set(remaining - 1);
-            if !owner.has_ancestor_repaint(1) {
-                callback(|| owner.invalidate_subtree_paint());
-            }
-            if owner.paint_frames.get() > 0 {
-                Self::arm_subtree_paint(weak);
-            } else {
-                owner.paint_armed.set(false);
-            }
-        });
+        let status = owner
+            .native
+            .borrow()
+            .post_frame_callback(move |timestamp, frame_count| {
+                let Some(owner) = weak.upgrade() else {
+                    return;
+                };
+                let tick = step_frame(&owner, (timestamp, u64::from(frame_count)));
+                if tick.invalidate {
+                    callback(|| owner.invalidate_subtree_paint());
+                }
+                if tick.rearm {
+                    Self::arm_subtree_paint(weak);
+                }
+            });
         if status.is_err() {
-            owner.paint_frames.set(0);
-            owner.paint_armed.set(false);
+            owner.paint_state.set(owner.paint_state.get().reset());
         }
     }
 

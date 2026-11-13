@@ -145,8 +145,7 @@ pub(crate) struct Node {
     pub(crate) animated_opacity: Cell<Option<f32>>,
     applied: Cell<AppliedStyle>,
     styled: Cell<bool>,
-    paint_frames: Cell<u8>,
-    paint_armed: Cell<bool>,
+    paint_state: Cell<super::subtree_paint::SubtreePaint>,
     pub(crate) live: RefCell<Option<Box<crate::render::transition::Live>>>,
     /// Leaving (an exit transition, a popped screen): changed only through
     /// [`Node::set_leaving`], which keeps the surface's count of them.

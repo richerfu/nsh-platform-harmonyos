@@ -462,7 +462,8 @@ pub(crate) struct ImageView {
     data: RefCell<Option<Arc<Data>>>,
     tint: Cell<Option<nsh_core::Color>>,
     radii: Cell<[f32; 4]>,
-    blur: Cell<f32>,
+    blur_radius: Cell<f32>,
+    applied_blur: Cell<f32>,
     fade_ms: Cell<f32>,
     fade_start: Cell<Option<f64>>,
 }
@@ -488,7 +489,8 @@ impl ImageView {
             data: RefCell::default(),
             tint: Cell::new(None),
             radii: Cell::new([0.0; 4]),
-            blur: Cell::new(0.0),
+            blur_radius: Cell::new(0.0),
+            applied_blur: Cell::new(0.0),
             fade_ms: Cell::new(0.0),
             fade_start: Cell::new(None),
         });
@@ -573,6 +575,16 @@ impl ImageView {
                 .borrow()
                 .set_attribute(A::BorderRadius, radii.to_vec().into())?;
         }
+        self.sync_blur()?;
+        Ok(())
+    }
+    fn sync_blur(&self) -> Result<()> {
+        let scale = self.owner.upgrade().map_or(1.0, |owner| owner.scale.get());
+        let blur =
+            crate::render::composition::geometry::native_blur_value(self.blur_radius.get(), scale);
+        if self.applied_blur.replace(blur) != blur {
+            self.native.borrow().set_f32_attribute(A::Blur, blur)?;
+        }
         Ok(())
     }
     pub(crate) fn tick(&self, now: f64) -> Result<bool> {
@@ -606,11 +618,8 @@ impl ImageView {
         self.fade_start.set(None);
         self.fade_ms.set(options.fade_ms.unwrap_or(0.0).max(0.0));
         self.native.borrow().set_f32_attribute(A::Opacity, 1.0)?;
-        if self.blur.replace(options.blur_radius.0) != options.blur_radius.0 {
-            self.native
-                .borrow()
-                .set_f32_attribute(A::Blur, options.blur_radius.0.max(0.0))?;
-        }
+        self.blur_radius.set(options.blur_radius.0);
+        self.sync_blur()?;
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
         self.primary.set(false);

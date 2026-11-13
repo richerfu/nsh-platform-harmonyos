@@ -12,4 +12,5 @@ pub(crate) mod node;
 pub(crate) mod shader;
 pub(crate) mod shadow;
 pub(crate) mod shadow_geometry;
+pub(crate) mod subtree_paint;
 pub(crate) mod transition;

@@ -197,17 +197,21 @@ impl Node {
         self.sync_visual_node(&visual);
         let plan = self.effects_plan_for(style);
         let mut applied = self.applied.get();
-        if applied.blur != plan.native_blur {
-            visual
-                .borrow()
-                .set_f32_attribute(Attribute::Blur, plan.native_blur.max(0.0))?;
-            applied.blur = plan.native_blur;
+        let scale = self.scale.get();
+        let blur = crate::render::composition::geometry::native_blur_value(plan.native_blur, scale);
+        if applied.blur != blur {
+            visual.borrow().set_f32_attribute(Attribute::Blur, blur)?;
+            applied.blur = blur;
         }
-        if applied.backdrop_blur != plan.native_backdrop_blur {
+        let backdrop_blur = crate::render::composition::geometry::native_blur_value(
+            plan.native_backdrop_blur,
+            scale,
+        );
+        if applied.backdrop_blur != backdrop_blur {
             self.native
                 .borrow()
-                .set_f32_attribute(Attribute::BackdropBlur, plan.native_backdrop_blur.max(0.0))?;
-            applied.backdrop_blur = plan.native_backdrop_blur;
+                .set_f32_attribute(Attribute::BackdropBlur, backdrop_blur)?;
+            applied.backdrop_blur = backdrop_blur;
         }
         if applied.blend != plan.native_blend {
             let mode = crate::render::decor::arkui_blend_mode(plan.native_blend);

@@ -81,8 +81,7 @@ impl Node {
                 ..AppliedStyle::default()
             }),
             styled: Cell::new(false),
-            paint_frames: Cell::new(0),
-            paint_armed: Cell::new(false),
+            paint_state: Cell::new(crate::render::subtree_paint::SubtreePaint::default()),
             live: RefCell::default(),
             leaving: Cell::new(false),
             extra: Cell::new((1.0, crate::render::transition::Extra::NONE)),
@@ -198,7 +197,7 @@ impl Node {
         if !self.active.replace(false) {
             return;
         }
-        self.paint_frames.set(0);
+        self.paint_state.set(self.paint_state.get().reset());
         self.animated_opacity.set(None);
         callback(|| self.cursor.update(self, false));
         callback(|| self.selection_clear());
