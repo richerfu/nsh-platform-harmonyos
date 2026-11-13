@@ -1,6 +1,7 @@
 pub(crate) mod blend;
 pub(crate) mod draw;
 pub(crate) mod fill;
+pub(crate) mod fill_retry;
 pub(crate) mod filter;
 mod frame_wake;
 pub(crate) mod geometry;
@@ -10,5 +11,6 @@ mod presentation;
 pub(crate) mod raster;
 pub(crate) mod readback;
 pub(crate) mod scene;
+pub(crate) mod scene_policy;
 pub(crate) mod surface;
 pub(crate) mod worker;

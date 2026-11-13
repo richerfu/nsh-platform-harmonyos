@@ -78,3 +78,15 @@ mod composition_mailbox;
 #[path = "../../src/media/video/mailbox.rs"]
 #[allow(dead_code)]
 mod video_mailbox;
+
+#[path = "../../src/render/subtree_paint.rs"]
+#[allow(dead_code)]
+mod subtree_paint;
+
+#[path = "../../src/render/composition/scene_policy.rs"]
+#[allow(dead_code)]
+mod scene_policy;
+
+#[path = "../../src/render/composition/fill_retry.rs"]
+#[allow(dead_code)]
+mod fill_retry;

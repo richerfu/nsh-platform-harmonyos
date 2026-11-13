@@ -38,6 +38,11 @@ pub(super) enum Error {
     #[error("shader draw GL error {0:#x}")]
     Draw(u32),
 }
+impl Error {
+    pub(super) fn is_retryable(&self) -> bool {
+        !matches!(self, Self::Shader(_) | Self::Configuration(_))
+    }
+}
 impl From<String> for Error {
     fn from(message: String) -> Self {
         Self::Driver(message)

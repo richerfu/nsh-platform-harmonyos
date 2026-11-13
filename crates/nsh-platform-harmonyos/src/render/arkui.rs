@@ -117,10 +117,8 @@ impl crate::render::mount::UiContext {
         if self.host.check().is_err() {
             return Ok(());
         }
-        if let Some(scene) = self.scene.borrow().as_ref()
-            && let Err(error) = scene.prepare()
-        {
-            log::warn!("OHOS scene prepare skipped: {error}");
+        if let Some(scene) = self.scene.borrow().as_ref() {
+            scene.prepare();
         }
         let owners: Vec<_> = {
             let mut nodes = self.composite_nodes.borrow_mut();

@@ -3,22 +3,30 @@ use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
     sync::{Arc, atomic::Ordering},
+    time::Instant,
 };
 
-use nsh_core::{Matrix, ViewKind};
+use nsh_core::{Matrix, NodeId, ViewKind};
 use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
 use ohos_drawing_binding::{Bitmap, BitmapFormat, Canvas};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::render::{
-    composition::{
-        draw::{PaintNode, Plan, Root},
-        geometry::{Bounds, target_size},
-        raster::Shared as SceneShared,
+use crate::{
+    app::runtime::{Dispatcher, Message},
+    render::{
+        composition::{
+            draw::{PaintNode, Plan, Root},
+            geometry::{Bounds, target_size},
+            raster::Shared as SceneShared,
+            scene_policy::{
+                MAX_PREPARE_RETRIES, SceneRetry, TransientOutcome, bounds_overflow_box,
+                is_opaque_color, opaque_background_covers_bounds,
+            },
+        },
+        effects::has_active_filters,
+        geometry::Size,
+        node::{Error, Node, Result},
     },
-    effects::has_active_filters,
-    geometry::Size,
-    node::{Error, Node, Result},
 };
 
 struct RootBitmap {
@@ -26,6 +34,42 @@ struct RootBitmap {
     x: f32,
     y: f32,
     scale: f32,
+}
+
+struct PreparingGuard<'a>(&'a Scene);
+
+impl<'a> PreparingGuard<'a> {
+    fn enter(scene: &'a Scene) -> Self {
+        scene.preparing.set(true);
+        Self(scene)
+    }
+}
+
+impl Drop for PreparingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.preparing.set(false);
+        if self.0.requeued.replace(false) {
+            self.0.invalidate();
+        }
+    }
+}
+
+struct CandidateRoot {
+    root: Rc<Node>,
+    req_ids: Vec<NodeId>,
+}
+
+struct ReconcileFailure {
+    error: Error,
+    culprit_ids: Vec<NodeId>,
+}
+
+fn is_unsupported_error(error: &Error) -> bool {
+    match error {
+        Error::Unsupported(_) => true,
+        Error::Tree(inner) => is_unsupported_error(inner),
+        _ => false,
+    }
 }
 
 pub(crate) struct Scene {
@@ -37,7 +81,9 @@ pub(crate) struct Scene {
     shared: Arc<SceneShared>,
     bitmaps: RefCell<FxHashMap<u32, RootBitmap>>,
     roots: RefCell<Vec<Weak<Node>>>,
+    pending_restore: RefCell<Vec<Weak<Node>>>,
     requirements: RefCell<Vec<Weak<Node>>>,
+    retry: RefCell<SceneRetry>,
 }
 impl Scene {
     pub(crate) fn new(root: &Rc<Node>) -> Self {
@@ -50,7 +96,9 @@ impl Scene {
             shared: Arc::default(),
             bitmaps: RefCell::default(),
             roots: RefCell::default(),
+            pending_restore: RefCell::default(),
             requirements: RefCell::default(),
+            retry: RefCell::default(),
         }
     }
     pub(crate) fn has_output(&self) -> bool {
@@ -64,6 +112,9 @@ impl Scene {
             nodes.push(Rc::downgrade(node));
         }
         drop(nodes);
+        self.retry
+            .borrow_mut()
+            .on_requirement_updated(node.id, required);
         if self.preparing.get() {
             self.requeued.set(true);
         } else {
@@ -71,104 +122,256 @@ impl Scene {
         }
     }
     pub(crate) fn invalidate(&self) {
-        if (self.active.get() || !self.requirements.borrow().is_empty())
+        if !self.active.get()
+            && self.pending_restore.borrow().is_empty()
+            && self.retry.borrow().is_exhausted()
+        {
+            return;
+        }
+        if (self.active.get()
+            || !self.pending_restore.borrow().is_empty()
+            || !self.requirements.borrow().is_empty())
             && !self.preparing.get()
             && !self.dirty.replace(true)
             && let Some(root) = self.root.upgrade()
             && let Some(route) = root.dispatcher.upgrade()
         {
-            route.send(crate::app::runtime::Message::Arkui);
+            route.send(Message::Arkui);
         }
     }
-    pub(crate) fn prepare(&self) -> Result<()> {
-        if !self.dirty.replace(false) {
-            return Ok(());
+    pub(crate) fn prepare(&self) {
+        if !self.dirty.get() {
+            return;
         }
-        self.preparing.set(true);
-        let result = self.reconcile();
-        self.preparing.set(false);
-        if self.requeued.replace(false) {
-            self.invalidate();
+        let now = Instant::now();
+        if !self.retry.borrow().due(now) {
+            return;
         }
-        result
+        let _guard = PreparingGuard::enter(self);
+        let max_passes = self.requirements.borrow().len().saturating_add(1);
+        for _ in 0..max_passes {
+            match self.reconcile() {
+                Ok(()) => {
+                    self.dirty.set(false);
+                    self.retry.borrow_mut().on_success();
+                    return;
+                }
+                Err(failure) if is_unsupported_error(&failure.error) => {
+                    let emit = self
+                        .retry
+                        .borrow_mut()
+                        .mark_unsupported(&failure.culprit_ids);
+                    if emit {
+                        log::warn!(
+                            "OHOS scene unsupported for {:?}; falling back to native: {}",
+                            failure.culprit_ids,
+                            failure.error
+                        );
+                    }
+                    if failure.culprit_ids.is_empty() {
+                        self.dirty.set(false);
+                        return;
+                    }
+                }
+                Err(failure) => {
+                    match self.retry.borrow_mut().on_transient_failure(Instant::now()) {
+                        TransientOutcome::Retry { delay, .. } => {
+                            self.dirty.set(true);
+                            self.schedule_retry(delay);
+                        }
+                        TransientOutcome::Exhausted { emit_diagnostic } => {
+                            self.dirty.set(false);
+                            if emit_diagnostic {
+                                log::warn!(
+                                    "OHOS scene prepare failed after {MAX_PREPARE_RETRIES} retries; falling back to native: {}",
+                                    failure.error
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
     }
-    fn reconcile(&self) -> Result<()> {
+    fn schedule_retry(&self, delay: std::time::Duration) {
+        let Some(root) = self.root.upgrade() else {
+            return;
+        };
+        if delay.is_zero() {
+            if let Some(route) = root.dispatcher.upgrade() {
+                route.send(Message::Arkui);
+            }
+        } else {
+            let dispatcher = root.dispatcher.clone();
+            Dispatcher::after(
+                &root.dispatcher,
+                delay,
+                Box::new(move || {
+                    if let Some(route) = dispatcher.upgrade() {
+                        route.send(Message::Arkui);
+                    }
+                }),
+            );
+        }
+    }
+    fn reconcile(&self) -> std::result::Result<(), ReconcileFailure> {
         let Some(root) = self.root.upgrade() else {
             return Ok(());
         };
-        let mut requirements = self.requirements.borrow_mut();
-        requirements.retain(|node| node.strong_count() > 0);
-        // Most surfaces have no scene effects. Check only current trigger nodes;
-        // ordinary mount/animation turns do not scan the whole native tree.
-        let mut candidates = Vec::new();
-        for node in requirements.iter().filter_map(Weak::upgrade) {
-            if !node.paint_visible() {
-                continue;
-            }
-            let mut connected = false;
-            let mut ancestor = Some(node.clone());
-            while let Some(current) = ancestor {
-                if Rc::ptr_eq(&current, &root) {
-                    connected = true;
-                    break;
+        let mut live_ids = FxHashSet::default();
+        let mut candidates: Vec<CandidateRoot> = Vec::new();
+        {
+            let mut requirements = self.requirements.borrow_mut();
+            requirements.retain(|node| node.strong_count() > 0);
+            let retry = self.retry.borrow();
+            // Most surfaces have no scene effects. Check only current trigger nodes;
+            // ordinary mount/animation turns do not scan the whole native tree.
+            for node in requirements.iter().filter_map(Weak::upgrade) {
+                live_ids.insert(node.id);
+                if !retry.is_eligible(node.id) || !node.paint_visible() {
+                    continue;
                 }
-                ancestor = current.parent_node.borrow().upgrade();
-            }
-            if connected {
-                let candidate = scene_root_for(&node, &root);
-                if !candidates
-                    .iter()
-                    .any(|existing: &Rc<Node>| Rc::ptr_eq(existing, &candidate))
-                {
-                    candidates.push(candidate);
+                let mut connected = false;
+                let mut ancestor = Some(node.clone());
+                while let Some(current) = ancestor {
+                    if Rc::ptr_eq(&current, &root) {
+                        connected = true;
+                        break;
+                    }
+                    ancestor = current.parent_node.borrow().upgrade();
+                }
+                if connected {
+                    let candidate = scene_root_for(&node, &root);
+                    if let Some(existing) = candidates
+                        .iter_mut()
+                        .find(|existing| Rc::ptr_eq(&existing.root, &candidate))
+                    {
+                        if !existing.req_ids.contains(&node.id) {
+                            existing.req_ids.push(node.id);
+                        }
+                    } else {
+                        candidates.push(CandidateRoot {
+                            root: candidate,
+                            req_ids: vec![node.id],
+                        });
+                    }
                 }
             }
         }
-        drop(requirements);
-        let initial_roots: Vec<Rc<Node>> = candidates
-            .iter()
-            .filter(|candidate| {
-                !candidates.iter().any(|other| {
-                    !Rc::ptr_eq(candidate, other) && is_scene_ancestor(other, candidate)
-                })
-            })
-            .cloned()
-            .collect();
+        self.retry
+            .borrow_mut()
+            .retain_live(|id| live_ids.contains(&id));
+
+        let mut initial_roots: Vec<CandidateRoot> = Vec::new();
+        for candidate in &candidates {
+            if let Some(ancestor) = candidates.iter().find(|other| {
+                !Rc::ptr_eq(&candidate.root, &other.root)
+                    && is_scene_ancestor(&other.root, &candidate.root)
+            }) {
+                let _ = ancestor;
+                continue;
+            }
+            let mut req_ids = candidate.req_ids.clone();
+            for covered in &candidates {
+                if !Rc::ptr_eq(&candidate.root, &covered.root)
+                    && is_scene_ancestor(&candidate.root, &covered.root)
+                {
+                    for &id in &covered.req_ids {
+                        if !req_ids.contains(&id) {
+                            req_ids.push(id);
+                        }
+                    }
+                }
+            }
+            initial_roots.push(CandidateRoot {
+                root: candidate.root.clone(),
+                req_ids,
+            });
+        }
+
         let active = !initial_roots.is_empty();
         let previous = self.active.replace(active);
         if active {
             return self.build(&root, initial_roots);
         }
-        if previous {
-            if let Some(worker) = root.compositor.borrow().as_ref() {
-                worker.clear_plan();
+        let prior_failed = std::mem::take(&mut *self.pending_restore.borrow_mut());
+        if previous || !prior_failed.is_empty() {
+            if previous {
+                if let Some(worker) = root.compositor.borrow().as_ref() {
+                    worker.clear_plan();
+                }
+                self.bitmaps.borrow_mut().clear();
+                self.shared.output.lock().unwrap().take();
             }
-            self.bitmaps.borrow_mut().clear();
             let old_roots = std::mem::take(&mut *self.roots.borrow_mut());
-            self.shared.output.lock().unwrap().take();
-            for old in old_roots.into_iter().filter_map(|w| w.upgrade()) {
-                restore(&old)?;
+            let mut first_error = None;
+            let mut restore_failed = Vec::new();
+            for node in prior_failed.into_iter().filter_map(|w| w.upgrade()) {
+                restore_native_node(&node, &mut first_error, &mut restore_failed);
             }
-            restore(&root)?;
+            for old in old_roots.into_iter().filter_map(|w| w.upgrade()) {
+                restore_subtree(&old, &mut first_error, &mut restore_failed);
+            }
+            if previous {
+                restore_subtree(&root, &mut first_error, &mut restore_failed);
+            }
+            *self.pending_restore.borrow_mut() = restore_failed;
+            if let Some(error) = first_error {
+                return Err(ReconcileFailure {
+                    error,
+                    culprit_ids: Vec::new(),
+                });
+            }
         }
         Ok(())
     }
-    fn build(&self, root: &Rc<Node>, initial_roots: Vec<Rc<Node>>) -> Result<()> {
+    fn build(
+        &self,
+        root: &Rc<Node>,
+        initial_roots: Vec<CandidateRoot>,
+    ) -> std::result::Result<(), ReconcileFailure> {
+        let mut first_old_restore_err = None;
+        let mut restore_failed = Vec::new();
+        let prior_failed = std::mem::take(&mut *self.pending_restore.borrow_mut());
+        for node in prior_failed.into_iter().filter_map(|w| w.upgrade()) {
+            restore_native_node(&node, &mut first_old_restore_err, &mut restore_failed);
+        }
         for old in self.roots.borrow().iter().filter_map(Weak::upgrade) {
             if !initial_roots
                 .iter()
-                .any(|next| Rc::ptr_eq(&old, next) || is_scene_ancestor(next, &old))
+                .any(|next| Rc::ptr_eq(&old, &next.root) || is_scene_ancestor(&next.root, &old))
             {
-                restore(&old)?;
+                restore_subtree(&old, &mut first_old_restore_err, &mut restore_failed);
             }
         }
-        fn prepare(node: &Rc<Node>, roots: &mut Vec<Rc<Node>>, depth: usize) -> Result<()> {
+        *self.pending_restore.borrow_mut() = restore_failed;
+        if let Some(error) = first_old_restore_err {
+            let all_ids: Vec<NodeId> = initial_roots
+                .iter()
+                .flat_map(|c| c.req_ids.iter().copied())
+                .collect();
+            self.rollback(root, &[], &[]);
+            return Err(ReconcileFailure {
+                error,
+                culprit_ids: all_ids,
+            });
+        }
+
+        fn prepare_subtree(
+            node: &Rc<Node>,
+            roots: &mut Vec<(Rc<Node>, Vec<NodeId>)>,
+            touched: &mut Vec<Rc<Node>>,
+            req_ids: &[NodeId],
+            depth: usize,
+        ) -> Result<()> {
             if depth > 256 {
                 return Err(Error::Unsupported("scene hierarchy exceeds 256 levels"));
             }
             if !node.paint_visible() {
                 return Ok(());
             }
+            touched.push(node.clone());
             let was_prepared = node.scene_prepared.replace(true);
             node.ensure_wrapper()?;
             if let Some(scroll) = node.scroll.borrow().as_ref() {
@@ -178,84 +381,79 @@ impl Scene {
                 node.restore_style()?;
             }
             if node.kind == ViewKind::Modal
-                && !roots.iter().any(|existing| Rc::ptr_eq(existing, node))
+                && !roots.iter().any(|(existing, _)| Rc::ptr_eq(existing, node))
             {
                 node.scene_root.set(true);
-                roots.push(node.clone());
+                roots.push((node.clone(), req_ids.to_vec()));
             }
             for child in node.children.borrow().iter().filter_map(Weak::upgrade) {
-                prepare(&child, roots, depth + 1)?;
+                prepare_subtree(&child, roots, touched, req_ids, depth + 1)?;
             }
             Ok(())
         }
-        let mut roots = initial_roots.clone();
-        let build_result = (|| -> Result<Plan> {
-            for scene_root in &initial_roots {
-                scene_root.scene_root.set(true);
-                prepare(scene_root, &mut roots, 0)?;
-            }
-            let mut plan = Plan { roots: Vec::new() };
-            for scene_root in &roots {
-                if !scene_root.paint_visible() {
-                    continue;
+
+        let mut roots: Vec<(Rc<Node>, Vec<NodeId>)> = initial_roots
+            .iter()
+            .map(|c| (c.root.clone(), c.req_ids.clone()))
+            .collect();
+        let mut touched: Vec<Rc<Node>> = Vec::new();
+        let build_result = (|| -> std::result::Result<Plan, ReconcileFailure> {
+            for candidate in &initial_roots {
+                touched.push(candidate.root.clone());
+                candidate.root.scene_root.set(true);
+                if let Err(error) = prepare_subtree(
+                    &candidate.root,
+                    &mut roots,
+                    &mut touched,
+                    &candidate.req_ids,
+                    0,
+                ) {
+                    return Err(ReconcileFailure {
+                        error,
+                        culprit_ids: candidate.req_ids.clone(),
+                    });
                 }
-                let node = snapshot(scene_root, None, 0)?;
-                let own_filters = node
-                    .style
-                    .effects
-                    .as_ref()
-                    .map_or(&[][..], |effects| effects.filters.as_slice());
-                let root_bounds = node.bounds.filters(own_filters);
-                let logical_w = (root_bounds.0[2] - root_bounds.0[0]).max(1.0);
-                let logical_h = (root_bounds.0[3] - root_bounds.0[1]).max(1.0);
-                let (_, _, root_scale) = target_size(logical_w, logical_h, scene_root.scale.get());
-                if root_scale <= 0.0 {
-                    return Err(Error::Unsupported("invalid scene root dimensions"));
-                }
-                let origin_x = (root_bounds.0[0] * root_scale).floor();
-                let origin_y = (root_bounds.0[1] * root_scale).floor();
-                let width =
-                    ((root_bounds.0[2] * root_scale).ceil() - origin_x).clamp(1.0, 4096.0) as u32;
-                let height =
-                    ((root_bounds.0[3] * root_scale).ceil() - origin_y).clamp(1.0, 4096.0) as u32;
-                plan.roots.push(Root {
-                    id: scene_root.id,
-                    width,
-                    height,
-                    origin: (origin_x, origin_y),
-                    scale: root_scale,
-                    node,
-                });
             }
-            Ok(plan)
+            paint_plan(&roots)
         })();
         let plan = match build_result {
             Ok(plan) => plan,
-            Err(error) => {
-                // Roll back any nodes touched during the failed build so no node
-                // remains stranded with `scene_prepared = true` outside `self.roots`.
-                self.active.set(false);
-                if let Some(worker) = root.compositor.borrow().as_ref() {
-                    worker.clear_plan();
-                }
-                self.bitmaps.borrow_mut().clear();
-                self.shared.output.lock().unwrap().take();
-                let old_roots = std::mem::take(&mut *self.roots.borrow_mut());
-                for old in old_roots.into_iter().filter_map(|w| w.upgrade()) {
-                    let _ = restore(&old);
-                }
-                for touched in &roots {
-                    let _ = restore(touched);
-                }
-                let _ = restore(root);
-                return Err(error);
+            Err(failure) => {
+                let root_nodes: Vec<Rc<Node>> = roots.into_iter().map(|(n, _)| n).collect();
+                self.rollback(root, &root_nodes, &touched);
+                return Err(failure);
             }
         };
-        *self.roots.borrow_mut() = roots.iter().map(Rc::downgrade).collect();
+        *self.roots.borrow_mut() = roots.iter().map(|(n, _)| Rc::downgrade(n)).collect();
         if let Some(worker) = root.compositor.borrow().as_ref() {
             worker.plan(Arc::new(plan), self.shared.clone());
         }
         Ok(())
+    }
+    fn rollback(&self, root: &Rc<Node>, candidate_roots: &[Rc<Node>], touched: &[Rc<Node>]) {
+        // Unconditionally clear `scene_prepared` and `scene_root` across every
+        // previously-active, candidate, and touched subtree without aborting on
+        // intermediate restore errors, guaranteeing zero orphan `scene_prepared` nodes.
+        self.active.set(false);
+        if let Some(worker) = root.compositor.borrow().as_ref() {
+            worker.clear_plan();
+        }
+        self.bitmaps.borrow_mut().clear();
+        self.shared.output.lock().unwrap().take();
+        let old_roots = std::mem::take(&mut *self.roots.borrow_mut());
+        let mut ignored = None;
+        let mut restore_failed = std::mem::take(&mut *self.pending_restore.borrow_mut());
+        for node in touched {
+            restore_node_only(node, &mut ignored, &mut restore_failed);
+        }
+        for old in old_roots.into_iter().filter_map(|w| w.upgrade()) {
+            restore_subtree(&old, &mut ignored, &mut restore_failed);
+        }
+        for candidate in candidate_roots {
+            restore_subtree(candidate, &mut ignored, &mut restore_failed);
+        }
+        restore_subtree(root, &mut ignored, &mut restore_failed);
+        *self.pending_restore.borrow_mut() = restore_failed;
     }
     pub(crate) fn ready(&self) -> Result<()> {
         self.shared.posted.store(false, Ordering::Release);
@@ -266,7 +464,7 @@ impl Scene {
         if let Some(frames) = frames {
             let was_empty = !self.has_output();
             let mut bitmaps = self.bitmaps.borrow_mut();
-            let mut next_ids = rustc_hash::FxHashSet::default();
+            let mut next_ids = FxHashSet::default();
             for frame in frames {
                 next_ids.insert(frame.id);
                 if let Some(existing) = bitmaps.get_mut(&frame.id)
@@ -327,28 +525,94 @@ impl Scene {
         }
     }
 }
-fn restore(node: &Rc<Node>) -> Result<()> {
+
+#[track_caller]
+fn record_err<E: Into<Error>>(
+    slot: &mut Option<Error>,
+    node_failed: &mut bool,
+    result: std::result::Result<(), E>,
+) {
+    if let Err(error) = result {
+        *node_failed = true;
+        if slot.is_none() {
+            *slot = Some(error.into());
+        }
+    }
+}
+
+fn restore_native_node(
+    node: &Rc<Node>,
+    first_error: &mut Option<Error>,
+    failed_nodes: &mut Vec<Weak<Node>>,
+) {
+    if !node.active.get() || node.pending_delete.get() {
+        return;
+    }
+    let mut node_failed = false;
+    if let Some(scroll) = node.scroll.borrow().as_ref() {
+        record_err(first_error, &mut node_failed, scroll.restore_scene(node));
+    }
+    record_err(first_error, &mut node_failed, node.ensure_wrapper());
+    record_err(first_error, &mut node_failed, node.restore_style());
+    record_err(
+        first_error,
+        &mut node_failed,
+        node.native.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure),
+    );
+    record_err(
+        first_error,
+        &mut node_failed,
+        node.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender),
+    );
+    record_err(
+        first_error,
+        &mut node_failed,
+        node.mounted()
+            .borrow()
+            .mark_dirty(NodeDirtyFlag::NeedRender),
+    );
+    if node_failed
+        && !failed_nodes
+            .iter()
+            .any(|existing| existing.upgrade().is_some_and(|n| Rc::ptr_eq(&n, node)))
+    {
+        failed_nodes.push(Rc::downgrade(node));
+    }
+}
+
+fn restore_node_only(
+    node: &Rc<Node>,
+    first_error: &mut Option<Error>,
+    failed_nodes: &mut Vec<Weak<Node>>,
+) {
     let was_prepared = node.scene_prepared.replace(false);
     let was_root = node.scene_root.replace(false);
     if was_prepared || was_root {
-        if let Some(scroll) = node.scroll.borrow().as_ref() {
-            scroll.restore_scene(node)?;
-        }
-        node.ensure_wrapper()?;
-        node.restore_style()?;
-        node.native
-            .borrow()
-            .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-        node.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
-        node.mounted()
-            .borrow()
-            .mark_dirty(NodeDirtyFlag::NeedRender)?;
+        restore_native_node(node, first_error, failed_nodes);
     }
-    for child in node.children.borrow().iter().filter_map(Weak::upgrade) {
-        restore(&child)?;
-    }
-    Ok(())
 }
+
+fn restore_subtree(
+    node: &Rc<Node>,
+    first_error: &mut Option<Error>,
+    failed_nodes: &mut Vec<Weak<Node>>,
+) {
+    restore_node_only(node, first_error, failed_nodes);
+    for child in node.children.borrow().iter().filter_map(Weak::upgrade) {
+        restore_subtree(&child, first_error, failed_nodes);
+    }
+    for child in node
+        .retained_children
+        .borrow()
+        .iter()
+        .filter_map(Weak::upgrade)
+    {
+        if child.retained.get() {
+            restore_subtree(&child, first_error, failed_nodes);
+        }
+    }
+}
+
 fn is_scene_ancestor(ancestor: &Rc<Node>, node: &Rc<Node>) -> bool {
     let mut current = node.parent_node.borrow().upgrade();
     while let Some(parent) = current {
@@ -362,6 +626,31 @@ fn is_scene_ancestor(ancestor: &Rc<Node>, node: &Rc<Node>) -> bool {
     }
     false
 }
+
+fn local_effect_bounds(node: &Rc<Node>, include_backdrop: bool) -> Bounds {
+    let frame = node.frame.get();
+    let style = node.style.borrow();
+    let filters = style
+        .effects
+        .as_ref()
+        .map_or(&[][..], |effects| effects.filters.as_slice());
+    let mut bounds = Bounds::new(frame.width, frame.height)
+        .shaders(node.shaders.overflow(node.id), &node.shader_layers.borrow())
+        .own(&style)
+        .filters(filters);
+    if include_backdrop && let Some(effects) = &style.effects {
+        bounds.union(Bounds::new(frame.width, frame.height).filters(&effects.backdrop_filters));
+    }
+    bounds
+}
+
+/// Selects the minimal stable ancestor root for a `Scene` trigger `node` (A14):
+/// - Non-backdrop triggers (e.g. `mask-image`) stay on `node`'s own subtree unless
+///   its computed visual bounds genuinely overflow `[0, 0, width, height]`.
+/// - Backdrop triggers (`backdrop-filter`, non-normal `blend-mode`, shader backdrop)
+///   stop at the nearest ancestor whose opaque background covers `node`'s projected
+///   backdrop sample bounds (even without `overflow: hidden`), or at clip+opaque /
+///   backdrop-root / `Screen` / `Modal` / surface `root` boundaries.
 fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
     let samples_backdrop = {
         let style = node.style.borrow();
@@ -378,16 +667,12 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
             })
     };
     if !samples_backdrop {
-        let overflows = {
-            let style = node.style.borrow();
-            style.outline.is_visible()
-                || style
-                    .effects
-                    .as_ref()
-                    .is_some_and(|e| !e.box_shadows.is_empty() || has_active_filters(&e.filters))
-                || !node.shader_layers.borrow().is_empty()
-        };
-        if !overflows {
+        if node.clips_children() {
+            return node.clone();
+        }
+        let frame = node.frame.get();
+        let bounds = local_effect_bounds(node, false);
+        if !bounds_overflow_box(bounds.0, frame.width, frame.height) {
             return node.clone();
         }
         if let Some(parent) = node.parent_node.borrow().upgrade() {
@@ -395,12 +680,29 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
         }
         return node.clone();
     }
+
+    let mut sample_bounds = Some(local_effect_bounds(node, true));
+    let mut child = node.clone();
     let mut current = node.parent_node.borrow().upgrade();
     while let Some(ancestor) = current {
+        sample_bounds = sample_bounds.and_then(|mut bounds| {
+            if child.clips_children() {
+                let cf = child.frame.get();
+                bounds.0 = [
+                    bounds.0[0].max(0.0),
+                    bounds.0[1].max(0.0),
+                    bounds.0[2].min(cf.width.max(0.0)),
+                    bounds.0[3].min(cf.height.max(0.0)),
+                ];
+            }
+            let to_parent = child.input_to_parent(&ancestor).ok()?;
+            bounds.transformed(to_parent)
+        });
+
         let backdrop_root = {
             let style = ancestor.style.borrow();
             let effects = style.effects.as_ref();
-            style.opacity < 1.0
+            ancestor.scene_opacity() < 1.0
                 || style.blend_mode != nsh_core::BlendMode::Normal
                 || effects.is_some_and(|e| {
                     !e.mask_images.is_empty()
@@ -417,24 +719,91 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
         {
             return ancestor;
         }
+        let ancestor_frame = ancestor.frame.get();
+        if let Some(bounds) = sample_bounds
+            && opaque_background_covers_bounds(
+                &ancestor.style.borrow(),
+                ancestor.scene_opacity(),
+                ancestor_frame.width,
+                ancestor_frame.height,
+                bounds.0,
+            )
+        {
+            return ancestor;
+        }
         if ancestor.clips_children() {
-            let opaque_bg = !ancestor.style.borrow().background_color.is_transparent()
+            let opaque_bg = is_opaque_color(ancestor.style.borrow().background_color)
                 || ancestor
                     .children
                     .borrow()
                     .iter()
                     .filter_map(Weak::upgrade)
-                    .find(|child| child.paint_visible())
-                    .is_some_and(|first| !first.style.borrow().background_color.is_transparent());
+                    .find(|first| first.paint_visible())
+                    .is_some_and(|first| {
+                        let ff = first.frame.get();
+                        opaque_background_covers_bounds(
+                            &first.style.borrow(),
+                            first.scene_opacity(),
+                            ff.width,
+                            ff.height,
+                            [0.0, 0.0, ancestor_frame.width, ancestor_frame.height],
+                        ) && ff.x <= 0.0
+                            && ff.y <= 0.0
+                            && ff.x + ff.width >= ancestor_frame.width
+                            && ff.y + ff.height >= ancestor_frame.height
+                    });
             if opaque_bg {
                 return ancestor;
             }
         }
+        child = ancestor.clone();
         current = ancestor.parent_node.borrow().upgrade();
     }
     root.clone()
 }
-fn snapshot(owner: &Rc<Node>, parent: Option<&Node>, depth: usize) -> Result<PaintNode> {
+
+fn paint_plan(roots: &[(Rc<Node>, Vec<NodeId>)]) -> std::result::Result<Plan, ReconcileFailure> {
+    let mut plan = Plan { roots: Vec::new() };
+    for (scene_root, req_ids) in roots {
+        if !scene_root.paint_visible() {
+            continue;
+        }
+        let node = build_paint_tree(scene_root, None, 0).map_err(|error| ReconcileFailure {
+            error,
+            culprit_ids: req_ids.clone(),
+        })?;
+        let own_filters = node
+            .style
+            .effects
+            .as_ref()
+            .map_or(&[][..], |effects| effects.filters.as_slice());
+        let root_bounds = node.bounds.filters(own_filters);
+        let logical_w = (root_bounds.0[2] - root_bounds.0[0]).max(1.0);
+        let logical_h = (root_bounds.0[3] - root_bounds.0[1]).max(1.0);
+        let (_, _, root_scale) = target_size(logical_w, logical_h, scene_root.scale.get());
+        if root_scale <= 0.0 {
+            return Err(ReconcileFailure {
+                error: Error::Unsupported("invalid scene root dimensions"),
+                culprit_ids: req_ids.clone(),
+            });
+        }
+        let origin_x = (root_bounds.0[0] * root_scale).floor();
+        let origin_y = (root_bounds.0[1] * root_scale).floor();
+        let width = ((root_bounds.0[2] * root_scale).ceil() - origin_x).clamp(1.0, 4096.0) as u32;
+        let height = ((root_bounds.0[3] * root_scale).ceil() - origin_y).clamp(1.0, 4096.0) as u32;
+        plan.roots.push(Root {
+            id: scene_root.id,
+            width,
+            height,
+            origin: (origin_x, origin_y),
+            scale: root_scale,
+            node,
+        });
+    }
+    Ok(plan)
+}
+
+fn build_paint_tree(owner: &Rc<Node>, parent: Option<&Node>, depth: usize) -> Result<PaintNode> {
     if depth > 256 {
         return Err(Error::Unsupported("scene hierarchy exceeds 256 levels"));
     }
@@ -464,7 +833,7 @@ fn snapshot(owner: &Rc<Node>, parent: Option<&Node>, depth: usize) -> Result<Pai
         .own(&style);
     let children = children
         .iter()
-        .map(|child| snapshot(child, Some(owner), depth + 1))
+        .map(|child| build_paint_tree(child, Some(owner), depth + 1))
         .collect::<Result<Vec<_>>>()?;
     if !owner.clips_children() {
         for child in &children {

@@ -269,6 +269,9 @@ impl Window {
     pub(super) fn raw(&self) -> usize {
         self.native.raw() as usize
     }
+    pub(super) fn invalidate_geometry(&self) {
+        self.size.set((0, 0));
+    }
     pub(super) fn enter(&self, width: u32, height: u32) -> Result<Current<'_>, Error> {
         if self.size.get() != (width, height) {
             self.native

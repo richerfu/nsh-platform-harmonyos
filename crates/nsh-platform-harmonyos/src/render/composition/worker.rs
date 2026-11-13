@@ -262,7 +262,9 @@ impl Worker {
                 let mut vote = rate.vote();
                 let mut entries: Vec<Option<Entry>> = Vec::new();
                 let mut gpu: Option<TextureContext> = None;
+                let mut gpu_error_reported = false;
                 let mut scene: Option<ScenePlan> = None;
+                let mut scene_stats = super::scene_policy::SceneStats::default();
                 let mut fills = super::fill::Fills::default();
                 let mut frame_pending = false;
                 let mut scene_dirty = false;
@@ -275,6 +277,7 @@ impl Worker {
                         Task::Close => break,
                         Task::Drain => {
                             scene = None;
+                            scene_stats.reset_idle();
                             captured = None;
                             for slot in &mut entries {
                                 if let Some(entry) = slot.take() {
@@ -299,14 +302,28 @@ impl Worker {
                             }
                         }
                         Task::Fill(command) => {
-                            let result = (|| -> std::result::Result<(), String> {
-                                if gpu.is_none() {
-                                    gpu = Some(TextureContext::new().map_err(|e| e.to_string())?);
+                            let upgraded = route.upgrade();
+                            if gpu.is_none() {
+                                match TextureContext::new() {
+                                    Ok(ctx) => {
+                                        gpu = Some(ctx);
+                                        gpu_error_reported = false;
+                                    }
+                                    Err(error) => {
+                                        log::warn!("shader fill context: {error}");
+                                        if !gpu_error_reported
+                                            && let Some(route) = upgraded.as_deref()
+                                        {
+                                            gpu_error_reported = true;
+                                            route.send(Message::Error(format!(
+                                                "shader fill context: {error}"
+                                            )));
+                                        }
+                                    }
                                 }
-                                fills.apply(command, gpu.as_ref().unwrap())
-                            })();
-                            if let Err(error) = result {
-                                log::warn!("shader fill: {error}");
+                            }
+                            if let Some(gpu) = gpu.as_ref() {
+                                fills.apply(command, gpu, upgraded.as_deref());
                             }
                             // Apply every update, but present only on VSync. A
                             // batch can change several animated uniforms; drawing
@@ -352,6 +369,7 @@ impl Worker {
                             }
                             PlanOp::Clear => {
                                 scene = None;
+                                scene_stats.reset_idle();
                             }
                             PlanOp::None => {}
                         },
@@ -405,6 +423,8 @@ impl Worker {
                                     filtered: None,
                                     window: None,
                                     window_dirty: false,
+                                    window_retry: super::fill_retry::FillRetry::default(),
+                                    pending_readback_bytes: 0,
                                     navigation: None,
                                     completed: None,
                                 });
@@ -588,13 +608,36 @@ impl Worker {
                                 .and_then(Option::as_mut)
                                 .filter(|e| e.key == key)
                             {
-                                entry.window.take();
-                                match gpu.as_ref().unwrap().window(window) {
-                                    Ok(window) => {
-                                        entry.window = Some(window);
-                                        entry.window_dirty = true;
+                                let raw = window.raw() as usize;
+                                if let Some(existing) = entry.window.as_ref()
+                                    && existing.raw() == raw
+                                {
+                                    existing.invalidate_geometry();
+                                    entry.window_dirty = true;
+                                    entry.window_retry.on_window_attached();
+                                } else {
+                                    match gpu.as_ref().unwrap().window(window) {
+                                        Ok(next) => {
+                                            entry.window = Some(next);
+                                            entry.window_dirty = true;
+                                            entry.window_retry.on_window_attached();
+                                        }
+                                        Err(error) => {
+                                            entry.window_dirty = true;
+                                            log::warn!("shader window: {error}");
+                                            if entry
+                                                .window_retry
+                                                .on_window_failure(entry.window.is_some())
+                                                .report_error
+                                                && let Some(route) = route.upgrade()
+                                            {
+                                                route.send(Message::Error(format!(
+                                                    "compositor node {} generation {} window: {error}",
+                                                    key.id, key.generation
+                                                )));
+                                            }
+                                        }
                                     }
-                                    Err(error) => log::warn!("shader window: {error}"),
                                 }
                                 wake(&callback, key, &entry.shared);
                             }
@@ -626,12 +669,13 @@ impl Worker {
                             }
                         }
                     }
+                    let upgraded_for_frame = route.upgrade();
                     if fill_frame
-                        && route
-                            .upgrade()
+                        && upgraded_for_frame
+                            .as_ref()
                             .is_some_and(|r| r.active.load(Ordering::Acquire))
                     {
-                        fills.render();
+                        fills.render(std::time::Instant::now(), upgraded_for_frame.as_deref());
                     }
                     // Many exports wake together during navigation. Compose their latest
                     // pictures once on VSync, so command delivery never waits for a full
@@ -641,15 +685,44 @@ impl Worker {
                         && std::mem::take(&mut scene_dirty)
                         && let Some(scene) = &scene
                     {
-                        let upgraded = route.upgrade();
+                        let upgraded = upgraded_for_frame;
                         if let Some(gpu) = gpu.as_ref() {
-                            let failed = scene.render(
-                                &mut SceneEntries {
-                                    entries: &mut entries,
-                                    gpu,
-                                },
-                                upgraded.as_deref(),
-                            );
+                            let mut active_planes = 0usize;
+                            let mut pre_readback_bytes = 0u64;
+                            for entry in entries.iter_mut().flatten() {
+                                if entry.settings.scene
+                                    && entry.shared.active.load(Ordering::Acquire)
+                                {
+                                    active_planes += 1;
+                                }
+                                pre_readback_bytes = pre_readback_bytes
+                                    .saturating_add(std::mem::take(&mut entry.pending_readback_bytes));
+                            }
+                            let mut scene_sources = SceneEntries {
+                                entries: &mut entries,
+                                gpu,
+                                readback_bytes: pre_readback_bytes,
+                                upload_bytes: 0,
+                            };
+                            let failed = scene.render(&mut scene_sources, upgraded.as_deref());
+                            let frame_readback = scene_sources.readback_bytes;
+                            let frame_upload = scene_sources.upload_bytes;
+                            if let Some(snap) = scene_stats.record(
+                                std::time::Instant::now(),
+                                active_planes,
+                                frame_readback,
+                                frame_upload,
+                            ) {
+                                log::info!(
+                                    "[NSH] scene-stats active_planes={} readback_bytes={} upload_bytes={} frames={} window_readback_bytes={} window_upload_bytes={}",
+                                    snap.active_planes,
+                                    snap.readback_bytes,
+                                    snap.upload_bytes,
+                                    snap.window_frames,
+                                    snap.window_readback_bytes,
+                                    snap.window_upload_bytes,
+                                );
+                            }
                             for entry in entries.iter_mut().flatten() {
                                 if failed
                                     && entry.settings.scene
@@ -846,6 +919,8 @@ struct Entry {
     filtered: Option<super::gles::Target>,
     window: Option<super::readback::Window>,
     window_dirty: bool,
+    window_retry: super::fill_retry::FillRetry,
+    pending_readback_bytes: u64,
     navigation: Option<Navigation<Option<Snapshot>>>,
     completed: Option<crate::render::shader::navigation::Key>,
 }
@@ -897,6 +972,9 @@ impl Entry {
                 let Some(frame) = self.reader.read().map_err(|e| e.to_string())? else {
                     break;
                 };
+                self.pending_readback_bytes = self
+                    .pending_readback_bytes
+                    .saturating_add(frame.pixels.len() as u64);
                 // Keep bounded captures at their own resolution. The scene canvas scales
                 // them while painting, after reserving its intermediate pixel budget.
                 let mut image = Image::new(frame);
@@ -1100,6 +1178,8 @@ impl Entry {
 struct SceneEntries<'a> {
     entries: &'a mut [Option<Entry>],
     gpu: &'a TextureContext,
+    readback_bytes: u64,
+    upload_bytes: u64,
 }
 impl super::draw::Sources for SceneEntries<'_> {
     fn image(&self, key: Key) -> Option<(&Image, f32)> {
@@ -1144,14 +1224,18 @@ impl super::draw::Sources for SceneEntries<'_> {
             ],
         };
         let (width, height, effective_scale) = coverage.pixels(scale);
-        let upload = |image: &Image| -> std::result::Result<super::gles::Target, String> {
+        let gpu = self.gpu;
+        let upload_bytes = &mut self.upload_bytes;
+        let mut upload = |image: &Image| -> std::result::Result<super::gles::Target, String> {
             let resized = image.resized(width, height);
+            let pixels = resized.bitmap.pixels().to_vec();
+            *upload_bytes = upload_bytes.saturating_add(pixels.len() as u64);
             Ok(super::gles::Target::upload(
-                self.gpu,
+                gpu,
                 &RgbaFrame {
                     width,
                     height,
-                    pixels: resized.bitmap.pixels().to_vec(),
+                    pixels,
                 },
             )?)
         };
@@ -1185,6 +1269,9 @@ impl super::draw::Sources for SceneEntries<'_> {
             .reader
             .read_texture(output.picture())
             .map_err(|error| error.to_string())?;
+        self.readback_bytes = self
+            .readback_bytes
+            .saturating_add(frame.pixels.len() as u64);
         let origin = entry
             .shared
             .state
