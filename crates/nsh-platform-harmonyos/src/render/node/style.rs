@@ -541,14 +541,13 @@ impl Node {
         Ok(())
     }
     pub(super) fn ensure_shadow_layer(&self, style: &ViewStyle) -> Result<()> {
-        if self.shadow_layer.borrow().is_none()
+        let needs_shadow_layer = self.shadow_layer.borrow().is_none()
             && crate::render::shadow_geometry::native_box_shadow(style).is_none()
             && style
                 .effects
                 .as_ref()
-                .is_some_and(|e| e.box_shadows.iter().any(|s| !s.inset && s.is_visible()))
-            && let Some(owner) = self.weak.upgrade()
-        {
+                .is_some_and(|e| e.box_shadows.iter().any(|s| !s.inset && s.is_visible()));
+        if needs_shadow_layer && let Some(owner) = self.weak.upgrade() {
             self.enable_layout();
             *self.shadow_layer.borrow_mut() =
                 Some(crate::render::shadow::ShadowLayer::new(&owner)?);

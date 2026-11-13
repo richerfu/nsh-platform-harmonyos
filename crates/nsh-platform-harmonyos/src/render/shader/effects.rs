@@ -124,9 +124,9 @@ impl Effects {
                     .is_some_and(|d| d.live.load(Ordering::Acquire))
                 && root
                     .wrapper
-                    .borrow()
-                    .as_ref()
-                    .is_none_or(|wrapper| wrapper.is_context_live())
+                    .try_borrow()
+                    .ok()
+                    .is_none_or(|wrapper| wrapper.as_ref().is_none_or(|w| w.is_context_live()))
         })
     }
 

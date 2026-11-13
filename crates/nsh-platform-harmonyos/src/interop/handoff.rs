@@ -202,20 +202,8 @@ impl HandoffState {
         }
 
         if inputs.covered_by_live_bridge {
-            self.gate = CommitGate::Committed;
-            self.callback_in_flight = None;
             self.gap_kind = GapKind::Mount;
             self.gap_started_at.get_or_insert(now);
-            let repaint_outer = std::mem::replace(&mut self.placeholder_active, false);
-            self.last_fill = None;
-            return (
-                PrepareOutcome {
-                    hold_direct_target: false,
-                    repaint_outer,
-                    arm_frame_callback: None,
-                },
-                None,
-            );
         }
 
         if self.mount_hidden {
@@ -724,34 +712,43 @@ mod tests {
     }
 
     #[test]
-    fn root_live_bridge_skips_placeholder_and_commit_gate_and_reports_mount_gap() {
+    fn root_live_bridge_keeps_commit_gate_and_placeholder_floor_and_reports_mount_gap() {
         let mut state = HandoffState::default();
         let t0 = Instant::now();
         let mut inputs = base_inputs();
         inputs.is_root = true;
-        inputs.is_mount_or_prewarm = true;
+        inputs.is_mount_or_prewarm = false;
         inputs.has_mounted_direct = true;
         inputs.export_requested = true;
 
         // Initial host reconciliation in the same batch before `stack::reconcile` installs bridge.
         let (out0, _) = state.prepare_target(inputs, t0);
-        let stale_gen = out0.arm_frame_callback.expect("initially armed");
+        let generation = out0.arm_frame_callback.expect("initially armed");
         assert_eq!(state.active_fill(), Some(DARK_BG));
 
         // `stack::reconcile` installs live `peer` bridge on `ROOT_ID` in the same UI turn.
+        // Both the placeholder floor and `CommitGate` stay armed until `outer` (hosting `peer`)
+        // commits to `render_service`.
         inputs.covered_by_live_bridge = true;
         inputs.desired_surface_ready = true;
         let (out1, gap) = state.prepare_target(inputs, t0);
         assert!(gap.is_none());
-        assert!(!out1.hold_direct_target);
-        assert!(out1.repaint_outer);
+        assert!(out1.hold_direct_target);
+        assert!(!out1.repaint_outer);
         assert!(out1.arm_frame_callback.is_none());
-        assert_eq!(state.active_fill(), None);
-        assert_eq!(state.on_frame_callback(stale_gen), FrameCallbackStep::Stale);
+        assert_eq!(state.active_fill(), Some(DARK_BG));
+
+        assert_eq!(state.note_placeholder_drawn(), None);
+        assert_eq!(
+            state.on_frame_callback(generation),
+            FrameCallbackStep::ReadyToDetach
+        );
+        let (out2, _) = state.prepare_target(inputs, t0 + Duration::from_millis(16));
+        assert!(!out2.hold_direct_target);
 
         state.note_target_updated(true, false, t0 + Duration::from_millis(18));
         let (stopped, gap) = state.note_revealed(t0 + Duration::from_millis(118));
-        assert!(!stopped);
+        assert!(stopped);
         assert_eq!(gap, Some((Duration::from_millis(118), GapKind::Mount)));
     }
 }

@@ -193,20 +193,22 @@ impl Wrapper {
         let Some((stack, peer, screen_owner)) = Self::bridge_nodes_valid(&bridge) else {
             return self.release_bridge();
         };
-        if active_target_is_texture && !bridge.hosted_on_outer.get() {
+        if !bridge.hosted_on_outer.get() {
             let mounted = peer.mounted();
-            if let Some(parent) = peer.mount_parent.borrow().upgrade()
-                && let Some(idx) = parent
+            let detach = peer.mount_parent.borrow().upgrade().and_then(|parent| {
+                let idx = parent
                     .borrow()
                     .children()
                     .iter()
-                    .position(|child| Rc::ptr_eq(child, &mounted))
-            {
+                    .position(|child| Rc::ptr_eq(child, &mounted))?;
+                Some((parent, idx))
+            });
+            if let Some((parent, idx)) = detach {
                 parent.borrow_mut().remove_child(idx)?;
                 parent.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure)?;
                 parent.borrow().mark_dirty(NodeDirtyFlag::NeedLayout)?;
             }
-            self.outer.borrow_mut().insert_child(mounted.clone(), 0)?;
+            self.outer.borrow_mut().add_child(mounted.clone())?;
             *peer.mount_parent.borrow_mut() = Rc::downgrade(&self.outer);
             peer.bridged_on_root_outer.set(true);
             bridge.hosted_on_outer.set(true);
@@ -218,19 +220,36 @@ impl Wrapper {
             let (x, y) = bridge_peer_px_offset(&stack, &peer, owner.scale.get());
             peer.invalidate_mounted_geometry();
             peer.place_bounds(x, y)?;
-            if let Some(screen) = screen_owner.screen.borrow().as_ref() {
-                screen
-                    .bridge_phase
-                    .set(crate::navigation::stack::RootBridgePhase::RenderingExport);
-            }
-            screen_owner.restore_style()?;
-            screen_owner.restore_export_controls()?;
-            screen_owner.schedule_subtree_paint(4)?;
-            screen_owner.shaders.invalidate_visibility();
-            screen_owner.animator.request_frame();
             self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedLayout)?;
             self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
+        let current_phase = screen_owner
+            .screen
+            .borrow()
+            .as_ref()
+            .map(|screen| screen.bridge_phase.get());
+        if active_target_is_texture {
+            if current_phase != Some(crate::navigation::stack::RootBridgePhase::RenderingExport) {
+                if let Some(screen) = screen_owner.screen.borrow().as_ref() {
+                    screen
+                        .bridge_phase
+                        .set(crate::navigation::stack::RootBridgePhase::RenderingExport);
+                }
+                screen_owner.navigation_presentation(1.0, 0.0)?;
+                screen_owner.restore_style()?;
+                screen_owner.restore_export_controls()?;
+                screen_owner.schedule_subtree_paint(4)?;
+                screen_owner.shaders.invalidate_visibility();
+                screen_owner.animator.request_frame();
+            }
+        } else if current_phase != Some(crate::navigation::stack::RootBridgePhase::HoldingDirect) {
+            if let Some(screen) = screen_owner.screen.borrow().as_ref() {
+                screen
+                    .bridge_phase
+                    .set(crate::navigation::stack::RootBridgePhase::HoldingDirect);
+            }
+            screen_owner.navigation_presentation(0.0, 0.0)?;
         }
         Ok(())
     }
@@ -239,15 +258,20 @@ impl Wrapper {
             return Ok(());
         };
         if let Some(screen_owner) = bridge.screen_owner.upgrade() {
+            let mut reset_nav = false;
             if let Some(screen) = screen_owner.screen.borrow().as_ref() {
                 screen
                     .bridge_phase
                     .set(crate::navigation::stack::RootBridgePhase::None);
                 if screen.is_unanimated() {
                     *screen.peer.borrow_mut() = std::rc::Weak::new();
+                    reset_nav = true;
                 }
             }
             if screen_owner.active.get() {
+                if reset_nav {
+                    screen_owner.navigation_presentation(1.0, 0.0)?;
+                }
                 screen_owner.restore_style()?;
                 screen_owner.shaders.invalidate_visibility();
             }
@@ -256,27 +280,33 @@ impl Wrapper {
             if let Some(peer) = bridge.peer.upgrade() {
                 peer.bridged_on_root_outer.set(false);
                 let mounted = peer.mounted();
-                if self.outer.borrow().is_owned()
-                    && let Some(idx) = self
-                        .outer
+                let outer_idx = if self.outer.borrow().is_owned() {
+                    self.outer
                         .borrow()
                         .children()
                         .iter()
                         .position(|c| Rc::ptr_eq(c, &mounted))
-                {
+                } else {
+                    None
+                };
+                if let Some(idx) = outer_idx {
                     self.outer.borrow_mut().remove_child(idx)?;
                 }
-                if peer.active.get()
-                    && !peer.retained.get()
-                    && let Some(stack) = bridge.stack.upgrade()
-                    && stack.active.get()
-                    && peer.parent.get() == Some(stack.id)
-                    && let Some(logical_idx) = stack
-                        .children
-                        .borrow()
-                        .iter()
-                        .position(|entry| entry.upgrade().is_some_and(|c| c.id == peer.id))
-                {
+                let reattach = if peer.active.get() && !peer.retained.get() {
+                    bridge
+                        .stack
+                        .upgrade()
+                        .filter(|stack| stack.active.get() && peer.parent.get() == Some(stack.id))
+                        .and_then(|stack| {
+                            let logical_idx = stack.children.borrow().iter().position(|entry| {
+                                entry.upgrade().is_some_and(|c| c.id == peer.id)
+                            })?;
+                            Some((stack, logical_idx))
+                        })
+                } else {
+                    None
+                };
+                if let Some((stack, logical_idx)) = reattach {
                     let native_idx = stack.child_index(logical_idx);
                     let container = stack.child_container();
                     container
@@ -289,7 +319,9 @@ impl Wrapper {
                     *peer.mount_parent.borrow_mut() = std::rc::Weak::new();
                 }
                 if peer.active.get() {
-                    if peer.wrapper.borrow().is_some() && mounted.borrow().is_owned() {
+                    let reset_hit_test =
+                        peer.wrapper.borrow().is_some() && mounted.borrow().is_owned();
+                    if reset_hit_test {
                         mounted.borrow().set_i32_attribute(
                             ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::HitTestBehavior,
                             ohos_arkui_binding::types::view::HitTestMode::Default.into(),
@@ -311,9 +343,8 @@ impl Wrapper {
                 self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
             }
         }
-        if let Some(peer) = bridge.peer.upgrade()
-            && peer.active.get()
-        {
+        let live_peer = bridge.peer.upgrade().filter(|peer| peer.active.get());
+        if let Some(peer) = live_peer {
             let still_shared = bridge.stack.upgrade().is_some_and(|stack| {
                 stack
                     .children

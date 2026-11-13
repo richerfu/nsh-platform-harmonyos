@@ -30,7 +30,7 @@ use crate::{
 pub(crate) enum RootBridgePhase {
     #[default]
     None,
-    WaitingTextureTarget,
+    HoldingDirect,
     RenderingExport,
 }
 
@@ -179,8 +179,7 @@ impl Screen {
     }
     pub(crate) fn paint_visible(&self) -> bool {
         match self.bridge_phase.get() {
-            RootBridgePhase::WaitingTextureTarget => return false,
-            RootBridgePhase::RenderingExport => return true,
+            RootBridgePhase::HoldingDirect | RootBridgePhase::RenderingExport => return true,
             RootBridgePhase::None => {}
         }
         crate::render::shader::navigation::screen_paint_visible(
@@ -564,8 +563,8 @@ impl Screen {
         previous.navigation_presentation(1.0, 0.0)?;
         *self.peer.borrow_mut() = Rc::downgrade(&previous);
         self.progress.set(0.0);
-        self.bridge_phase.set(RootBridgePhase::WaitingTextureTarget);
-        owner.navigation_presentation(1.0, 0.0)?;
+        self.bridge_phase.set(RootBridgePhase::HoldingDirect);
+        owner.navigation_presentation(0.0, 0.0)?;
         self.show()?;
         root.install_root_bridge(&stack, &previous, owner)?;
         Ok(true)
@@ -592,6 +591,7 @@ impl Screen {
         };
         if self.bridge_phase.get() != RootBridgePhase::None {
             owner.release_enclosing_root_bridge()?;
+            owner.navigation_presentation(1.0, 0.0)?;
             self.show()?;
             return Ok(false);
         }
