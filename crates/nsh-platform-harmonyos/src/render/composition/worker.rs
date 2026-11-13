@@ -414,11 +414,15 @@ impl Worker {
                             frame_pending = false;
                             repaint = scene.is_some();
                             fill_frame = true;
+                            fills.mark_windows_dirty();
                             if route
                                 .upgrade()
                                 .is_some_and(|r| r.active.load(Ordering::Acquire))
                             {
-                                for entry in entries.iter().flatten() {
+                                for entry in entries.iter_mut().flatten() {
+                                    if entry.window.is_some() {
+                                        entry.window_dirty = true;
+                                    }
                                     wake(&callback, entry.key, &entry.shared);
                                 }
                             }

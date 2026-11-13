@@ -26,6 +26,14 @@ use crate::{
     text::typography::argb,
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RootBridgePhase {
+    #[default]
+    None,
+    WaitingTextureTarget,
+    RenderingExport,
+}
+
 pub(crate) struct Screen {
     owner: Weak<Node>,
     pub(crate) config: RefCell<ScreenConfig>,
@@ -36,9 +44,10 @@ pub(crate) struct Screen {
     has_back: Cell<bool>,
     top: Cell<bool>,
     revealed: Cell<bool>,
+    pub(crate) bridge_phase: Cell<RootBridgePhase>,
     entered: Cell<bool>,
     progress: Cell<f32>,
-    peer: RefCell<Weak<Node>>,
+    pub(crate) peer: RefCell<Weak<Node>>,
     motion: RefCell<Option<Motion>>,
     shader: RefCell<Option<Rc<crate::render::shader::navigation::Navigation>>>,
     immediate_removal: Cell<bool>,
@@ -47,7 +56,7 @@ pub(crate) struct Screen {
 impl Screen {
     #[cfg(feature = "dev")]
     pub(crate) fn test_animating(&self) -> bool {
-        self.motion.borrow().is_some()
+        self.motion.borrow().is_some() || self.bridge_phase.get() != RootBridgePhase::None
     }
     pub(crate) fn header(&self) -> &NativeNode {
         &self.header
@@ -93,6 +102,7 @@ impl Screen {
             has_back: Cell::new(false),
             top: Cell::new(false),
             revealed: Cell::new(false),
+            bridge_phase: Cell::new(RootBridgePhase::None),
             entered: Cell::new(false),
             progress: Cell::new(0.0),
             peer: RefCell::default(),
@@ -168,6 +178,11 @@ impl Screen {
         self.insets.get().is_some()
     }
     pub(crate) fn paint_visible(&self) -> bool {
+        match self.bridge_phase.get() {
+            RootBridgePhase::WaitingTextureTarget => return false,
+            RootBridgePhase::RenderingExport => return true,
+            RootBridgePhase::None => {}
+        }
         crate::render::shader::navigation::screen_paint_visible(
             self.shader.borrow().as_deref(),
             self.is_top(),
@@ -412,6 +427,12 @@ impl Screen {
         }
         None
     }
+    pub(crate) fn is_unanimated(&self) -> bool {
+        self.motion.borrow().is_none() && self.shader.borrow().is_none()
+    }
+    pub(crate) fn set_revealed(&self, revealed: bool) {
+        self.revealed.set(revealed);
+    }
     fn show(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
             owner.restore_style()?;
@@ -503,7 +524,58 @@ impl Screen {
         }
         self.start_motion(&owner, to)
     }
+    fn try_begin_root_bridge(&self, owner: &Rc<Node>) -> Result<bool> {
+        if owner.navigation_shader.borrow().is_some() {
+            return Ok(false);
+        }
+        let Some(stack) = owner.parent_node.borrow().upgrade() else {
+            return Ok(false);
+        };
+        let Some(previous) = self.previous() else {
+            return Ok(false);
+        };
+        let mut at = Some(stack.clone());
+        let mut root = None;
+        while let Some(node) = at {
+            if !node.active.get() || node.retained.get() || node.modal.borrow().is_some() {
+                return Ok(false);
+            }
+            if node.id == nsh_core::ROOT_ID {
+                root = Some(node);
+                break;
+            }
+            at = node.parent_node.borrow().upgrade();
+        }
+        let Some(root) = root else {
+            return Ok(false);
+        };
+        if !root.can_bridge_cold_export() {
+            return Ok(false);
+        }
+        if let Some(previous_screen) = previous.screen.borrow().as_ref() {
+            if previous_screen.motion.borrow().is_some()
+                || previous_screen.shader.borrow().is_some()
+            {
+                previous_screen.settle()?;
+            }
+            previous_screen.revealed.set(true);
+            previous_screen.show()?;
+        }
+        previous.navigation_presentation(1.0, 0.0)?;
+        *self.peer.borrow_mut() = Rc::downgrade(&previous);
+        self.progress.set(0.0);
+        self.bridge_phase.set(RootBridgePhase::WaitingTextureTarget);
+        owner.navigation_presentation(1.0, 0.0)?;
+        self.show()?;
+        root.install_root_bridge(&stack, &previous, owner)?;
+        Ok(true)
+    }
     fn push(&self) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade()
+            && self.try_begin_root_bridge(&owner)?
+        {
+            return Ok(());
+        }
         let shader = self
             .owner
             .upgrade()
@@ -518,6 +590,11 @@ impl Screen {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(false);
         };
+        if self.bridge_phase.get() != RootBridgePhase::None {
+            owner.release_enclosing_root_bridge()?;
+            self.show()?;
+            return Ok(false);
+        }
         if self.immediate_removal.get() {
             return Ok(false);
         }
@@ -562,6 +639,12 @@ impl Screen {
         Ok(())
     }
     fn settle(&self) -> Result<()> {
+        if self.bridge_phase.get() != RootBridgePhase::None {
+            self.bridge_phase.set(RootBridgePhase::None);
+            if let Some(owner) = self.owner.upgrade() {
+                owner.release_enclosing_root_bridge()?;
+            }
+        }
         let shader = self.shader.borrow_mut().take();
         self.motion.borrow_mut().take();
         self.progress.set(0.0);
@@ -656,6 +739,7 @@ impl Screen {
         self.is_top()
             && self.has_back.get()
             && c.gesture_enabled
+            && self.bridge_phase.get() == RootBridgePhase::None
             && self.motion.borrow().is_none()
             && self.shader.borrow().is_none()
             && !owner.platform.get().screen_reader

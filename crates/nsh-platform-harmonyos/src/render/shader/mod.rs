@@ -111,11 +111,17 @@ impl Shaders {
     pub(crate) fn surface_active(&self) -> bool {
         self.effects.surface_active()
     }
+    pub(crate) fn hosts_retainable(&self) -> bool {
+        self.effects.hosts_retainable()
+    }
     pub(crate) fn keep_alive(&self, id: NodeId) -> bool {
         self.effects.keep_alive(id)
     }
     pub(crate) fn has_navigation_layer(&self, target_id: NodeId) -> bool {
         self.effects.has_navigation_layer(target_id)
+    }
+    pub(crate) fn reconcile_hosts_now(&self) -> Result<()> {
+        self.reconcile_hosts()
     }
     fn reconcile_hosts(&self) -> Result<()> {
         let has_fill_in_root = self.views.borrow().values().any(|state| {

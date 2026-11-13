@@ -28,12 +28,36 @@ enum RetirePhase {
     Settling,
 }
 
+struct RootBridge {
+    stack: std::rc::Weak<Node>,
+    peer: std::rc::Weak<Node>,
+    screen_owner: std::rc::Weak<Node>,
+    hosted_on_outer: Cell<bool>,
+}
+
+fn bridge_peer_px_offset(stack: &Rc<Node>, peer: &Rc<Node>, scale: f32) -> (i32, i32) {
+    let mut x = peer.frame.get().x;
+    let mut y = peer.frame.get().y;
+    let mut at = Some(stack.clone());
+    while let Some(node) = at {
+        if node.id == nsh_core::ROOT_ID {
+            break;
+        }
+        let frame = node.frame.get();
+        x += frame.x;
+        y += frame.y;
+        at = node.parent_node.borrow().upgrade();
+    }
+    ((x * scale).round() as i32, (y * scale).round() as i32)
+}
+
 pub(crate) struct Wrapper {
     closed: std::cell::Cell<bool>,
     pub(crate) outer: NativeNode,
     target: RefCell<Option<NativeAttachment>>,
     route: RefCell<Option<ViewRoute>>,
     handoff: RefCell<crate::interop::handoff::HandoffState>,
+    bridge: RefCell<Option<Rc<RootBridge>>>,
     context_live: Cell<bool>,
     owner: std::rc::Weak<Node>,
     settings: std::cell::RefCell<Option<ViewOptions>>,
@@ -97,8 +121,235 @@ fn draw_placeholder_fill(
 }
 
 impl Wrapper {
+    pub(crate) fn is_context_live(&self) -> bool {
+        !self.closed.get() && self.context_live.get()
+    }
     pub(crate) fn retiring_export(&self) -> bool {
         matches!(self.retiring.get(), Some((_, RetirePhase::Exporting)))
+    }
+    fn bridge_nodes_valid(bridge: &RootBridge) -> Option<(Rc<Node>, Rc<Node>, Rc<Node>)> {
+        let stack = bridge.stack.upgrade()?;
+        let peer = bridge.peer.upgrade()?;
+        let screen_owner = bridge.screen_owner.upgrade()?;
+        if !stack.active.get()
+            || stack.retained.get()
+            || !peer.active.get()
+            || peer.retained.get()
+            || peer.parent.get() != Some(stack.id)
+            || !screen_owner.active.get()
+            || screen_owner.retained.get()
+            || screen_owner.parent.get() != Some(stack.id)
+        {
+            return None;
+        }
+        let valid_screen = screen_owner.screen.try_borrow().ok().is_some_and(|s| {
+            s.as_ref()
+                .is_some_and(|sc| sc.is_top() && sc.is_unanimated())
+        });
+        if !valid_screen {
+            return None;
+        }
+        Some((stack, peer, screen_owner))
+    }
+    fn has_live_bridge(&self, export_requested: bool, revealed: bool) -> bool {
+        if self.closed.get() || !self.context_live.get() || !export_requested || revealed {
+            return false;
+        }
+        let bridge = self.bridge.try_borrow().ok().and_then(|b| b.clone());
+        bridge
+            .as_ref()
+            .is_some_and(|b| Self::bridge_nodes_valid(b).is_some())
+    }
+    fn hosted_bridge_peer(&self) -> Option<Rc<Node>> {
+        let bridge = self.bridge.try_borrow().ok()?.clone()?;
+        if !bridge.hosted_on_outer.get() {
+            return None;
+        }
+        bridge.peer.upgrade().filter(|peer| peer.active.get())
+    }
+    fn hosted_bridge_layout(&self, owner: &Node) -> Option<(Rc<Node>, i32, i32)> {
+        let bridge = self.bridge.try_borrow().ok()?.clone()?;
+        if !bridge.hosted_on_outer.get() {
+            return None;
+        }
+        let stack = bridge.stack.upgrade().filter(|s| s.active.get())?;
+        let peer = bridge.peer.upgrade().filter(|p| p.active.get())?;
+        let (x, y) = bridge_peer_px_offset(&stack, &peer, owner.scale.get());
+        Some((peer, x, y))
+    }
+    fn sync_bridge(
+        &self,
+        owner: &Node,
+        export_requested: bool,
+        active_target_is_texture: bool,
+        revealed: bool,
+    ) -> Result<()> {
+        let Some(bridge) = self.bridge.borrow().clone() else {
+            return Ok(());
+        };
+        if self.closed.get() || !self.context_live.get() || !export_requested || revealed {
+            return self.release_bridge();
+        }
+        let Some((stack, peer, screen_owner)) = Self::bridge_nodes_valid(&bridge) else {
+            return self.release_bridge();
+        };
+        if active_target_is_texture && !bridge.hosted_on_outer.get() {
+            let mounted = peer.mounted();
+            if let Some(parent) = peer.mount_parent.borrow().upgrade()
+                && let Some(idx) = parent
+                    .borrow()
+                    .children()
+                    .iter()
+                    .position(|child| Rc::ptr_eq(child, &mounted))
+            {
+                parent.borrow_mut().remove_child(idx)?;
+                parent.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+                parent.borrow().mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            }
+            self.outer.borrow_mut().insert_child(mounted.clone(), 0)?;
+            *peer.mount_parent.borrow_mut() = Rc::downgrade(&self.outer);
+            peer.bridged_on_root_outer.set(true);
+            bridge.hosted_on_outer.set(true);
+            mounted.borrow().set_i32_attribute(
+                ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::HitTestBehavior,
+                ohos_arkui_binding::types::view::HitTestMode::None.into(),
+            )?;
+            peer.interaction.pointer(&peer, true)?;
+            let (x, y) = bridge_peer_px_offset(&stack, &peer, owner.scale.get());
+            peer.invalidate_mounted_geometry();
+            peer.place_bounds(x, y)?;
+            if let Some(screen) = screen_owner.screen.borrow().as_ref() {
+                screen
+                    .bridge_phase
+                    .set(crate::navigation::stack::RootBridgePhase::RenderingExport);
+            }
+            screen_owner.restore_style()?;
+            screen_owner.restore_export_controls()?;
+            screen_owner.schedule_subtree_paint(4)?;
+            screen_owner.shaders.invalidate_visibility();
+            screen_owner.animator.request_frame();
+            self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+            self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
+        Ok(())
+    }
+    fn release_bridge(&self) -> Result<()> {
+        let Some(bridge) = self.bridge.borrow_mut().take() else {
+            return Ok(());
+        };
+        if let Some(screen_owner) = bridge.screen_owner.upgrade() {
+            if let Some(screen) = screen_owner.screen.borrow().as_ref() {
+                screen
+                    .bridge_phase
+                    .set(crate::navigation::stack::RootBridgePhase::None);
+                if screen.is_unanimated() {
+                    *screen.peer.borrow_mut() = std::rc::Weak::new();
+                }
+            }
+            if screen_owner.active.get() {
+                screen_owner.restore_style()?;
+                screen_owner.shaders.invalidate_visibility();
+            }
+        }
+        if bridge.hosted_on_outer.replace(false) {
+            if let Some(peer) = bridge.peer.upgrade() {
+                peer.bridged_on_root_outer.set(false);
+                let mounted = peer.mounted();
+                if self.outer.borrow().is_owned()
+                    && let Some(idx) = self
+                        .outer
+                        .borrow()
+                        .children()
+                        .iter()
+                        .position(|c| Rc::ptr_eq(c, &mounted))
+                {
+                    self.outer.borrow_mut().remove_child(idx)?;
+                }
+                if peer.active.get()
+                    && !peer.retained.get()
+                    && let Some(stack) = bridge.stack.upgrade()
+                    && stack.active.get()
+                    && peer.parent.get() == Some(stack.id)
+                    && let Some(logical_idx) = stack
+                        .children
+                        .borrow()
+                        .iter()
+                        .position(|entry| entry.upgrade().is_some_and(|c| c.id == peer.id))
+                {
+                    let native_idx = stack.child_index(logical_idx);
+                    let container = stack.child_container();
+                    container
+                        .borrow_mut()
+                        .insert_child(mounted.clone(), native_idx)?;
+                    *peer.mount_parent.borrow_mut() = Rc::downgrade(&container);
+                    container.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+                    container.borrow().mark_dirty(NodeDirtyFlag::NeedLayout)?;
+                } else {
+                    *peer.mount_parent.borrow_mut() = std::rc::Weak::new();
+                }
+                if peer.active.get() {
+                    if peer.wrapper.borrow().is_some() && mounted.borrow().is_owned() {
+                        mounted.borrow().set_i32_attribute(
+                            ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::HitTestBehavior,
+                            ohos_arkui_binding::types::view::HitTestMode::Default.into(),
+                        )?;
+                    }
+                    let inherited = peer
+                        .parent_node
+                        .borrow()
+                        .upgrade()
+                        .is_some_and(|parent| parent.interaction.blocks_children());
+                    peer.interaction.pointer(&peer, inherited)?;
+                    peer.invalidate_mounted_geometry();
+                    peer.update_layout_bounds()?;
+                }
+            }
+            if self.outer.borrow().is_owned() {
+                self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+                self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedLayout)?;
+                self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            }
+        }
+        if let Some(peer) = bridge.peer.upgrade()
+            && peer.active.get()
+        {
+            let still_shared = bridge.stack.upgrade().is_some_and(|stack| {
+                stack
+                    .children
+                    .borrow()
+                    .iter()
+                    .filter_map(std::rc::Weak::upgrade)
+                    .filter_map(|child| child.screen.borrow().clone())
+                    .any(|screen| {
+                        screen
+                            .peer
+                            .borrow()
+                            .upgrade()
+                            .is_some_and(|p| Rc::ptr_eq(&p, &peer))
+                    })
+            });
+            if !still_shared {
+                if let Some(peer_screen) = peer.screen.borrow().as_ref() {
+                    peer_screen.set_revealed(false);
+                }
+                peer.navigation_presentation(1.0, 0.0)?;
+                peer.restore_style()?;
+                peer.invalidate_scene();
+            }
+        }
+        Ok(())
+    }
+    fn release_bridge_referencing(&self, id: nsh_core::NodeId) -> Result<()> {
+        let matches = self.bridge.borrow().as_ref().is_some_and(|b| {
+            b.stack.upgrade().is_some_and(|n| n.id == id)
+                || b.peer.upgrade().is_some_and(|n| n.id == id)
+                || b.screen_owner.upgrade().is_some_and(|n| n.id == id)
+        });
+        if matches {
+            self.release_bridge()?;
+        }
+        Ok(())
     }
     fn retire_composite(owner: std::rc::Weak<Node>, generation: u32, remaining: u8) {
         let Some(node) = owner.upgrade() else {
@@ -300,6 +551,7 @@ impl Wrapper {
         }
     }
     pub(crate) fn invalidate_context(&self) {
+        let _ = self.release_bridge();
         self.settings.borrow_mut().take();
         self.route.borrow_mut().take();
         self.handoff.borrow_mut().reset();
@@ -514,6 +766,10 @@ impl Wrapper {
                         for composite in wrapper.lingering.borrow().iter() {
                             composite.measure(event)?;
                         }
+                        if let Some(peer) = wrapper.hosted_bridge_peer() {
+                            crate::render::layout::ChildMeasure::new(event)
+                                .child(&peer.mounted().borrow())?;
+                        }
                     }
                 }
                 Ok(())
@@ -553,6 +809,9 @@ impl Wrapper {
                     for composite in wrapper.lingering.borrow().iter() {
                         composite.layout(event)?;
                     }
+                    if let Some((peer, x, y)) = wrapper.hosted_bridge_layout(&owner) {
+                        peer.place(event, x, y)?;
+                    }
                 }
                 Ok(())
             })
@@ -563,6 +822,7 @@ impl Wrapper {
             target: RefCell::new(Some(target)),
             route: RefCell::new(Some(route)),
             handoff: RefCell::default(),
+            bridge: RefCell::default(),
             context_live: Cell::new(true),
             owner: Rc::downgrade(owner),
             settings: std::cell::RefCell::default(),
@@ -610,11 +870,13 @@ impl Wrapper {
         let is_mount_or_prewarm = !has_mounted_direct
             || self.retired_for_background.get()
             || (owner.shaders.keep_alive(owner.id) && owner.shader_layers.borrow().is_empty());
+        let covered_by_live_bridge = is_root && self.has_live_bridge(export_requested, revealed);
         let inputs = crate::interop::handoff::HandoffInputs {
             closed: self.closed.get(),
             fill: owner.placeholder_fill(),
             is_root,
             is_mount_or_prewarm,
+            covered_by_live_bridge,
             has_mounted_direct,
             active_target_is_texture: previous_texture == Some(true),
             export_requested,
@@ -739,12 +1001,21 @@ impl Wrapper {
             revealed,
             now,
         );
+        if is_root {
+            self.sync_bridge(
+                owner,
+                export_requested,
+                self.active_target_is_texture(),
+                revealed,
+            )?;
+        }
         if outcome.repaint_outer {
             self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         }
         Ok(changed)
     }
     pub(crate) fn close(&self, owner: &Node) -> Result<()> {
+        let _ = self.release_bridge();
         self.closed.set(true);
         self.retiring.set(None);
         self.retired_for_background.set(false);
@@ -915,7 +1186,7 @@ impl Node {
         }
         let mut created_composite = false;
         if !requires_texture {
-            let immediate_retire = !self.shaders.surface_active()
+            let immediate_retire = !self.shaders.hosts_retainable()
                 || self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
                     wrapper
                         .composite
@@ -927,7 +1198,7 @@ impl Node {
                 if let Some(wrapper) = self.wrapper.borrow().as_ref() {
                     wrapper.retiring.set(None);
                     if wrapper.composite.borrow_mut().take().is_some() {
-                        if !self.shaders.surface_active() {
+                        if !self.shaders.hosts_retainable() {
                             wrapper.retired_for_background.set(true);
                         }
                         wrapper
@@ -1062,7 +1333,53 @@ impl Node {
     pub(crate) fn visual_node(&self) -> NativeNode {
         self.mounted()
     }
+    pub(crate) fn can_bridge_cold_export(&self) -> bool {
+        if self.id != nsh_core::ROOT_ID || !self.needs_texture() || self.navigation_capture.get() {
+            return false;
+        }
+        self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+            wrapper.is_context_live()
+                && wrapper.composite.borrow().is_some()
+                && !self.is_handoff_revealed(wrapper)
+        })
+    }
+    pub(crate) fn install_root_bridge(
+        &self,
+        stack: &Rc<Self>,
+        peer: &Rc<Self>,
+        screen_owner: &Rc<Self>,
+    ) -> Result<()> {
+        if let Some(wrapper) = self.wrapper.borrow().as_ref() {
+            wrapper.release_bridge()?;
+            *wrapper.bridge.borrow_mut() = Some(Rc::new(RootBridge {
+                stack: Rc::downgrade(stack),
+                peer: Rc::downgrade(peer),
+                screen_owner: Rc::downgrade(screen_owner),
+                hosted_on_outer: Cell::new(false),
+            }));
+        }
+        self.update_wrapper()
+    }
+    pub(crate) fn release_root_bridge_for(&self, id: nsh_core::NodeId) -> Result<()> {
+        if let Some(wrapper) = self.wrapper.borrow().as_ref() {
+            wrapper.release_bridge_referencing(id)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn release_enclosing_root_bridge(&self) -> Result<()> {
+        let mut at = self.parent_node.borrow().upgrade();
+        while let Some(node) = at {
+            if node.id == nsh_core::ROOT_ID {
+                return node.release_root_bridge_for(self.id);
+            }
+            at = node.parent_node.borrow().upgrade();
+        }
+        Ok(())
+    }
     pub(crate) fn active_export_target_id(&self) -> Option<u32> {
+        if self.bridged_on_root_outer.get() {
+            return None;
+        }
         let own_target = |node: &Self| -> Option<u32> {
             if let Some(id) = node.scroll.try_borrow().ok().and_then(|scroll| {
                 scroll
@@ -1097,6 +1414,9 @@ impl Node {
         };
         let mut at = next_parent(self);
         while let Some(node) = at {
+            if node.bridged_on_root_outer.get() {
+                return None;
+            }
             if let Some(id) = own_target(&node) {
                 return Some(id);
             }

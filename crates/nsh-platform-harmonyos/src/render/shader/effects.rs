@@ -79,6 +79,7 @@ pub(super) struct Effects {
     root_max_overflow: Cell<f32>,
     keep_alive_active: RefCell<FxHashMap<NodeId, bool>>,
     was_surface_active: Cell<bool>,
+    was_hosts_retainable: Cell<bool>,
     logged_state: Cell<Option<(usize, usize)>>,
     logged_hosts: Cell<Option<(usize, usize, usize, usize)>>,
 }
@@ -110,6 +111,22 @@ impl Effects {
                     .dispatcher
                     .upgrade()
                     .is_some_and(|d| d.active.load(Ordering::Acquire))
+        })
+    }
+
+    pub(super) fn hosts_retainable(&self) -> bool {
+        self.root.borrow().upgrade().is_some_and(|root| {
+            root.active.get()
+                && root.host.check().is_ok()
+                && root
+                    .dispatcher
+                    .upgrade()
+                    .is_some_and(|d| d.live.load(Ordering::Acquire))
+                && root
+                    .wrapper
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|wrapper| wrapper.is_context_live())
         })
     }
 
@@ -167,7 +184,9 @@ impl Effects {
     pub(super) fn reconcile_hosts(&self, has_fill_in_root: bool, fill_count: usize) -> Result<()> {
         let root_node = self.root.borrow().upgrade();
         let active_surface = self.surface_active();
+        let retainable = self.hosts_retainable();
         let surface_changed = self.was_surface_active.replace(active_surface) != active_surface;
+        let retainable_changed = self.was_hosts_retainable.replace(retainable) != retainable;
 
         {
             let mut owners = self.screen_effect_owners.borrow_mut();
@@ -221,7 +240,7 @@ impl Effects {
 
         let mut desired: FxHashMap<NodeId, (Rc<Node>, bool)> = FxHashMap::default();
         for (id, node) in capable_list {
-            let keep = active_surface && mounted_and_unhidden_in_root(&node);
+            let keep = retainable && mounted_and_unhidden_in_root(&node);
             desired.insert(id, (node, keep));
         }
 
@@ -240,7 +259,7 @@ impl Effects {
                 .filter_map(Weak::upgrade)
                 .any(|scope| mounted_and_unhidden_in_root(&scope));
             let root_capable = desired.get(&root.id).is_some_and(|&(_, keep)| keep);
-            let root_keep = active_surface
+            let root_keep = retainable
                 && mounted_and_unhidden_in_root(root)
                 && (has_fill_in_root
                     || has_non_nav_effect_in_root
@@ -267,13 +286,13 @@ impl Effects {
                 } else {
                     active_map.remove(&id);
                 }
-                if prev != *keep || surface_changed {
+                if prev != *keep || retainable_changed || surface_changed {
                     to_refresh.push(node.clone());
                 }
             }
         }
 
-        if surface_changed {
+        if retainable_changed || surface_changed {
             let extra_targets: Vec<Rc<Node>> = self
                 .views
                 .borrow()
@@ -529,7 +548,7 @@ impl Effects {
     }
 
     pub(super) fn prewarm_root_early(&self, owner: &Rc<Node>) -> Result<()> {
-        if !self.surface_active() || !unhidden_chain(owner) {
+        if !self.hosts_retainable() || !unhidden_chain(owner) {
             return Ok(());
         }
         let Some(root) = self.root.borrow().upgrade() else {
@@ -608,7 +627,7 @@ impl Effects {
                 entry.0 = Rc::downgrade(target);
                 entry.1 = entry.1.max(overflow);
             }
-            if self.surface_active() && unhidden_chain(owner) && unhidden_chain(target) {
+            if self.hosts_retainable() && unhidden_chain(owner) && unhidden_chain(target) {
                 self.keep_alive_active.borrow_mut().insert(target.id, true);
             }
         }

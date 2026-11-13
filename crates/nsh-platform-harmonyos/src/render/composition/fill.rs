@@ -116,6 +116,13 @@ impl Fills {
     pub(super) fn remove(&mut self, key: Key) {
         self.views.remove(&key);
     }
+    pub(super) fn mark_windows_dirty(&mut self) {
+        for view in self.views.values_mut() {
+            if view.window.is_some() {
+                view.window_dirty = true;
+            }
+        }
+    }
     pub(super) fn apply(
         &mut self,
         command: Command,

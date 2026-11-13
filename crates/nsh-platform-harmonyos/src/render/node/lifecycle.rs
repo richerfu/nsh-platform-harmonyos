@@ -69,6 +69,7 @@ impl Node {
             video: RefCell::default(),
             active: Cell::new(true),
             export_repair: Cell::new(0),
+            bridged_on_root_outer: Cell::new(false),
             retained: Cell::new(false),
             retained_owner: RefCell::default(),
             retained_children: RefCell::default(),
@@ -197,6 +198,7 @@ impl Node {
         if !self.active.replace(false) {
             return;
         }
+        self.bridged_on_root_outer.set(false);
         self.paint_state.set(self.paint_state.get().reset());
         self.animated_opacity.set(None);
         callback(|| self.cursor.update(self, false));

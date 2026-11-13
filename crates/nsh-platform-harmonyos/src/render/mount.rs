@@ -156,6 +156,9 @@ impl Mounter {
         }
         if let Some(Some(node)) = self.slots.get(id as usize) {
             node.composite_ready(generation)?;
+            if id == nsh_core::ROOT_ID {
+                self.shaders.reveal()?;
+            }
             if let Some(modal) = node.modal.borrow().as_ref() {
                 modal.refresh_presentation()?;
             }
@@ -289,6 +292,7 @@ impl Mounter {
                 video.context(ready)?;
             }
         }
+        self.shaders.reconcile_hosts_now()?;
         if ready {
             self.flush_arkui()?;
         }
@@ -436,6 +440,7 @@ impl Mounter {
         .cloned()
     }
     pub(crate) fn reconcile_navigation(&mut self) -> Result<()> {
+        self.shaders.reconcile_hosts_now()?;
         crate::navigation::stack::reconcile(
             self.stacks
                 .iter()
@@ -556,6 +561,13 @@ impl Mounter {
     }
 
     fn unlink(&mut self, id: NodeId, retain: bool) -> Result<()> {
+        if let Some(root) = self
+            .slots
+            .get(nsh_core::ROOT_ID as usize)
+            .and_then(Option::as_ref)
+        {
+            Self::attribute(root.release_root_bridge_for(id));
+        }
         let node = self.node(id)?;
         let parent = node.parent.get().map(|id| self.node(id)).transpose()?;
         let retain = retain && node.modal.borrow().is_none() && parent.is_some();

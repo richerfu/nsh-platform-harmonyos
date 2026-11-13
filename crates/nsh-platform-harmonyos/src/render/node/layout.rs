@@ -171,7 +171,7 @@ impl Node {
             (y * self.scale.get()).round() as i32,
         )
     }
-    pub(super) fn place_bounds(&self, x: i32, y: i32) -> Result<()> {
+    pub(crate) fn place_bounds(&self, x: i32, y: i32) -> Result<()> {
         let frame = self.frame.get();
         let mut width = (frame.width * self.scale.get()).round() as i32;
         let mut height = (frame.height * self.scale.get()).round() as i32;

@@ -151,11 +151,12 @@ impl Node {
         style: &ViewStyle,
     ) -> crate::render::effects::EffectsPlan {
         let surface_active = self.shaders.surface_active();
-        let unhidden = surface_active && self.unhidden_for_effects(style);
+        let hosts_retainable = self.shaders.hosts_retainable();
+        let unhidden = hosts_retainable && self.unhidden_for_effects(style);
         let shaders = self.shader_layers.borrow();
         let has_shaders = !shaders.is_empty()
-            && surface_active
-            && (unhidden || self.shaders.has_navigation_layer(self.id));
+            && hosts_retainable
+            && (unhidden || (surface_active && self.shaders.has_navigation_layer(self.id)));
         let shader_samples_backdrop = has_shaders
             && self.id != nsh_core::ROOT_ID
             && shaders.iter().any(|(_, layer)| {
