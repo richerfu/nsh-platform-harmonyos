@@ -148,10 +148,6 @@ impl FrameRate {
         &self.vsync
     }
 
-    pub(crate) fn hz(&self) -> u32 {
-        self.state.lock().unwrap().hz
-    }
-
     /// Applies the initial baseline range and returns the raw status code so
     /// surface startup can fail fast if the native VSync handle rejects it.
     pub(crate) fn apply_initial(&self) -> i32 {
@@ -238,28 +234,6 @@ pub(crate) fn normalize_display_hz(raw: u32) -> u32 {
     match raw {
         0 => 60,
         hz => hz.clamp(30, 240),
-    }
-}
-
-/// Parses an optional `NSH_VSYNC_KEEPALIVE` runtime override (`0`/`false`/`off`
-/// disables, `1`/`true`/`on` enables, unset or unrecognized falls back to `default`).
-pub(crate) fn parse_keepalive_switch(raw: Option<&str>, default: bool) -> bool {
-    match raw.map(str::trim) {
-        Some(v)
-            if v.eq_ignore_ascii_case("0")
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("off") =>
-        {
-            false
-        }
-        Some(v)
-            if v.eq_ignore_ascii_case("1")
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("on") =>
-        {
-            true
-        }
-        _ => default,
     }
 }
 
@@ -398,18 +372,5 @@ mod tests {
                 expected: 30,
             })
         );
-    }
-
-    #[test]
-    fn keepalive_switch_preserves_default_and_honors_env_values() {
-        assert!(parse_keepalive_switch(None, true));
-        assert!(!parse_keepalive_switch(None, false));
-        assert!(!parse_keepalive_switch(Some("0"), true));
-        assert!(!parse_keepalive_switch(Some("false"), true));
-        assert!(!parse_keepalive_switch(Some("OFF"), true));
-        assert!(parse_keepalive_switch(Some("1"), false));
-        assert!(parse_keepalive_switch(Some("true"), false));
-        assert!(parse_keepalive_switch(Some("On"), false));
-        assert!(parse_keepalive_switch(Some(""), true));
     }
 }

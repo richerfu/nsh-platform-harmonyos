@@ -339,120 +339,6 @@ impl MountSink for Sink {
     }
 }
 
-/// Runtime default for the LTPO VSync keepalive burst (A15).
-/// Kept `true` by default so existing behavior is unchanged; flip to `false` or
-/// set process env `NSH_VSYNC_KEEPALIVE=0` (`0`/`false`/`off`) to measure on/off
-/// on device without compile-time feature flags.
-const VSYNC_KEEPALIVE_DEFAULT: bool = true;
-
-fn vsync_keepalive_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let raw = std::env::var("NSH_VSYNC_KEEPALIVE").ok();
-        crate::app::frame_rate::parse_keepalive_switch(raw.as_deref(), VSYNC_KEEPALIVE_DEFAULT)
-    })
-}
-
-struct VsyncVote {
-    remaining: std::sync::atomic::AtomicU8,
-    armed: std::sync::atomic::AtomicBool,
-    active: std::sync::atomic::AtomicBool,
-    window_callbacks: std::sync::atomic::AtomicU64,
-    total_callbacks: std::sync::atomic::AtomicU64,
-    last_log_ns: std::sync::atomic::AtomicU64,
-}
-
-impl VsyncVote {
-    fn flush_burst_log(&self) {
-        use std::sync::atomic::Ordering;
-        let callbacks = self.window_callbacks.swap(0, Ordering::AcqRel);
-        if callbacks > 0 {
-            let total = self.total_callbacks.load(Ordering::Relaxed);
-            log::info!(
-                "[NSH] vsync-keepalive enabled={} callbacks={} total_callbacks={}",
-                vsync_keepalive_enabled(),
-                callbacks,
-                total,
-            );
-        }
-    }
-}
-
-fn arm_vsync_vote(vsync: &Arc<Vsync>, vote: &Arc<VsyncVote>) {
-    use std::sync::atomic::Ordering;
-    if !vote.active.load(Ordering::Acquire) || !vsync_keepalive_enabled() {
-        vote.remaining.store(0, Ordering::Release);
-        vote.armed.store(false, Ordering::Release);
-        vote.flush_burst_log();
-        return;
-    }
-    let weak = Arc::downgrade(vsync);
-    let vote_cb = vote.clone();
-    if vsync.request_frame_once(move |timestamp| {
-        if !vote_cb.active.load(Ordering::Acquire) || !vsync_keepalive_enabled() {
-            vote_cb.remaining.store(0, Ordering::Release);
-            vote_cb.armed.store(false, Ordering::Release);
-            vote_cb.flush_burst_log();
-            return;
-        }
-        let window = vote_cb.window_callbacks.fetch_add(1, Ordering::Relaxed) + 1;
-        let total = vote_cb.total_callbacks.fetch_add(1, Ordering::Relaxed) + 1;
-        let ts = timestamp.max(0) as u64;
-        let last_ns = vote_cb.last_log_ns.load(Ordering::Relaxed);
-        if last_ns == 0 {
-            let _ =
-                vote_cb
-                    .last_log_ns
-                    .compare_exchange(0, ts, Ordering::Relaxed, Ordering::Relaxed);
-        } else if ts.saturating_sub(last_ns) >= 1_000_000_000
-            && vote_cb
-                .last_log_ns
-                .compare_exchange(last_ns, ts, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            let callbacks = vote_cb.window_callbacks.swap(0, Ordering::AcqRel);
-            if callbacks > 0 {
-                log::info!(
-                    "[NSH] vsync-keepalive enabled=true callbacks={} total_callbacks={}",
-                    callbacks.max(window),
-                    total,
-                );
-            }
-        }
-        let prev = vote_cb
-            .remaining
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                Some(n.saturating_sub(1))
-            })
-            .unwrap_or(0);
-        if prev > 1
-            && vote_cb.active.load(Ordering::Acquire)
-            && let Some(vsync) = weak.upgrade()
-        {
-            arm_vsync_vote(&vsync, &vote_cb);
-        } else {
-            vote_cb.armed.store(false, Ordering::Release);
-            if vote_cb.active.load(Ordering::Acquire)
-                && vote_cb.remaining.load(Ordering::Acquire) > 0
-                && let Some(vsync) = weak.upgrade()
-                && vote_cb
-                    .armed
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                arm_vsync_vote(&vsync, &vote_cb);
-            } else {
-                vote_cb.last_log_ns.store(0, Ordering::Relaxed);
-                vote_cb.flush_burst_log();
-            }
-        }
-    }) != 0
-    {
-        vote.armed.store(false, Ordering::Release);
-        vote.flush_burst_log();
-    }
-}
-
 struct State {
     #[cfg(feature = "dev")]
     testing: Option<Arc<crate::app::testing::Session>>,
@@ -465,7 +351,6 @@ struct State {
     dispatcher: Weak<Dispatcher>,
     vsync: Arc<Vsync>,
     frame_rate: Arc<crate::app::frame_rate::FrameRate>,
-    vsync_vote: Arc<VsyncVote>,
     environment: Environment,
     errors: Errors,
     frame_pending: bool,
@@ -530,10 +415,7 @@ impl State {
                 .navigation_complete(key),
             Message::Shader => self.mounter.as_ref().unwrap().shaders.collect()?,
             Message::Arkui => self.mounter.as_ref().unwrap().flush_arkui()?,
-            Message::ScrollReports => {
-                self.pulse_frame_rate_vote();
-                self.mounter.as_ref().unwrap().flush_scroll_reports()?;
-            }
+            Message::ScrollReports => self.mounter.as_ref().unwrap().flush_scroll_reports()?,
             Message::TextSelection(id, command) => {
                 self.mounter.as_ref().unwrap().text_selection(id, command)?
             }
@@ -639,7 +521,6 @@ impl State {
                     // native batch below finishes. No batch clone is needed.
                     testing.model.apply(&batch);
                 }
-                self.pulse_frame_rate_vote();
                 let mounter = self
                     .mounter
                     .as_mut()
@@ -692,13 +573,7 @@ impl State {
     }
     fn update_back(&self) {
         let active = self.is_active();
-        self.vsync_vote
-            .active
-            .store(active, std::sync::atomic::Ordering::Release);
         if !active {
-            self.vsync_vote
-                .remaining
-                .store(0, std::sync::atomic::Ordering::Release);
             self.frame_rate
                 .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
         }
@@ -751,29 +626,6 @@ impl State {
     fn report(&self, error: String) {
         self.errors.report(error);
     }
-    fn pulse_frame_rate_vote(&self) {
-        use std::sync::atomic::Ordering;
-        if !self.is_active() || !vsync_keepalive_enabled() {
-            return;
-        }
-        // Keep the window-associated VSync active across ~33 ms of scroll batches
-        // and live ticks (scaled to the current panel rate: 2 frames at 60 Hz,
-        // 3 at 90 Hz, 4 at 120 Hz) so LTPO maintains its negotiated rate without
-        // waking the UI thread when idle. Disarmed immediately on background/hide.
-        let keepalive_frames = (self.frame_rate.hz() / 30).clamp(1, 4) as u8;
-        self.vsync_vote.active.store(true, Ordering::Release);
-        self.vsync_vote
-            .remaining
-            .store(keepalive_frames, Ordering::Release);
-        if self
-            .vsync_vote
-            .armed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            arm_vsync_vote(&self.vsync, &self.vsync_vote);
-        }
-    }
     fn step_frame(&mut self, wake_engine: bool, timestamp: Option<u64>) -> Result<()> {
         self.frame_pending = false;
         if !self.is_active() {
@@ -814,7 +666,6 @@ impl State {
         if !self.is_active() {
             return Ok(());
         }
-        self.pulse_frame_rate_vote();
         if !self.frame_pending {
             self.frame_wanted = false;
             let state = self.self_ref.clone();
@@ -892,12 +743,6 @@ impl State {
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
-        self.vsync_vote
-            .active
-            .store(false, std::sync::atomic::Ordering::Release);
-        self.vsync_vote
-            .remaining
-            .store(0, std::sync::atomic::Ordering::Release);
         self.frame_rate
             .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
         if let Some(dispatcher) = self.dispatcher.upgrade() {
@@ -1031,18 +876,6 @@ impl Runtime {
                 "failed to configure OHOS native VSync rate: {status}"
             )));
         }
-        let keepalive_enabled = vsync_keepalive_enabled();
-        log::info!(
-            "[NSH] vsync-keepalive enabled={keepalive_enabled} callbacks=0 total_callbacks=0"
-        );
-        let vsync_vote = Arc::new(VsyncVote {
-            remaining: std::sync::atomic::AtomicU8::new(0),
-            armed: std::sync::atomic::AtomicBool::new(false),
-            active: std::sync::atomic::AtomicBool::new(true),
-            window_callbacks: std::sync::atomic::AtomicU64::new(0),
-            total_callbacks: std::sync::atomic::AtomicU64::new(0),
-            last_log_ns: std::sync::atomic::AtomicU64::new(0),
-        });
         // The shader thread paces itself on the surface's shared FrameRate too.
         let shader_rate = frame_rate.clone();
         let state = Rc::new_cyclic(|weak| {
@@ -1058,7 +891,6 @@ impl Runtime {
                 dispatcher: Weak::new(),
                 vsync,
                 frame_rate,
-                vsync_vote,
                 errors,
                 frame_pending: false,
                 laid_out: false,

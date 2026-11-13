@@ -47,16 +47,14 @@ Features:
   explicitly from the provided `UIContext` (`UIAbilityContext` and `Window`) in a standard `UIAbility` without a custom
   base class or process-global context guessing.
 - **Commits, frames and frame-rate arbitration** (`src/render/`, `src/app/frame_rate.rs`, `src/app/runtime.rs`): the
-  engine submits each `MountBatch` through a N-API threadsafe function to the ArkUI UI thread. Per-surface `NativeVSync`
-  callbacks drive UI animations on the UI thread while `FrameRate` arbitrates UI animation demand (`Uncapped` or
-  reduced-rate `Capped`, e.g. `30` Hz) and shader compositor demand as the single owner of
-  `OH_NativeVSync_SetExpectedFrameRateRange`; idle surfaces request no frames. Intentional policy: while any GPU shader
-  holds an active vote (`shader_votes > 0`), `FrameRate` pins the shared `NativeVSync` range to full panel `hz`,
-  overriding concurrent `UiDemand::Capped` caps until the last shader vote drops (per-consumer UI throttling, if ever
-  needed alongside a live shader, belongs in `Animator` rather than lowering the shared VSync handle). Active UI frame
-  bursts optionally hold a short panel-rate-scaled LTPO VSync keepalive (`VSYNC_KEEPALIVE_DEFAULT` /
-  `NSH_VSYNC_KEEPALIVE` read once at startup, reporting `[NSH] vsync-keepalive` callback counts during bursts and `0`
-  callbacks when idle or backgrounded).
+  engine submits each `MountBatch` through a N-API threadsafe function to the ArkUI UI thread. `OH_ArkUI_PostFrameCallback`
+  (falling back to per-surface `NativeVSync` before attachment) drives demanded UI frames on the UI thread while `FrameRate`
+  arbitrates UI animation demand (`Uncapped` or reduced-rate `Capped`, e.g. `30` Hz) and shader compositor demand as the
+  single owner of `OH_NativeVSync_SetExpectedFrameRateRange`; idle surfaces and native `Scroll` gestures schedule zero
+  synthetic keepalive callbacks on the UI thread. Intentional policy: while any GPU shader holds an active vote
+  (`shader_votes > 0`), `FrameRate` pins the shared `NativeVSync` range to full panel `hz`, overriding concurrent
+  `UiDemand::Capped` caps until the last shader vote drops (per-consumer UI throttling, if ever needed alongside a live
+  shader, belongs in `Animator` rather than lowering the shared VSync handle).
 - **Device tests** (`nsh-platform-harmonyos-cli/src/test/`, `src/app/testing.rs`, `src/render/mount/testing.rs`): the
   CLI runs NSH's public `TestRun` and `Agent`, with a `RemoteScene` over the dev protocol. The device's `Model`
   observes mount batches and provides selectors, storage, network mocks and the manual clock. ArkUI answers native
