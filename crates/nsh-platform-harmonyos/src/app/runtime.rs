@@ -136,7 +136,7 @@ pub(crate) enum Message {
         generation: u32,
     },
     Scene,
-    Navigation(crate::render::shader::navigation::Key),
+    Navigation(crate::render::shader::navigation::Event),
     /// The shader thread left frames (`render::shader`).
     Shader,
     #[cfg(feature = "api-23")]
@@ -407,12 +407,7 @@ impl State {
         }
         match message {
             Message::Scene => self.mounter.as_ref().unwrap().scene_ready()?,
-            Message::Navigation(key) => self
-                .mounter
-                .as_ref()
-                .unwrap()
-                .shaders
-                .navigation_complete(key),
+            Message::Navigation(event) => self.mounter.as_ref().unwrap().navigation_event(event)?,
             Message::Shader => self.mounter.as_ref().unwrap().shaders.collect()?,
             Message::Arkui => self.mounter.as_ref().unwrap().flush_arkui()?,
             Message::ScrollReports => self.mounter.as_ref().unwrap().flush_scroll_reports()?,

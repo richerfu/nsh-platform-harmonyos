@@ -80,14 +80,22 @@ impl Key {
     }
 }
 enum Task {
-    Create { key: Key, shared: Arc<Shared> },
+    Create {
+        key: Key,
+        shared: Arc<Shared>,
+    },
     Fill(super::fill::Command),
     Frame,
     Resume,
     Wake(Key, Weak<Shared>),
     Slot(Key, NodeId, u16, AnimationValue),
     Transition(Key, NodeId, std::time::Duration),
-    Capture(crate::render::shader::navigation::Key, Key),
+    Capture {
+        key: crate::render::shader::navigation::Key,
+        source: Key,
+        deadline: std::time::Instant,
+    },
+    CancelCapture(crate::render::shader::navigation::Key),
     Navigation(Navigation<()>),
     Window(Key, NativeWindow),
     WindowGone(Key, usize),
@@ -111,7 +119,8 @@ impl Coalesce for Task {
             )
             | Self::Wake(..)
             | Self::Transition(..)
-            | Self::Capture(..)
+            | Self::Capture { .. }
+            | Self::CancelCapture(..)
             | Self::Navigation(..)
             | Self::Window(..)
             | Self::WindowGone(..)
@@ -182,6 +191,11 @@ struct Snapshot {
     target: super::gles::Target,
     coverage: super::geometry::Coverage,
     origin: (f32, f32),
+}
+struct PendingCapture {
+    key: crate::render::shader::navigation::Key,
+    source: Key,
+    deadline: std::time::Instant,
 }
 pub(crate) struct Worker {
     send: CommandSender<Task>,
@@ -268,7 +282,12 @@ impl Worker {
                 let mut fills = super::fill::Fills::default();
                 let mut frame_pending = false;
                 let mut scene_dirty = false;
-                let mut captured = None;
+                let mut pending_captures: Vec<PendingCapture> = Vec::new();
+                let mut captured: Vec<(
+                    crate::render::shader::navigation::Key,
+                    Snapshot,
+                    std::time::Instant,
+                )> = Vec::new();
                 while let Ok(task) = receive.recv() {
                     let frame = matches!(&task, Task::Frame);
                     let mut repaint = false;
@@ -278,7 +297,18 @@ impl Worker {
                         Task::Drain => {
                             scene = None;
                             scene_stats.reset_idle();
-                            captured = None;
+                            captured.clear();
+                            if let Some(route) = route.upgrade() {
+                                for pending in pending_captures.drain(..) {
+                                    route.send(Message::Navigation(
+                                        crate::render::shader::navigation::Event::Failed(
+                                            pending.key,
+                                        ),
+                                    ));
+                                }
+                            } else {
+                                pending_captures.clear();
+                            }
                             for slot in &mut entries {
                                 if let Some(entry) = slot.take() {
                                     retire_entry(entry, &route);
@@ -487,8 +517,17 @@ impl Worker {
                                         && !navigation.complete
                                         && let Some(route) = &upgraded
                                     {
-                                        route.send(Message::Navigation(navigation.key));
+                                        route.send(Message::Navigation(
+                                            crate::render::shader::navigation::Event::Completed(
+                                                navigation.key,
+                                            ),
+                                        ));
                                     }
+                                    fail_captures_for_source(
+                                        &mut pending_captures,
+                                        key,
+                                        upgraded.as_deref(),
+                                    );
                                     if let Some(route) = &upgraded {
                                         route.send(Message::Error(format!(
                                             "compositor node {} generation {}: {error}",
@@ -498,6 +537,13 @@ impl Worker {
                                     continue;
                                 }
                             }
+                            fulfill_captures(
+                                &mut entries,
+                                &mut pending_captures,
+                                &mut captured,
+                                Some(key),
+                                upgraded.as_deref(),
+                            );
                             let completed_nav =
                                 entries[key.slot()].as_mut().unwrap().completed.take();
                             if let Some(route) = &upgraded {
@@ -513,7 +559,9 @@ impl Worker {
                                     });
                                 }
                                 if let Some(key) = completed_nav {
-                                    route.send(Message::Navigation(key));
+                                    route.send(Message::Navigation(
+                                        crate::render::shader::navigation::Event::Completed(key),
+                                    ));
                                 }
                             }
                         }
@@ -551,26 +599,78 @@ impl Worker {
                                 wake(&callback, key, &entry.shared);
                             }
                         }
-                        Task::Capture(key, source) => {
-                            captured = entries
+                        Task::Capture {
+                            key,
+                            source,
+                            deadline,
+                        } => {
+                            let now = std::time::Instant::now();
+                            captured.retain(|(k, _, at)| {
+                                k.owner != key.owner
+                                    && now.saturating_duration_since(*at)
+                                        < std::time::Duration::from_secs(2)
+                            });
+                            pending_captures.retain(|p| p.key.owner != key.owner);
+                            let upgraded = route.upgrade();
+                            let entry = entries
                                 .get_mut(source.slot())
                                 .and_then(Option::as_mut)
-                                .filter(|entry| entry.key == source)
-                                .and_then(|entry| match entry.snapshot() {
-                                    Ok(snapshot) => snapshot.map(|snapshot| (key, snapshot)),
+                                .filter(|entry| {
+                                    entry.key == source
+                                        && !entry.shared.state.lock().unwrap().closed
+                                });
+                            if let Some(entry) = entry {
+                                match entry.snapshot() {
+                                    Ok(Some(snapshot)) => {
+                                        captured.push((key, snapshot, now));
+                                        if let Some(route) = &upgraded {
+                                            route.send(Message::Navigation(
+                                                crate::render::shader::navigation::Event::Captured(
+                                                    key,
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        if entry.settings.scene {
+                                            repaint = true;
+                                        }
+                                        wake(&callback, source, &entry.shared);
+                                        pending_captures.push(PendingCapture {
+                                            key,
+                                            source,
+                                            deadline,
+                                        });
+                                    }
                                     Err(error) => {
                                         log::warn!("shader navigation capture: {error}");
-                                        None
+                                        if let Some(route) = &upgraded {
+                                            route.send(Message::Navigation(
+                                                crate::render::shader::navigation::Event::Failed(
+                                                    key,
+                                                ),
+                                            ));
+                                        }
                                     }
-                                });
+                                }
+                            } else if let Some(route) = &upgraded {
+                                route.send(Message::Navigation(
+                                    crate::render::shader::navigation::Event::Failed(key),
+                                ));
+                            }
+                        }
+                        Task::CancelCapture(key) => {
+                            pending_captures.retain(|p| p.key != key);
+                            captured.retain(|(k, _, _)| *k != key);
                         }
                         Task::Navigation(request) => {
                             repaint = scene.is_some();
+                            let snapshot = captured
+                                .iter()
+                                .position(|(key, _, _)| *key == request.key)
+                                .map(|idx| captured.swap_remove(idx).1);
                             let request = Navigation {
-                                snapshot: captured
-                                    .take()
-                                    .filter(|(key, _)| *key == request.key)
-                                    .map(|(_, snapshot)| snapshot),
+                                snapshot,
                                 target: request.target,
                                 key: request.key,
                                 duration: request.duration,
@@ -586,20 +686,32 @@ impl Worker {
                             {
                                 if request.snapshot.is_none() {
                                     if let Some(route) = route.upgrade() {
-                                        route.send(Message::Navigation(request.key));
+                                        route.send(Message::Navigation(
+                                            crate::render::shader::navigation::Event::Failed(
+                                                request.key,
+                                            ),
+                                        ));
                                     }
                                 } else {
                                     if let Some(old) = entry.navigation.replace(request)
                                         && !old.complete
                                         && let Some(route) = route.upgrade()
                                     {
-                                        route.send(Message::Navigation(old.key));
+                                        route.send(Message::Navigation(
+                                            crate::render::shader::navigation::Event::Completed(
+                                                old.key,
+                                            ),
+                                        ));
                                     }
                                     entry.shared.animating.store(true, Ordering::Release);
                                 }
                                 wake(&callback, entry.key, &entry.shared);
                             } else if let Some(route) = route.upgrade() {
-                                route.send(Message::Navigation(request.key));
+                                route.send(Message::Navigation(
+                                    crate::render::shader::navigation::Event::Completed(
+                                        request.key,
+                                    ),
+                                ));
                             }
                         }
                         Task::Window(key, window) => {
@@ -735,10 +847,46 @@ impl Worker {
                                 if let Some(key) = entry.completed.take()
                                     && let Some(route) = &upgraded
                                 {
-                                    route.send(Message::Navigation(key));
+                                    route.send(Message::Navigation(
+                                        crate::render::shader::navigation::Event::Completed(key),
+                                    ));
                                 }
                             }
+                            if !failed {
+                                fulfill_captures(
+                                    &mut entries,
+                                    &mut pending_captures,
+                                    &mut captured,
+                                    None,
+                                    upgraded.as_deref(),
+                                );
+                            }
                         }
+                    }
+                    if !pending_captures.is_empty() {
+                        let now = std::time::Instant::now();
+                        let upgraded = route.upgrade();
+                        pending_captures.retain(|pending| {
+                            let live = entries
+                                .get(pending.source.slot())
+                                .and_then(Option::as_ref)
+                                .is_some_and(|entry| {
+                                    entry.key == pending.source
+                                        && !entry.shared.state.lock().unwrap().closed
+                                });
+                            if live && now < pending.deadline {
+                                true
+                            } else {
+                                if let Some(route) = &upgraded {
+                                    route.send(Message::Navigation(
+                                        crate::render::shader::navigation::Event::Failed(
+                                            pending.key,
+                                        ),
+                                    ));
+                                }
+                                false
+                            }
+                        });
                     }
                     // Shader clocks advance on the window's native VSync, just
                     // like fill shaders. UI callbacks only update ownership and
@@ -747,6 +895,7 @@ impl Worker {
                         .upgrade()
                         .is_some_and(|r| r.active.load(Ordering::Acquire))
                         && (scene_dirty
+                            || !pending_captures.is_empty()
                             || fills.animating()
                             || entries.iter().flatten().any(|entry| {
                                 let pending_nav =
@@ -778,6 +927,13 @@ impl Worker {
                 vote.update(false);
                 drop(scene);
                 drop(captured);
+                if let Some(route) = route.upgrade() {
+                    for pending in pending_captures.drain(..) {
+                        route.send(Message::Navigation(
+                            crate::render::shader::navigation::Event::Failed(pending.key),
+                        ));
+                    }
+                }
                 while let Some(task) = receive.try_recv() {
                     match task {
                         Task::Create { shared, .. } => {
@@ -786,9 +942,20 @@ impl Worker {
                         Task::RetireWindow(_, released) => {
                             released.store(true, Ordering::Release);
                         }
+                        Task::Capture { key, .. } => {
+                            if let Some(route) = route.upgrade() {
+                                route.send(Message::Navigation(
+                                    crate::render::shader::navigation::Event::Failed(key),
+                                ));
+                            }
+                        }
                         Task::Navigation(request) => {
                             if let Some(route) = route.upgrade() {
-                                route.send(Message::Navigation(request.key));
+                                route.send(Message::Navigation(
+                                    crate::render::shader::navigation::Event::Completed(
+                                        request.key,
+                                    ),
+                                ));
                             }
                         }
                         Task::Wake(_, weak_shared) => {
@@ -838,6 +1005,9 @@ impl Worker {
     pub(crate) fn wake(&self) {
         let _ = self.send.send(Task::Resume);
     }
+    pub(crate) fn cancel_capture(&self, key: crate::render::shader::navigation::Key) {
+        let _ = self.send.send(Task::CancelCapture(key));
+    }
     pub(crate) fn collect(&self) {
         self.retired_windows
             .borrow_mut()
@@ -880,11 +1050,88 @@ fn retire_entry(mut entry: Entry, route: &Weak<Dispatcher>) {
         && !nav.complete
         && let Some(route) = route.upgrade()
     {
-        route.send(Message::Navigation(nav.key));
+        route.send(Message::Navigation(
+            crate::render::shader::navigation::Event::Completed(nav.key),
+        ));
     }
     let shared = entry.shared.clone();
     drop(entry);
     shared.released.store(true, Ordering::Release);
+}
+fn fail_captures_for_source(
+    pending_captures: &mut Vec<PendingCapture>,
+    source: Key,
+    route: Option<&Dispatcher>,
+) {
+    pending_captures.retain(|pending| {
+        if pending.source == source {
+            if let Some(route) = route {
+                route.send(Message::Navigation(
+                    crate::render::shader::navigation::Event::Failed(pending.key),
+                ));
+            }
+            false
+        } else {
+            true
+        }
+    });
+}
+fn fulfill_captures(
+    entries: &mut [Option<Entry>],
+    pending_captures: &mut Vec<PendingCapture>,
+    captured: &mut Vec<(
+        crate::render::shader::navigation::Key,
+        Snapshot,
+        std::time::Instant,
+    )>,
+    only_source: Option<Key>,
+    route: Option<&Dispatcher>,
+) {
+    if pending_captures.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    pending_captures.retain(|pending| {
+        if only_source.is_some_and(|source| pending.source != source) {
+            return true;
+        }
+        let Some(entry) = entries
+            .get_mut(pending.source.slot())
+            .and_then(Option::as_mut)
+            .filter(|entry| {
+                entry.key == pending.source && !entry.shared.state.lock().unwrap().closed
+            })
+        else {
+            if let Some(route) = route {
+                route.send(Message::Navigation(
+                    crate::render::shader::navigation::Event::Failed(pending.key),
+                ));
+            }
+            return false;
+        };
+        match entry.snapshot() {
+            Ok(Some(snapshot)) => {
+                captured.retain(|(k, _, _)| k.owner != pending.key.owner);
+                captured.push((pending.key, snapshot, now));
+                if let Some(route) = route {
+                    route.send(Message::Navigation(
+                        crate::render::shader::navigation::Event::Captured(pending.key),
+                    ));
+                }
+                false
+            }
+            Ok(None) => true,
+            Err(error) => {
+                log::warn!("shader navigation capture: {error}");
+                if let Some(route) = route {
+                    route.send(Message::Navigation(
+                        crate::render::shader::navigation::Event::Failed(pending.key),
+                    ));
+                }
+                false
+            }
+        }
+    });
 }
 fn check_pixels(
     entries: &[Option<Entry>],
@@ -1070,15 +1317,16 @@ impl Entry {
                 origin,
             }));
         }
-        if !self.settings.scene {
-            for _ in 0..4 {
-                if !self
-                    .reader
-                    .update_texture()
-                    .map_err(|error| error.to_string())?
-                {
-                    break;
-                }
+        if self.settings.scene {
+            return Ok(None);
+        }
+        for _ in 0..4 {
+            if !self
+                .reader
+                .update_texture()
+                .map_err(|error| error.to_string())?
+            {
+                break;
             }
         }
         let picture = self
@@ -1337,12 +1585,18 @@ impl Composite {
         let generation = next_composite_generation();
         let worker = Worker::for_owner(owner)?;
         let initial_settings = settings(owner, overlay)?;
+        let initial_origin = owner
+            .mounted()
+            .borrow()
+            .layout_position_in_screen()
+            .ok()
+            .map(|origin| (origin.x, origin.y));
         let shared = Arc::new(Shared {
             released: AtomicBool::new(false),
             active: AtomicBool::new(true),
             state: Mutex::new(State {
                 settings: initial_settings.clone(),
-                screen_origin: None,
+                screen_origin: initial_origin,
                 output: None,
                 surface: None,
                 closed: false,
@@ -1459,6 +1713,14 @@ impl Composite {
             )?;
         }
         let mut state = self.shared.state.lock().unwrap();
+        if state.screen_origin.is_none() {
+            state.screen_origin = owner
+                .mounted()
+                .borrow()
+                .layout_position_in_screen()
+                .ok()
+                .map(|origin| (origin.x, origin.y));
+        }
         let changed = state.settings != settings;
         if changed {
             state.settings = settings;
@@ -1480,8 +1742,16 @@ impl Composite {
             .send
             .send(Task::Transition(self.key, id, duration));
     }
-    pub(crate) fn snapshot(&self, key: crate::render::shader::navigation::Key) {
-        let _ = self.worker.send.send(Task::Capture(key, self.key));
+    pub(crate) fn capture(
+        &self,
+        key: crate::render::shader::navigation::Key,
+        deadline: std::time::Instant,
+    ) {
+        let _ = self.worker.send.send(Task::Capture {
+            key,
+            source: self.key,
+            deadline,
+        });
     }
     pub(crate) fn shader_navigation(
         &self,

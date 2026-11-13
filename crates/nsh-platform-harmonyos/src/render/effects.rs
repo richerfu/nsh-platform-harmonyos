@@ -297,6 +297,44 @@ mod tests {
     }
 
     #[test]
+    fn idle_navigation_shader_keeps_root_and_backdrop_blur_native_until_capture_demanded() {
+        let backdrop_style = ViewStyle {
+            effects: Some(Arc::new(Effects {
+                backdrop_filters: vec![Filter::Blur(Points(12.0))],
+                ..Default::default()
+            })),
+            ..ViewStyle::default()
+        };
+
+        // Idle NavShader configuration sets `navigation_capture: false`: zero
+        // persistent texture exports and single backdrop-blur stays native.
+        let idle_root = EffectsPlan::compute(&ViewStyle::default(), EffectsContext::default());
+        assert!(!idle_root.requires_texture);
+        assert!(!idle_root.requires_scene);
+
+        let idle_backdrop = EffectsPlan::compute(&backdrop_style, EffectsContext::default());
+        assert!(!idle_backdrop.requires_texture);
+        assert!(!idle_backdrop.requires_scene);
+        assert_eq!(idle_backdrop.native_backdrop_blur, 12.0);
+
+        // Active transition capture demand enables export only for the capture window.
+        let demanded = EffectsPlan::compute(
+            &backdrop_style,
+            EffectsContext {
+                navigation_capture: true,
+                ..EffectsContext::default()
+            },
+        );
+        assert!(demanded.requires_texture);
+        assert!(demanded.requires_scene);
+        assert_eq!(demanded.native_backdrop_blur, 0.0);
+
+        // Releasing the last demand restores the native path.
+        let restored = EffectsPlan::compute(&backdrop_style, EffectsContext::default());
+        assert_eq!(restored, idle_backdrop);
+    }
+
+    #[test]
     fn visual_opacity_uses_animated_value_across_native_and_scene_paths() {
         assert!((resolve_visual_opacity(0.8, None, 1.0, 1.0, 1.0) - 0.8).abs() < 1e-6);
         assert!((resolve_visual_opacity(0.8, Some(0.25), 1.0, 1.0, 1.0) - 0.25).abs() < 1e-6);

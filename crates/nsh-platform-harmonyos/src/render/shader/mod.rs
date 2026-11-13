@@ -207,11 +207,23 @@ impl Shaders {
     ) -> Result<Option<Rc<navigation::Navigation>>> {
         self.effects.begin_navigation(owner, lower, backwards)
     }
-    pub(crate) fn navigation_complete(&self, key: navigation::Key) {
-        self.effects.navigation_complete(key);
+    pub(crate) fn navigation_event(&self, event: navigation::Event) -> Result<()> {
+        self.effects.navigation_event(event)
     }
     pub(crate) fn end_navigation(&self, id: NodeId) -> Result<()> {
-        self.effects.remove(id)
+        self.effects.end_navigation(id)
+    }
+    pub(crate) fn reconcile_navigation_capture(&self, reduce_motion: bool) -> Result<()> {
+        self.effects.reconcile_navigation_capture(reduce_motion)
+    }
+    pub(crate) fn cancel_navigation(&self, reason: &str) -> Result<()> {
+        self.effects.cancel_navigation(reason)
+    }
+    pub(crate) fn expire_captures(&self) -> Result<()> {
+        self.effects.expire_captures()
+    }
+    pub(crate) fn log_idle_configured(&self) {
+        self.effects.log_idle_configured();
     }
 
     /// The native node of `id`'s surface, which its view lays out.
@@ -321,6 +333,7 @@ impl Shaders {
     }
 
     pub(crate) fn close(&self) -> Result<()> {
+        self.effects.cancel_navigation("close")?;
         let ids: Vec<_> = self.views.borrow().keys().copied().collect();
         for id in ids {
             self.remove(id);

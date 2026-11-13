@@ -155,9 +155,6 @@ impl Modal {
     pub(crate) fn schedule_present(&self) {
         self.pending_present.set(true);
     }
-    pub(crate) fn is_pending_present(&self) -> bool {
-        self.pending_present.get()
-    }
     pub(crate) fn present_if_pending(&self) -> Result<()> {
         if self.pending_present.replace(false) {
             self.present()?;
@@ -246,16 +243,27 @@ impl Modal {
         }
         Ok(())
     }
-    fn begin(&self, to: f32) -> Result<()> {
-        if let Some(owner) = self.owner.upgrade()
-            && let Some(navigation) = owner.shaders.begin_navigation(&owner, None, to == 0.0)?
-        {
-            self.transition.borrow_mut().take();
-            *self.shader.borrow_mut() = Some(navigation);
-            owner.presentation(1.0, 0.0)?;
-            owner.animator.request_frame();
-            return Ok(());
+    pub(crate) fn on_shader_captured(
+        &self,
+        navigation: &crate::render::shader::navigation::Navigation,
+    ) -> Result<()> {
+        let matches = self
+            .shader
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.key == navigation.key);
+        if matches && !navigation.backwards {
+            self.progress.set(1.0);
         }
+        Ok(())
+    }
+    pub(crate) fn refresh_presentation(&self) -> Result<()> {
+        if self.shader.borrow().is_some() {
+            self.paint()?;
+        }
+        Ok(())
+    }
+    fn start_transition(&self, to: f32) -> Result<()> {
         let reduced = self
             .owner
             .upgrade()
@@ -282,18 +290,45 @@ impl Modal {
         }
         Ok(())
     }
+    fn begin(&self, to: f32) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade()
+            && let Some(navigation) = owner.shaders.begin_navigation(&owner, None, to == 0.0)?
+        {
+            self.transition.borrow_mut().take();
+            *self.shader.borrow_mut() = Some(navigation);
+            self.paint()?;
+            owner.animator.request_frame();
+            return Ok(());
+        }
+        if self.shader.borrow_mut().take().is_some()
+            && let Some(owner) = self.owner.upgrade()
+        {
+            owner.shaders.end_navigation(owner.id)?;
+        }
+        self.start_transition(to)
+    }
     pub(crate) fn frame(&self, now: f64) -> Result<bool> {
         let shader = self
             .shader
             .borrow()
             .as_ref()
-            .map(|n| (n.running(), n.backwards));
-        if let Some((running, backwards)) = shader {
+            .map(|n| (n.running(), n.take_fallback(), n.backwards));
+        if let Some((running, fallback, backwards)) = shader {
             if running {
+                self.paint()?;
                 return Ok(true);
             }
-            self.finish(if backwards { 0.0 } else { 1.0 })?;
-            return Ok(false);
+            let to = if backwards { 0.0 } else { 1.0 };
+            if fallback {
+                self.shader.borrow_mut().take();
+                if let Some(owner) = self.owner.upgrade() {
+                    owner.shaders.end_navigation(owner.id)?;
+                }
+                self.start_transition(to)?;
+            } else {
+                self.finish(to)?;
+                return Ok(false);
+            }
         }
         let state = self.transition.borrow().as_ref().map(|transition| {
             let t = ((now - transition.start) / transition.duration).clamp(0.0, 1.0);
@@ -315,8 +350,17 @@ impl Modal {
     }
     fn paint(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
-            if self.shader.borrow().is_some() {
-                return owner.presentation(1.0, 0.0);
+            if let Some(nav) = self.shader.borrow().as_ref() {
+                let has_surface = owner.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                    wrapper
+                        .composite
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|composite| composite.surface().is_some())
+                });
+                let waiting_open =
+                    crate::render::shader::navigation::modal_open_waiting(nav, has_surface);
+                return owner.presentation(if waiting_open { 0.0 } else { 1.0 }, 0.0);
             }
             let progress = self.progress.get();
             let crossfade = nsh_core::navigation::modal_motion(

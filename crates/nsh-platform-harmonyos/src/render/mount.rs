@@ -156,8 +156,21 @@ impl Mounter {
         }
         if let Some(Some(node)) = self.slots.get(id as usize) {
             node.composite_ready(generation)?;
+            if let Some(modal) = node.modal.borrow().as_ref() {
+                modal.refresh_presentation()?;
+            }
         }
         self.flush_arkui()
+    }
+    pub(crate) fn navigation_event(
+        &self,
+        event: crate::render::shader::navigation::Event,
+    ) -> Result<()> {
+        self.shaders.navigation_event(event)?;
+        self.reconcile_navigation_capture()?;
+        self.flush_arkui()?;
+        self.animator.request_frame();
+        Ok(())
     }
     pub(crate) fn text_selection(
         &self,
@@ -205,7 +218,11 @@ impl Mounter {
                     .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
             }
         }
-        if reduce_motion_changed {
+        let background = environment.lifecycle == nsh_engine::Lifecycle::Background;
+        if background {
+            self.shaders.cancel_navigation("background")?;
+        }
+        if reduce_motion_changed || background {
             self.reconcile_navigation_capture()?;
             self.flush_arkui()?;
         }
@@ -238,6 +255,7 @@ impl Mounter {
     }
     pub(crate) fn native_context(&self, ready: bool) -> Result<()> {
         if !ready {
+            self.shaders.cancel_navigation("context-lost")?;
             let mut pending = self.arkui.borrow_mut();
             pending.editors.clear();
             pending.commands.clear();
@@ -428,60 +446,8 @@ impl Mounter {
         self.reconcile_navigation_capture()
     }
     fn reconcile_navigation_capture(&self) -> Result<()> {
-        let mut wanted = rustc_hash::FxHashSet::default();
-        if !self.platform.get().reduce_motion {
-            for node in self.slots.iter().flatten() {
-                if !node.active.get()
-                    || node.pending_delete.get()
-                    || node.navigation_shader.borrow().is_none()
-                {
-                    continue;
-                }
-                if node.kind == ViewKind::Modal {
-                    let modal_active = node.modal.borrow().as_ref().is_some_and(|modal| {
-                        !modal.closing() && (modal.is_visible() || modal.is_pending_present())
-                    });
-                    if !modal_active {
-                        continue;
-                    }
-                } else if (node.id != nsh_core::ROOT_ID && node.parent.get().is_none())
-                    || node.retained.get()
-                {
-                    continue;
-                }
-                let mut root = nsh_core::ROOT_ID;
-                let mut ancestor = node.parent_node.borrow().upgrade();
-                while let Some(current) = ancestor {
-                    if current.kind == ViewKind::Modal {
-                        root = current.id;
-                        break;
-                    }
-                    ancestor = current.parent_node.borrow().upgrade();
-                }
-                wanted.insert(root);
-            }
-        }
-        let mut candidates = vec![nsh_core::ROOT_ID];
-        for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
-            if let Some(id) = modal.node_id() {
-                candidates.push(id);
-            }
-        }
-        for id in candidates {
-            let Some(Some(root)) = self.slots.get(id as usize) else {
-                continue;
-            };
-            let capture = wanted.contains(&id);
-            if root.navigation_capture.replace(capture) != capture {
-                if let Some(scene) = root.scene.borrow().as_ref() {
-                    scene.require(root);
-                }
-                root.invalidate_composites();
-                root.ensure_wrapper()?;
-                root.restore_style()?;
-            }
-        }
-        Ok(())
+        self.shaders
+            .reconcile_navigation_capture(self.platform.get().reduce_motion)
     }
     pub(crate) fn dialog_result(&mut self, id: u32, index: i32) -> Result<()> {
         self.dialogs.finish(id, index)
@@ -862,6 +828,7 @@ impl Mounter {
         // Each frame uses the most recent marker. Batch-local state also keeps
         // an unclosed scope from leaking into a later commit or deferred replay.
         let mut layout = None;
+        let mut nav_shader_configured = false;
         self.batches += 1;
         let items = batch.items.len();
         for (at, item) in batch.items.into_iter().enumerate() {
@@ -1143,8 +1110,14 @@ impl Mounter {
                     MountItem::ShaderInput { .. } => {}
                     MountItem::NavShader { id, shader } => {
                         if !self.frozen(id) {
+                            let configured = shader.is_some();
                             let node = self.node(id)?;
                             *node.navigation_shader.borrow_mut() = shader;
+                            if !configured {
+                                self.shaders.end_navigation(id)?;
+                            } else {
+                                nav_shader_configured = true;
+                            }
                             node.ensure_wrapper()?;
                             node.restore_style()?;
                         }
@@ -1513,6 +1486,9 @@ impl Mounter {
             }
         }
         Self::attribute(self.reconcile_navigation());
+        if nav_shader_configured {
+            self.shaders.log_idle_configured();
+        }
         Self::attribute(self.animator.flush());
         Self::attribute(self.shaders.frame().map(|_| ()));
         let selected = self
@@ -1579,6 +1555,7 @@ impl Mounter {
         self.shaders.reveal()
     }
     pub(crate) fn frame(&mut self, timestamp: Option<u64>) -> Result<bool> {
+        self.shaders.expire_captures()?;
         let mut animating = self.animator.tick(timestamp)?;
         animating |= self.shaders.frame()?;
         let mut settled_leaving = false;

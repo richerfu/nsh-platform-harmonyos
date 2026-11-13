@@ -168,13 +168,30 @@ impl Screen {
         self.insets.get().is_some()
     }
     pub(crate) fn paint_visible(&self) -> bool {
-        if self.shader.borrow().as_ref().is_some_and(|n| n.backwards) {
-            return false;
+        crate::render::shader::navigation::screen_paint_visible(
+            self.shader.borrow().as_deref(),
+            self.is_top(),
+            self.revealed.get(),
+            self.motion.borrow().is_some(),
+        )
+    }
+    pub(crate) fn on_shader_captured(
+        &self,
+        navigation: &crate::render::shader::navigation::Navigation,
+    ) -> Result<()> {
+        let matches = self
+            .shader
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.key == navigation.key);
+        if !matches {
+            return Ok(());
         }
-        self.is_top()
-            || self.revealed.get()
-            || self.motion.borrow().is_some()
-            || self.shader.borrow().is_some()
+        if !navigation.backwards {
+            self.progress.set(0.0);
+        }
+        self.show()?;
+        self.paint()
     }
     pub(crate) fn large_title_offset(&self) -> f32 {
         let c = self.config.borrow();
@@ -446,6 +463,22 @@ impl Screen {
         }
         Ok(())
     }
+    fn start_motion(&self, owner: &Rc<Node>, to: f32) -> Result<()> {
+        let motion = nsh_core::navigation::screen_motion(
+            self.config.borrow().animation,
+            owner.platform.get().reduce_motion,
+        );
+        *self.motion.borrow_mut() = Some(Motion::new(
+            owner.animator.now(),
+            self.progress.get(),
+            to,
+            motion.map(|motion| motion.0),
+        ));
+        self.show()?;
+        self.paint()?;
+        owner.animator.track(owner);
+        Ok(())
+    }
     fn animate(&self, to: f32) -> Result<()> {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
@@ -465,20 +498,10 @@ impl Screen {
             owner.animator.track(&owner);
             return Ok(());
         }
-        let motion = nsh_core::navigation::screen_motion(
-            self.config.borrow().animation,
-            owner.platform.get().reduce_motion,
-        );
-        *self.motion.borrow_mut() = Some(Motion::new(
-            owner.animator.now(),
-            self.progress.get(),
-            to,
-            motion.map(|motion| motion.0),
-        ));
-        self.show()?;
-        self.paint()?;
-        owner.animator.track(&owner);
-        Ok(())
+        if self.shader.borrow_mut().take().is_some() {
+            owner.shaders.end_navigation(owner.id)?;
+        }
+        self.start_motion(&owner, to)
     }
     fn push(&self) -> Result<()> {
         let shader = self
@@ -592,13 +615,24 @@ impl Screen {
             .shader
             .borrow()
             .as_ref()
-            .map(|n| (n.running(), n.backwards));
-        if let Some((running, backwards)) = shader {
+            .map(|n| (n.running(), n.take_fallback(), n.backwards));
+        if let Some((running, fallback, backwards)) = shader {
             if running {
                 return Ok((true, false));
             }
-            self.settle()?;
-            return Ok((false, backwards));
+            if fallback {
+                self.shader.borrow_mut().take();
+                if let Some(owner) = self.owner.upgrade() {
+                    owner.shaders.end_navigation(owner.id)?;
+                    self.start_motion(&owner, if backwards { 1.0 } else { 0.0 })?;
+                } else {
+                    self.settle()?;
+                    return Ok((false, backwards));
+                }
+            } else {
+                self.settle()?;
+                return Ok((false, backwards));
+            }
         }
         let state = self.motion.borrow().as_ref().map(|motion| motion.step(now));
         let Some((progress, done, to)) = state else {
