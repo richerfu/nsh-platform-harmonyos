@@ -148,6 +148,7 @@ pub(crate) enum Message {
     Batch(MountBatch),
     Error(String),
     RequestFrame,
+    PokeVsync(u64, bool),
     Frame(Option<u64>),
     FrameSynced(u64),
     Reclaim(u64),
@@ -353,6 +354,7 @@ struct State {
     frame_rate: Arc<crate::app::frame_rate::FrameRate>,
     environment: Environment,
     errors: Errors,
+    frame_epoch: u64,
     frame_pending: bool,
     laid_out: bool,
     attached: bool,
@@ -549,12 +551,30 @@ impl State {
                 self.report(error);
             }
             Message::RequestFrame => self.request_frame()?,
+            Message::PokeVsync(epoch, fallback) => {
+                if self.frame_pending && self.frame_epoch == epoch && self.is_active() {
+                    if fallback {
+                        self.step_frame(true, false, None)?;
+                    } else if let Some(parent) = self.parent.upgrade()
+                        && let Ok(node) = parent.try_borrow()
+                        && node.is_owned()
+                    {
+                        let _ = node.mark_dirty(
+                            ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender,
+                        );
+                        let _ = self.schedule(Message::PokeVsync(epoch, true));
+                    } else {
+                        self.step_frame(true, false, None)?;
+                    }
+                }
+                return Ok(());
+            }
             Message::Frame(timestamp) => {
-                self.step_frame(true, timestamp)?;
+                self.step_frame(true, false, timestamp)?;
                 return Ok(());
             }
             Message::FrameSynced(timestamp) => {
-                self.step_frame(false, Some(timestamp))?;
+                self.step_frame(false, false, Some(timestamp))?;
                 return Ok(());
             }
             Message::Reclaim(_)
@@ -627,7 +647,13 @@ impl State {
     fn report(&self, error: String) {
         self.errors.report(error);
     }
-    fn step_frame(&mut self, wake_engine: bool, timestamp: Option<u64>) -> Result<()> {
+    fn step_frame(
+        &mut self,
+        wake_engine: bool,
+        from_arkui_callback: bool,
+        timestamp: Option<u64>,
+    ) -> Result<()> {
+        self.frame_epoch = self.frame_epoch.wrapping_add(1);
         self.frame_pending = false;
         if !self.is_active() {
             self.frame_wanted = true;
@@ -654,6 +680,13 @@ impl State {
             };
             self.frame_rate.set_ui_demand(demand);
             self.request_frame()?;
+            if from_arkui_callback && self.frame_pending {
+                // `request_frame()` inside `UIVsyncTask` sets `NeedRender` on `viewport`
+                // before `FlushRenderTask` clears it in the *same* VSync; if this frame
+                // mutated only `ExportRoot` or `pending_delete` state (zero main-tree RS
+                // commands), `PokeVsync` wakes `PipelineContext` outside `OnVsync`.
+                let _ = self.schedule(Message::PokeVsync(self.frame_epoch, false));
+            }
         } else {
             self.frame_rate
                 .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
@@ -682,7 +715,7 @@ impl State {
                                 return;
                             };
                             if let Ok(mut state) = state.try_borrow_mut() {
-                                if let Err(error) = state.step_frame(true, Some(timestamp)) {
+                                if let Err(error) = state.step_frame(true, true, Some(timestamp)) {
                                     state.report(error.to_string());
                                     log::error!("OHOS surface frame: {error}");
                                 }
@@ -893,6 +926,7 @@ impl Runtime {
                 vsync,
                 frame_rate,
                 errors,
+                frame_epoch: 0,
                 frame_pending: false,
                 laid_out: false,
                 attached: true,

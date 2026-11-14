@@ -141,6 +141,9 @@ impl Wrapper {
     pub(crate) fn retiring_export(&self) -> bool {
         self.retiring.get().is_some()
     }
+    pub(crate) fn is_export_transitioning(&self) -> bool {
+        self.retiring_export() || self.is_export_repairing()
+    }
     fn is_export_repairing(&self) -> bool {
         self.route
             .try_borrow()
@@ -165,11 +168,25 @@ impl Wrapper {
             .iter()
             .filter_map(std::rc::Weak::upgrade)
         {
-            if !child.active.get() || child.retained.get() || child.modal.borrow().is_some() {
+            if !child.active.get()
+                || child.retained.get()
+                || child.pending_delete.get()
+                || child.is_leaving()
+                || child.modal.borrow().is_some()
+            {
                 continue;
             }
             if child.kind == nsh_core::ViewKind::Screen {
-                out.push(child);
+                let visible_screen = child.desired_visibility() == 0
+                    && !child.export_hidden()
+                    && child
+                        .screen
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|screen| !screen.popped.get());
+                if visible_screen {
+                    out.push(child);
+                }
             } else {
                 Self::collect_clearing_screens(&child, out);
             }

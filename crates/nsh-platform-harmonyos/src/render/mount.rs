@@ -662,11 +662,42 @@ impl Mounter {
             id = parent;
         }
     }
+    /// Whether an ancestor wrapper is retiring an export surface back to
+    /// `DirectRoot` or running its post-attach RenderService export repair.
+    /// Detaching/disposing a `FrameNode` while its parent is still on
+    /// `ExportRoot` routes `RemoveChild` / `RSNodeDestroy` only to the
+    /// RenderThread side, stranding pre-export RenderService `RSNode` children.
+    fn export_transitioning(&self, mut id: NodeId) -> bool {
+        for _ in 0..=self.slots.len() {
+            let Ok(node) = self.node(id) else {
+                return false;
+            };
+            if node
+                .wrapper
+                .borrow()
+                .as_ref()
+                .is_some_and(crate::interop::view::Wrapper::is_export_transitioning)
+            {
+                return true;
+            }
+            let next = node.parent.get().or_else(|| {
+                node.retained_owner
+                    .borrow()
+                    .upgrade()
+                    .map(|parent| parent.id)
+            });
+            let Some(parent) = next else {
+                return false;
+            };
+            id = parent;
+        }
+        false
+    }
     fn delete(&mut self, id: NodeId) -> Result<()> {
         if let Some(modal) = self.node(id)?.modal.borrow().as_ref() {
             Self::attribute(modal.close(true));
         }
-        if self.frozen(id) {
+        if self.frozen(id) || self.export_transitioning(id) {
             if !self.node(id)?.pending_delete.replace(true) {
                 // Both exits still render their retained subtree. Deactivation
                 // closes texture wrappers, so it belongs to delete_now after
@@ -1618,6 +1649,9 @@ impl Mounter {
             for id in pending {
                 if self.frozen(id) {
                     self.pending_delete.push(id);
+                } else if self.export_transitioning(id) {
+                    self.pending_delete.push(id);
+                    animating = true;
                 } else {
                     self.delete_now(id)?;
                     deleted_any = true;

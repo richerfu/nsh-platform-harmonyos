@@ -396,7 +396,14 @@ impl Effects {
                 } else {
                     active_map.remove(&id);
                 }
-                if prev != *keep || retainable_changed || surface_changed {
+                let missing_composite = *keep
+                    && !node.scene_active()
+                    && node
+                        .wrapper
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|wrapper| wrapper.composite.borrow().is_none());
+                if prev != *keep || missing_composite || retainable_changed || surface_changed {
                     to_refresh.push(node.clone());
                 }
             }
@@ -679,16 +686,17 @@ impl Effects {
         if already_warm {
             return Ok(());
         }
+        // Inside `Mounter::apply`, `reconcile_navigation()` -> `reconcile_hosts_now()`
+        // reconciles `keep_alive_active`, `Composite`, and `RootBridge` atomically at
+        // the end of the batch; returning before mutating `keep_alive_active` ensures
+        // `reconcile_hosts_now()` sees `prev == false != true` and creates `Composite`.
+        if root.flushing_batch.get() {
+            return Ok(());
+        }
         self.keep_alive_active.borrow_mut().insert(root.id, true);
         root.invalidate_composites();
         if let Some(scene) = root.scene.borrow().as_ref() {
             scene.require(&root);
-        }
-        // Inside `Mounter::apply`, `reconcile_navigation()` reconciles hosts and
-        // `RootBridge` atomically at the end of the batch; deferring `ensure_wrapper`
-        // until then avoids arming and cancelling a placeholder gate mid-batch.
-        if root.flushing_batch.get() {
-            return Ok(());
         }
         root.ensure_wrapper()?;
         root.restore_style()?;
