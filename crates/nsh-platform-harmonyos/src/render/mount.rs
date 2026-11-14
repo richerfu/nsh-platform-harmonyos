@@ -764,28 +764,13 @@ impl Mounter {
         if let Some(scene) = self.scene.borrow().as_ref() {
             scene.invalidate();
         }
-        let mut layout = None;
-        let mut deletions = Vec::new();
-        let mut deleted = rustc_hash::FxHashSet::default();
-        let mut removals = Vec::new();
-        let mut removed = rustc_hash::FxHashSet::default();
-        for item in &batch.items {
-            match item {
-                MountItem::LayoutAnimation(animation) => layout = Some(*animation),
-                MountItem::Delete { id } => {
-                    if deleted.insert(*id) {
-                        deletions.push(*id);
-                    }
-                    if removed.insert(*id) {
-                        removals.push((*id, layout));
-                    }
-                }
-                MountItem::Remove { id } if removed.insert(*id) => {
-                    removals.push((*id, layout));
-                }
-                _ => {}
-            }
-        }
+        let crate::render::transition::BatchPrepass {
+            deletions,
+            deleted,
+            removals,
+            removed,
+            mut motion,
+        } = crate::render::transition::BatchMotion::scan(&batch.items);
         // Start a screen's exit before its descendants' delete operations. An
         // enclosing tree deletion retires immediately instead of animating orphans.
         for id in &deletions {
@@ -840,12 +825,13 @@ impl Mounter {
         }
         // Each frame uses the most recent marker. Batch-local state also keeps
         // an unclosed scope from leaking into a later commit or deferred replay.
-        let mut layout = None;
         let mut nav_shader_configured = false;
         self.batches += 1;
         let items = batch.items.len();
         for (at, item) in batch.items.into_iter().enumerate() {
-            if Self::deferred_node(&item).is_some_and(|id| self.frozen(id)) {
+            if Self::deferred_node(&item)
+                .is_some_and(|id| motion.allows_defer(id) && self.frozen(id))
+            {
                 self.deferred.push(item);
                 continue;
             }
@@ -918,6 +904,7 @@ impl Mounter {
                             Node::new(id, kind, self.context.clone())
                                 .map_err(|error| Error::Tree(Box::new(error)))?,
                         );
+                        motion.note_created(id);
                         if kind == ViewKind::Stack {
                             let index = self.stacks.partition_point(|stack| *stack < id);
                             self.stacks.insert(index, id);
@@ -990,7 +977,7 @@ impl Mounter {
                         {
                             Self::attribute(screen.update(screen.has_back()));
                         }
-                        Self::attribute(node.inserted(layout.as_ref()));
+                        Self::attribute(node.inserted(motion.insert_animation()));
                         // This Insert supersedes a removal deferred while the node
                         // was leaving. Replay its other updates before newer ones.
                         self.deferred.retain(
@@ -999,10 +986,17 @@ impl Mounter {
                         self.finish_deferred()?;
                     }
                     MountItem::Remove { id } => {
-                        if !self.frozen(id)
+                        if motion.is_created_in_batch(id) {
+                            let node = self.node(id)?;
+                            if node.live.borrow_mut().take().is_some() {
+                                self.animator.remove(id);
+                                Self::attribute(node.finish_removal());
+                            }
+                            self.unlink(id, true)?;
+                        } else if !self.frozen(id)
                             && !self
                                 .node(id)?
-                                .removing(layout.as_ref())
+                                .removing(motion.remove_animation(id))
                                 .unwrap_or_else(|error| {
                                     Self::attribute(Err(error));
                                     false
@@ -1012,20 +1006,31 @@ impl Mounter {
                         }
                     }
                     MountItem::Delete { id } => {
-                        if !self.frozen(id) {
-                            Self::attribute(self.node(id)?.removing(layout.as_ref()).map(|_| ()));
+                        if motion.note_deleted(id) {
+                            if let Some(modal) = self.node(id)?.modal.borrow().as_ref() {
+                                Self::attribute(modal.close(true));
+                            }
+                            self.delete_now(id)?;
+                        } else {
+                            if !self.frozen(id) {
+                                Self::attribute(
+                                    self.node(id)?
+                                        .removing(motion.remove_animation(id))
+                                        .map(|_| ()),
+                                );
+                            }
+                            self.delete(id)?;
                         }
-                        self.delete(id)?;
                     }
                     MountItem::Frame { id, frame } => {
-                        if !self.frozen(id) {
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
                             self.node(id)?
-                                .animated_frame(frame.into(), layout.as_ref())?;
+                                .animated_frame(frame.into(), motion.frame_animation(id))?;
                         }
                     }
-                    MountItem::LayoutAnimation(animation) => layout = Some(animation),
+                    MountItem::LayoutAnimation(animation) => motion.set_layout(animation),
                     MountItem::ViewStyle { id, style } => {
-                        if !self.frozen(id) {
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
                             self.node(id)?.style(&style)?;
                         }
                     }
@@ -1035,7 +1040,7 @@ impl Mounter {
                         content,
                         ..
                     } => {
-                        if !self.frozen(id) {
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
                             let node = self.node(id)?;
                             let raster = layout
                                 .0
