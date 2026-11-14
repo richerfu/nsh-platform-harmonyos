@@ -19,7 +19,7 @@ use crate::{
     render::{
         geometry::Size,
         mount::Mounter,
-        node::{Error, NativeNode, Result},
+        node::{Error, FrameCallbackExt as _, NativeNode, Result},
     },
     text::typography::OhosTextEngine,
 };
@@ -670,7 +670,7 @@ impl State {
             if self.parent.upgrade().is_none_or(|parent| {
                 parent
                     .borrow()
-                    .post_frame_callback(move |timestamp, _| {
+                    .post_frame_callback_dirty(move |timestamp, _| {
                         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let Some(state) = state.upgrade() else {
                                 return;
@@ -1029,6 +1029,7 @@ impl Runtime {
             testing.model.engine_started(control.clone());
         }
         let context = Rc::new(crate::render::mount::UiContext {
+            viewport: Rc::downgrade(&parent),
             theme: RefCell::default(),
             cursor: Default::default(),
             shaders: crate::render::shader::Shaders::new(shader_rate),

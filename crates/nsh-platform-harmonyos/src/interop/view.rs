@@ -661,6 +661,21 @@ impl Wrapper {
         }
         Ok(())
     }
+    fn post_outer_frame_callback(
+        outer: &NativeNode,
+        owner: Option<&Node>,
+        callback: impl FnOnce(u64, u32) + 'static,
+    ) -> bool {
+        use crate::render::node::FrameCallbackExt as _;
+        if outer.borrow().post_frame_callback_dirty(callback).is_ok() {
+            if let Some(owner) = owner {
+                owner.pulse_frame_wake();
+            }
+            true
+        } else {
+            false
+        }
+    }
     fn advance_pending_reattach(owner: std::rc::Weak<Node>, id: u64) {
         let Some(node) = owner.upgrade() else {
             return;
@@ -685,13 +700,9 @@ impl Wrapper {
                         node.flush_arkui()?;
                     }
                     let next = owner.clone();
-                    if outer
-                        .borrow()
-                        .post_frame_callback(move |_, _| {
-                            Self::advance_pending_reattach(next, id);
-                        })
-                        .is_err()
-                    {
+                    if !Self::post_outer_frame_callback(&outer, Some(&node), move |_, _| {
+                        Self::advance_pending_reattach(next, id);
+                    }) {
                         let fallback = node
                             .wrapper
                             .borrow()
@@ -705,13 +716,9 @@ impl Wrapper {
                 }
                 crate::interop::handoff::ReattachTick::WaitMore => {
                     let next = owner.clone();
-                    if outer
-                        .borrow()
-                        .post_frame_callback(move |_, _| {
-                            Self::advance_pending_reattach(next, id);
-                        })
-                        .is_err()
-                    {
+                    if !Self::post_outer_frame_callback(&outer, Some(&node), move |_, _| {
+                        Self::advance_pending_reattach(next, id);
+                    }) {
                         let fallback = node
                             .wrapper
                             .borrow()
@@ -809,18 +816,17 @@ impl Wrapper {
                             Self::release_entry_export_repair(&mut old);
                         }
                         let next = self.owner.clone();
-                        if self
-                            .outer
-                            .borrow()
-                            .post_frame_callback(move |_, _| {
+                        let root_owner = self.owner.upgrade();
+                        if !Self::post_outer_frame_callback(
+                            &self.outer,
+                            root_owner.as_deref(),
+                            move |_, _| {
                                 Self::advance_pending_reattach(next, id);
-                            })
-                            .is_err()
-                        {
+                            },
+                        ) {
                             let fallback = self.pending_reattach.borrow_mut().take_by_id(id);
                             if let Some(entry) = fallback {
-                                let root = self.owner.upgrade();
-                                Self::finish_bridge_reattach(root.as_deref(), entry)?;
+                                Self::finish_bridge_reattach(root_owner.as_deref(), entry)?;
                             }
                         }
                     }
@@ -955,13 +961,9 @@ impl Wrapper {
         }
         if remaining > 0 {
             let next = owner.clone();
-            if outer
-                .borrow()
-                .post_frame_callback(move |_, _| {
-                    Self::retire_composite(next, generation, remaining - 1);
-                })
-                .is_ok()
-            {
+            if Self::post_outer_frame_callback(&outer, Some(&node), move |_, _| {
+                Self::retire_composite(next, generation, remaining - 1);
+            }) {
                 return;
             }
         }
@@ -1037,13 +1039,9 @@ impl Wrapper {
                 crate::interop::handoff::FrameCallbackStep::Stale => {}
                 crate::interop::handoff::FrameCallbackStep::ReArm => {
                     let next = owner.clone();
-                    if outer
-                        .borrow()
-                        .post_frame_callback(move |_, _| {
-                            Self::advance_handoff_gate(next, generation);
-                        })
-                        .is_err()
-                    {
+                    if !Self::post_outer_frame_callback(&outer, Some(&node), move |_, _| {
+                        Self::advance_handoff_gate(next, generation);
+                    }) {
                         let forced = node
                             .wrapper
                             .borrow()
@@ -1100,13 +1098,9 @@ impl Wrapper {
         }
         if remaining > 0 {
             let next = owner.clone();
-            if outer
-                .borrow()
-                .post_frame_callback(move |_, _| {
-                    Self::retire_lingering(next, generation, remaining - 1);
-                })
-                .is_ok()
-            {
+            if Self::post_outer_frame_callback(&outer, Some(&node), move |_, _| {
+                Self::retire_lingering(next, generation, remaining - 1);
+            }) {
                 return;
             }
         }
@@ -1297,13 +1291,13 @@ impl Wrapper {
                         });
                         if let Some((outer, generation)) = arm {
                             let next = Rc::downgrade(&owner);
-                            if outer
-                                .borrow()
-                                .post_frame_callback(move |_, _| {
+                            if !Wrapper::post_outer_frame_callback(
+                                &outer,
+                                Some(&owner),
+                                move |_, _| {
                                     Wrapper::advance_handoff_gate(next, generation);
-                                })
-                                .is_err()
-                                && let Ok(borrow) = owner.wrapper.try_borrow()
+                                },
+                            ) && let Ok(borrow) = owner.wrapper.try_borrow()
                                 && let Some(wrapper) = borrow.as_ref()
                                 && let Ok(mut handoff) = wrapper.handoff.try_borrow_mut()
                             {
@@ -1485,14 +1479,9 @@ impl Wrapper {
         }
         if let Some(generation) = outcome.arm_frame_callback {
             let weak = self.owner.clone();
-            if self
-                .outer
-                .borrow()
-                .post_frame_callback(move |_, _| {
-                    Self::advance_handoff_gate(weak, generation);
-                })
-                .is_err()
-            {
+            if !Self::post_outer_frame_callback(&self.outer, Some(owner), move |_, _| {
+                Self::advance_handoff_gate(weak, generation);
+            }) {
                 self.handoff.borrow_mut().force_commit(generation);
                 outcome.hold_direct_target = false;
             }

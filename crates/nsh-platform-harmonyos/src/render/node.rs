@@ -26,6 +26,30 @@ use crate::{
 
 pub(crate) type NativeNode = Rc<RefCell<ArkUINode>>;
 
+pub(crate) trait FrameCallbackExt {
+    /// Registers a next-VSync `OH_ArkUI_PostFrameCallback` on this node's
+    /// `UIContext` and pulses `NodeDirtyFlag::NeedRender` so OpenHarmony's
+    /// `PipelineContext::RequestFrame()` schedules the `UIVsyncTask` even
+    /// when no other node in the context was mutated on this turn.
+    fn post_frame_callback_dirty(
+        &self,
+        callback: impl FnOnce(u64, u32) + 'static,
+    ) -> std::result::Result<(), ohos_arkui_binding::common::error::ArkUIError>;
+}
+
+impl FrameCallbackExt for ArkUINode {
+    fn post_frame_callback_dirty(
+        &self,
+        callback: impl FnOnce(u64, u32) + 'static,
+    ) -> std::result::Result<(), ohos_arkui_binding::common::error::ArkUIError> {
+        self.post_frame_callback(callback)?;
+        if self.is_owned() {
+            let _ = self.mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error("OHOS mount tree: {0}")]

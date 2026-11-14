@@ -77,6 +77,8 @@ impl Theme {
 }
 
 pub(crate) struct UiContext {
+    pub(crate) viewport:
+        std::rc::Weak<std::cell::RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
     pub(crate) theme: std::cell::RefCell<Theme>,
     pub(crate) cursor: crate::input::cursor::State,
     pub(crate) shaders: super::shader::Shaders,

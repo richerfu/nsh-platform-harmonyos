@@ -335,14 +335,23 @@ impl Node {
                     .flatten()
             });
         }
+        if let Some(viewport) = owner.viewport.upgrade()
+            && !candidates
+                .iter()
+                .any(|existing| Rc::ptr_eq(existing, &viewport))
+        {
+            candidates.push(viewport);
+        }
         let callback_fn = Rc::new(callback_fn);
         for candidate in candidates {
             let cb = callback_fn.clone();
-            if candidate
-                .borrow()
-                .post_frame_callback(move |timestamp, frame_count| cb(timestamp, frame_count))
-                .is_ok()
+            if super::FrameCallbackExt::post_frame_callback_dirty(
+                &*candidate.borrow(),
+                move |timestamp, frame_count| cb(timestamp, frame_count),
+            )
+            .is_ok()
             {
+                owner.pulse_frame_wake();
                 return true;
             }
         }

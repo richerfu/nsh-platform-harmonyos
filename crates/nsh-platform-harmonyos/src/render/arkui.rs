@@ -6,6 +6,18 @@ use crate::interop::{
 };
 
 impl crate::render::mount::UiContext {
+    /// Pulses `NeedRender` on the root surface viewport `Custom` node so
+    /// `PipelineContext::RequestFrame()` wakes `OH_ArkUI_PostFrameCallback`
+    /// even when the node that armed the callback is inside a `Visibility::None`
+    /// (retained) subtree or a non-custom container (`Scroll` / `Stack`).
+    pub(crate) fn pulse_frame_wake(&self) {
+        if let Some(viewport) = self.viewport.upgrade()
+            && let Ok(node) = viewport.try_borrow()
+            && node.is_owned()
+        {
+            let _ = node.mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
+        }
+    }
     pub(crate) fn editor_update(&self, settings: EditorSettings) {
         let mut pending = self.arkui.borrow_mut();
         let wake = pending.is_empty();

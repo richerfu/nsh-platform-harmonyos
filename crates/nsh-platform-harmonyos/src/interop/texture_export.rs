@@ -25,12 +25,13 @@ use ohos_arkui_binding::{
 };
 use rustc_hash::FxHashMap;
 
-use crate::render::node::{NativeNode, Node, Result, callback};
+use crate::render::node::{FrameCallbackExt as _, NativeNode, Node, Result, callback};
 
 #[derive(Default)]
 pub(crate) struct Export {
     pub(crate) enabled: Cell<bool>,
     epoch: Cell<u64>,
+    viewport: RefCell<Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>>,
     hidden: RefCell<Vec<Hidden>>,
 }
 
@@ -51,6 +52,7 @@ impl Export {
             return Ok(());
         }
         self.restore();
+        *self.viewport.borrow_mut() = owner.viewport.clone();
         self.epoch.set(self.epoch.get().wrapping_add(1));
         let mut owners = FxHashMap::default();
         Self::owners(owner, &mut owners);
@@ -167,68 +169,75 @@ impl Export {
             }
             return Ok(());
         };
-        node.borrow()
-            .post_frame_callback(move |_, _| {
-                let Some(current) = repair.upgrade() else {
-                    return;
-                };
-                if current.epoch.get() != epoch {
-                    return;
+        let repair_for_wake = repair.clone();
+        node.borrow().post_frame_callback_dirty(move |_, _| {
+            let Some(current) = repair.upgrade() else {
+                return;
+            };
+            if current.epoch.get() != epoch {
+                return;
+            }
+            if remaining == 0 {
+                current.restore();
+                return;
+            }
+            // Property updates or nested textureController attachment before
+            // RSRootNode::AttachRSSurfaceNode must not shorten the rebuild
+            // in which these nodes join the exported tree.
+            let mut released = Vec::new();
+            current.hidden.borrow_mut().retain(|hidden| {
+                let keep = hidden
+                    .owner
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_none_or(|owner| owner.desired_visibility() != 0);
+                if !keep {
+                    released.push(Hidden {
+                        native: hidden.native.clone(),
+                        owner: hidden.owner.clone(),
+                        controls: hidden.controls.clone(),
+                        visibility: hidden.visibility,
+                        opacity: hidden.opacity,
+                        hit_test: hidden.hit_test,
+                        accessibility: hidden.accessibility,
+                        focusable: hidden.focusable,
+                    });
                 }
-                if remaining == 0 {
-                    current.restore();
-                    return;
+                keep
+            });
+            for hidden in released {
+                Self::restore_one(hidden);
+            }
+            for hidden in current.hidden.borrow().iter() {
+                if let Some(native) = hidden.native.upgrade()
+                    && native.borrow().is_owned()
+                {
+                    callback(|| {
+                        let node = native.borrow();
+                        node.opacity(0.0)?;
+                        node.set_i32_attribute(A::Visibility, 0)?;
+                        node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
+                        node.set_i32_attribute(
+                            A::AccessibilityMode,
+                            AccessibilityMode::DisabledForDescendants.into(),
+                        )?;
+                        node.set_i32_attribute(A::Focusable, 0)?;
+                        Ok(())
+                    });
                 }
-                // Property updates or nested textureController attachment before
-                // RSRootNode::AttachRSSurfaceNode must not shorten the rebuild
-                // in which these nodes join the exported tree.
-                let mut released = Vec::new();
-                current.hidden.borrow_mut().retain(|hidden| {
-                    let keep = hidden
-                        .owner
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                        .is_none_or(|owner| owner.desired_visibility() != 0);
-                    if !keep {
-                        released.push(Hidden {
-                            native: hidden.native.clone(),
-                            owner: hidden.owner.clone(),
-                            controls: hidden.controls.clone(),
-                            visibility: hidden.visibility,
-                            opacity: hidden.opacity,
-                            hit_test: hidden.hit_test,
-                            accessibility: hidden.accessibility,
-                            focusable: hidden.focusable,
-                        });
-                    }
-                    keep
-                });
-                for hidden in released {
-                    Self::restore_one(hidden);
-                }
-                for hidden in current.hidden.borrow().iter() {
-                    if let Some(native) = hidden.native.upgrade()
-                        && native.borrow().is_owned()
-                    {
-                        callback(|| {
-                            let node = native.borrow();
-                            node.opacity(0.0)?;
-                            node.set_i32_attribute(A::Visibility, 0)?;
-                            node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
-                            node.set_i32_attribute(
-                                A::AccessibilityMode,
-                                AccessibilityMode::DisabledForDescendants.into(),
-                            )?;
-                            node.set_i32_attribute(A::Focusable, 0)?;
-                            Ok(())
-                        });
-                    }
-                }
-                if Self::defer_restore(repair, native, epoch, remaining - 1).is_err() {
-                    current.restore();
-                }
-            })
-            .map_err(Into::into)
+            }
+            if Self::defer_restore(repair, native, epoch, remaining - 1).is_err() {
+                current.restore();
+            }
+        })?;
+        if let Some(current) = repair_for_wake.upgrade()
+            && let Some(viewport) = current.viewport.borrow().upgrade()
+            && let Ok(vp) = viewport.try_borrow()
+            && vp.is_owned()
+        {
+            let _ = vp.mark_dirty(NodeDirtyFlag::NeedRender);
+        }
+        Ok(())
     }
 
     pub(crate) fn restore(&self) {

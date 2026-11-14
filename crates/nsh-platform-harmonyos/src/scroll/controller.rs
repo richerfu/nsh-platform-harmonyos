@@ -24,7 +24,7 @@ use ohos_arkui_binding::{
 use crate::{
     render::{
         geometry::Size,
-        node::{NativeNode, Node, Result, callback},
+        node::{FrameCallbackExt as _, NativeNode, Node, Result, callback},
     },
     scroll::motion::{ZoomFrame, ZoomMotion, focal_offset, resisted_scale},
 };
@@ -1597,11 +1597,14 @@ impl Scroller {
                 if scroll
                     .native
                     .borrow()
-                    .post_frame_callback(move |_, _| {
+                    .post_frame_callback_dirty(move |_, _| {
                         Self::advance_reparent_restore(next, remaining - 1);
                     })
                     .is_ok()
                 {
+                    if let Some(owner) = scroll.owner.upgrade() {
+                        owner.pulse_frame_wake();
+                    }
                     return Ok(());
                 }
             }
@@ -1622,11 +1625,15 @@ impl Scroller {
                 if self
                     .native
                     .borrow()
-                    .post_frame_callback(move |_, _| {
+                    .post_frame_callback_dirty(move |_, _| {
                         Self::advance_reparent_restore(weak, 3);
                     })
-                    .is_err()
+                    .is_ok()
                 {
+                    if let Some(owner) = self.owner.upgrade() {
+                        owner.pulse_frame_wake();
+                    }
+                } else {
                     self.reparent_offset.set(None);
                 }
             } else {
