@@ -11,7 +11,14 @@ use super::{Node, Result};
 
 impl Node {
     pub(crate) fn desired_visibility(&self) -> i32 {
-        if self.retained.get() || !self.header_item_visible() {
+        if self.retained.get()
+            || !self.header_item_visible()
+            || self
+                .screen
+                .borrow()
+                .as_ref()
+                .is_some_and(|screen| screen.popped.get() && screen.is_unanimated())
+        {
             2
         } else if self.clearing_export.get()
             || self

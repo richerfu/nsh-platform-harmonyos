@@ -1,8 +1,10 @@
 //! Shader frames presented by an XComponent Surface, outside the exported subtree.
 
 use ohos_arkui_binding::{
-    api::node_custom_event::NodeCustomEvent, component::attribute::ArkUICommonAttribute,
-    types::advanced::NodeDirtyFlag,
+    api::node_custom_event::NodeCustomEvent,
+    common::attribute::ArkUINodeAttributeNumber as Number,
+    component::attribute::ArkUICommonAttribute,
+    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
 };
 
 use crate::render::node::{NativeNode, Node, Result, callback};
@@ -14,6 +16,8 @@ pub(super) struct Presentation {
     origin: (i32, i32),
     size: (u32, u32),
     revealed: bool,
+    bridge: Option<(f32, f32)>,
+    applied_dx_px: f32,
 }
 
 impl Presentation {
@@ -39,6 +43,8 @@ impl Presentation {
             origin: (0, 0),
             size: (0, 0),
             revealed: false,
+            bridge: None,
+            applied_dx_px: 0.0,
         };
         let frame = owner.frame.get();
         let scale = owner.scale.get();
@@ -56,10 +62,77 @@ impl Presentation {
         self.revealed
     }
 
+    fn apply_bridge_transform(
+        node: &ohos_arkui_binding::common::node::ArkUINode,
+        bridge: Option<(f32, f32)>,
+        scale: f32,
+        applied_dx_px: &mut f32,
+    ) -> Result<bool> {
+        let dx_px = bridge.map_or(0.0, |(_, dx_vp)| dx_vp * scale.max(0.01));
+        if (*applied_dx_px - dx_px).abs() <= 0.01 {
+            return Ok(false);
+        }
+        if dx_px.abs() <= 0.01 {
+            node.reset_attribute(Attribute::Transform)?;
+            *applied_dx_px = 0.0;
+        } else {
+            let raw_values = [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, dx_px, 0.0, 0.0, 1.0,
+            ];
+            node.set_number_attribute(
+                Attribute::Transform,
+                raw_values.into_iter().map(Number::Float).collect(),
+            )?;
+            *applied_dx_px = dx_px;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn set_bridge(&mut self, alpha: f32, dx_vp: f32) -> Result<()> {
+        let clamped = alpha.clamp(0.0, 1.0);
+        let prev_alpha = self.bridge.map(|(a, _)| a);
+        self.bridge = Some((clamped, dx_vp));
+        let node = self.surface.native.borrow();
+        let moved =
+            Self::apply_bridge_transform(&node, self.bridge, self.scale, &mut self.applied_dx_px)?;
+        let alpha_changed = self.revealed && prev_alpha != Some(clamped);
+        if alpha_changed {
+            node.opacity(clamped)?;
+        }
+        if moved || alpha_changed {
+            node.mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn clear_bridge(&mut self) -> Result<()> {
+        let had_bridge = self.bridge.take();
+        if had_bridge.is_none() && self.applied_dx_px == 0.0 {
+            return Ok(());
+        }
+        let node = self.surface.native.borrow();
+        let moved =
+            Self::apply_bridge_transform(&node, self.bridge, self.scale, &mut self.applied_dx_px)?;
+        if self.revealed {
+            node.opacity(1.0)?;
+        }
+        if moved || self.revealed {
+            node.mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn reveal(&mut self) -> Result<bool> {
         if !self.revealed {
             let node = self.surface.native.borrow();
-            node.opacity(1.0)?;
+            let _ = Self::apply_bridge_transform(
+                &node,
+                self.bridge,
+                self.scale,
+                &mut self.applied_dx_px,
+            )?;
+            let alpha = self.bridge.map_or(1.0, |(a, _)| a);
+            node.opacity(alpha)?;
             node.mark_dirty(NodeDirtyFlag::NeedRender)?;
             self.revealed = true;
             return Ok(true);
@@ -69,6 +142,7 @@ impl Presentation {
 
     pub(super) fn hide(&mut self) {
         let node = self.surface.native.borrow();
+        let _ = node.opacity(f32::MIN_POSITIVE);
         let _ = node.opacity(0.0);
         let _ = node.mark_dirty(NodeDirtyFlag::NeedRender);
         self.revealed = false;
@@ -88,6 +162,14 @@ impl Presentation {
             self.scale = scale;
         }
         let node = self.surface.native.borrow();
+        if scale_changed && self.bridge.is_some() {
+            let _ = Self::apply_bridge_transform(
+                &node,
+                self.bridge,
+                self.scale,
+                &mut self.applied_dx_px,
+            )?;
+        }
         let origin = (x.round() as i32, y.round() as i32);
         let origin_changed = self.origin != origin;
         if origin_changed || scale_changed {

@@ -132,6 +132,10 @@ impl Export {
             owner.export_repair.set(owner.export_repair.get() + 1);
         }
         self.hidden.borrow_mut().push(hidden);
+        // Pulse through MIN_POSITIVE first so ArkUI dirties RSNode::SetAlpha(0.0)
+        // even when FrameNode's Opacity attribute was already 0.0 before Visibility
+        // switches to Visible across SetTextureExport tree rebuilds.
+        node.opacity(f32::MIN_POSITIVE)?;
         node.opacity(0.0)?;
         node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
         node.set_i32_attribute(
@@ -214,6 +218,7 @@ impl Export {
                 {
                     callback(|| {
                         let node = native.borrow();
+                        node.opacity(f32::MIN_POSITIVE)?;
                         node.opacity(0.0)?;
                         node.set_i32_attribute(A::Visibility, 0)?;
                         node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;

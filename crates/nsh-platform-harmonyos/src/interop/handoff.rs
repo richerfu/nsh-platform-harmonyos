@@ -204,6 +204,18 @@ impl HandoffState {
         if inputs.covered_by_live_bridge {
             self.gap_kind = GapKind::Mount;
             self.gap_started_at.get_or_insert(now);
+            self.gate = CommitGate::Committed;
+            self.callback_in_flight = None;
+            let repaint_outer = std::mem::replace(&mut self.placeholder_active, false);
+            self.last_fill = None;
+            return (
+                PrepareOutcome {
+                    hold_direct_target: false,
+                    repaint_outer,
+                    arm_frame_callback: None,
+                },
+                None,
+            );
         }
 
         if self.mount_hidden {
@@ -429,6 +441,7 @@ pub(crate) fn plan_bridge_reattach(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReattachPhase {
+    HoldOnOuterUntilDirect { remaining_frames: u8 },
     FlushAlphaOnOuter { settle_frames: u8 },
     SettleDetached { remaining_frames: u8 },
 }
@@ -496,6 +509,44 @@ impl<T> PendingReattachQueue<T> {
         (id, displaced)
     }
 
+    pub(crate) fn enqueue_hold_until_direct(
+        &mut self,
+        stack_id: u32,
+        peer_id: u32,
+        max_frames: u8,
+        payload: T,
+    ) -> (u64, Option<T>) {
+        let displaced = self.take_peer(peer_id);
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.entries.push(PendingReattachEntry {
+            id,
+            stack_id,
+            peer_id,
+            phase: ReattachPhase::HoldOnOuterUntilDirect {
+                remaining_frames: max_frames.max(1),
+            },
+            payload,
+        });
+        (id, displaced)
+    }
+
+    pub(crate) fn promote_holds_for_export(
+        &mut self,
+        settle_frames: u8,
+        mut on_promote: impl FnMut(&mut T),
+    ) {
+        let settle = settle_frames.max(1);
+        for entry in &mut self.entries {
+            if matches!(entry.phase, ReattachPhase::HoldOnOuterUntilDirect { .. }) {
+                entry.phase = ReattachPhase::FlushAlphaOnOuter {
+                    settle_frames: settle,
+                };
+                on_promote(&mut entry.payload);
+            }
+        }
+    }
+
     pub(crate) fn on_frame_callback(&mut self, id: u64) -> ReattachTick<T>
     where
         T: Clone,
@@ -504,6 +555,16 @@ impl<T> PendingReattachQueue<T> {
             return ReattachTick::Stale;
         };
         match self.entries[pos].phase {
+            ReattachPhase::HoldOnOuterUntilDirect { remaining_frames } => {
+                if remaining_frames > 1 {
+                    self.entries[pos].phase = ReattachPhase::HoldOnOuterUntilDirect {
+                        remaining_frames: remaining_frames - 1,
+                    };
+                    ReattachTick::WaitMore
+                } else {
+                    ReattachTick::Complete(self.entries.remove(pos).payload)
+                }
+            }
             ReattachPhase::FlushAlphaOnOuter { settle_frames } => {
                 self.entries[pos].phase = ReattachPhase::SettleDetached {
                     remaining_frames: settle_frames.max(1),
@@ -525,7 +586,8 @@ impl<T> PendingReattachQueue<T> {
 
     pub(crate) fn iter_on_outer(&self) -> impl Iterator<Item = &T> {
         self.entries.iter().filter_map(|entry| match entry.phase {
-            ReattachPhase::FlushAlphaOnOuter { .. } => Some(&entry.payload),
+            ReattachPhase::HoldOnOuterUntilDirect { .. }
+            | ReattachPhase::FlushAlphaOnOuter { .. } => Some(&entry.payload),
             ReattachPhase::SettleDetached { .. } => None,
         })
     }
@@ -589,6 +651,160 @@ pub(crate) fn should_immediately_retire_composite(
     composite_unrevealed: bool,
 ) -> bool {
     !hosts_retainable || unmounted_modal || composite_unrevealed
+}
+
+/// Committed VSyncs after `DirectRoot` attaches before hiding an opaque lingering
+/// `Presentation` (`> 3` `Export::after_attach` repair frames + custom draw rebuilds).
+pub(crate) const LINGERING_OPAQUE_COMMIT_FRAMES: u8 = 6;
+/// Committed VSyncs after `DirectRoot` attaches before hiding a translucent lingering
+/// `Presentation` (avoids stacking semi-transparent scrims while ensuring `DirectRoot` drew).
+pub(crate) const LINGERING_TRANSLUCENT_COMMIT_FRAMES: u8 = 1;
+/// VSyncs between setting `Presentation` `opacity = 0.0` and disposing its `XComponent`.
+pub(crate) const LINGERING_DISPOSE_SETTLE_FRAMES: u8 = 3;
+/// Safety fallback VSyncs if `DirectRoot` never attaches (e.g. host torn down).
+pub(crate) const LINGERING_ATTACH_FALLBACK_FRAMES: u8 = 90;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LingeringPhase {
+    WaitingDirectAttach {
+        remaining_fallback: u8,
+        commit_frames: u8,
+    },
+    WaitingDirectCommit {
+        remaining_frames: u8,
+    },
+    HiddenWaitingDispose {
+        remaining_frames: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LingeringGateEntry {
+    generation: u32,
+    phase: LingeringPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LingeringTick {
+    Stale,
+    WaitMore,
+    HideAndWaitMore,
+    ReleaseFallbackHoldsHideAndWaitMore,
+    Dispose,
+}
+
+#[derive(Default, Debug)]
+pub(crate) struct LingeringQueue {
+    entries: Vec<LingeringGateEntry>,
+}
+
+impl LingeringQueue {
+    pub(crate) fn enqueue(&mut self, generation: u32, has_opaque_fill: bool, already_direct: bool) {
+        self.remove(generation);
+        let commit_frames = if should_hide_lingering_presentation(has_opaque_fill) {
+            LINGERING_TRANSLUCENT_COMMIT_FRAMES
+        } else {
+            LINGERING_OPAQUE_COMMIT_FRAMES
+        };
+        let phase = if already_direct {
+            LingeringPhase::WaitingDirectCommit {
+                remaining_frames: commit_frames,
+            }
+        } else {
+            LingeringPhase::WaitingDirectAttach {
+                remaining_fallback: LINGERING_ATTACH_FALLBACK_FRAMES,
+                commit_frames,
+            }
+        };
+        self.entries.push(LingeringGateEntry { generation, phase });
+    }
+
+    pub(crate) fn on_direct_attached(&mut self) -> Vec<u32> {
+        let mut promoted = Vec::new();
+        for entry in &mut self.entries {
+            if let LingeringPhase::WaitingDirectAttach { commit_frames, .. } = entry.phase {
+                entry.phase = LingeringPhase::WaitingDirectCommit {
+                    remaining_frames: commit_frames,
+                };
+                promoted.push(entry.generation);
+            }
+        }
+        promoted
+    }
+
+    pub(crate) fn mark_all_hidden(&mut self) -> Vec<u32> {
+        let mut hidden = Vec::new();
+        for entry in &mut self.entries {
+            if !matches!(entry.phase, LingeringPhase::HiddenWaitingDispose { .. }) {
+                entry.phase = LingeringPhase::HiddenWaitingDispose {
+                    remaining_frames: LINGERING_DISPOSE_SETTLE_FRAMES,
+                };
+                hidden.push(entry.generation);
+            }
+        }
+        hidden
+    }
+
+    pub(crate) fn remove(&mut self, generation: u32) {
+        self.entries.retain(|entry| entry.generation != generation);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub(crate) fn on_frame_callback(&mut self, generation: u32) -> LingeringTick {
+        let Some(pos) = self
+            .entries
+            .iter()
+            .position(|entry| entry.generation == generation)
+        else {
+            return LingeringTick::Stale;
+        };
+        match self.entries[pos].phase {
+            LingeringPhase::WaitingDirectAttach {
+                remaining_fallback,
+                commit_frames,
+            } => {
+                if remaining_fallback > 1 {
+                    self.entries[pos].phase = LingeringPhase::WaitingDirectAttach {
+                        remaining_fallback: remaining_fallback - 1,
+                        commit_frames,
+                    };
+                    LingeringTick::WaitMore
+                } else {
+                    self.entries[pos].phase = LingeringPhase::HiddenWaitingDispose {
+                        remaining_frames: LINGERING_DISPOSE_SETTLE_FRAMES,
+                    };
+                    LingeringTick::ReleaseFallbackHoldsHideAndWaitMore
+                }
+            }
+            LingeringPhase::WaitingDirectCommit { remaining_frames } => {
+                if remaining_frames > 1 {
+                    self.entries[pos].phase = LingeringPhase::WaitingDirectCommit {
+                        remaining_frames: remaining_frames - 1,
+                    };
+                    LingeringTick::WaitMore
+                } else {
+                    self.entries[pos].phase = LingeringPhase::HiddenWaitingDispose {
+                        remaining_frames: LINGERING_DISPOSE_SETTLE_FRAMES,
+                    };
+                    LingeringTick::HideAndWaitMore
+                }
+            }
+            LingeringPhase::HiddenWaitingDispose { remaining_frames } => {
+                if remaining_frames > 1 {
+                    self.entries[pos].phase = LingeringPhase::HiddenWaitingDispose {
+                        remaining_frames: remaining_frames - 1,
+                    };
+                    LingeringTick::WaitMore
+                } else {
+                    self.entries.remove(pos);
+                    LingeringTick::Dispose
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -913,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn root_live_bridge_keeps_commit_gate_and_placeholder_floor_and_reports_mount_gap() {
+    fn root_live_bridge_clears_placeholder_without_holding_direct_and_reports_mount_gap() {
         let mut state = HandoffState::default();
         let t0 = Instant::now();
         let mut inputs = base_inputs();
@@ -928,29 +1144,94 @@ mod tests {
         assert_eq!(state.active_fill(), Some(DARK_BG));
 
         // `stack::reconcile` installs live `peer` bridge on `ROOT_ID` in the same UI turn.
-        // Both the placeholder floor and `CommitGate` stay armed until `outer` (hosting `peer`)
-        // commits to `render_service`.
+        // Live `peer` on `outer` covers the viewport directly, so placeholder fill is cleared
+        // with zero color assumptions and `DirectRoot` is not held on a placeholder draw gate.
         inputs.covered_by_live_bridge = true;
         inputs.desired_surface_ready = true;
         let (out1, gap) = state.prepare_target(inputs, t0);
         assert!(gap.is_none());
-        assert!(out1.hold_direct_target);
-        assert!(!out1.repaint_outer);
+        assert!(!out1.hold_direct_target);
+        assert!(out1.repaint_outer);
         assert!(out1.arm_frame_callback.is_none());
-        assert_eq!(state.active_fill(), Some(DARK_BG));
-
-        assert_eq!(state.note_placeholder_drawn(), None);
+        assert_eq!(state.active_fill(), None);
         assert_eq!(
             state.on_frame_callback(generation),
-            FrameCallbackStep::ReadyToDetach
+            FrameCallbackStep::Stale
         );
-        let (out2, _) = state.prepare_target(inputs, t0 + Duration::from_millis(16));
-        assert!(!out2.hold_direct_target);
 
-        state.note_target_updated(true, false, t0 + Duration::from_millis(18));
+        state.note_target_updated(true, false, t0 + Duration::from_millis(12));
         let (stopped, gap) = state.note_revealed(t0 + Duration::from_millis(118));
-        assert!(stopped);
+        assert!(!stopped);
         assert_eq!(gap, Some((Duration::from_millis(118), GapKind::Mount)));
+    }
+
+    #[test]
+    fn hold_until_direct_keeps_peer_on_outer_and_promotes_if_export_resumes() {
+        let mut queue = PendingReattachQueue::default();
+        let (id, _) = queue.enqueue_hold_until_direct(10, 20, 3, "home");
+        assert_eq!(queue.iter_on_outer().copied().collect::<Vec<_>>(), ["home"]);
+        assert_eq!(queue.on_frame_callback(id), ReattachTick::WaitMore);
+        assert_eq!(queue.iter_on_outer().copied().collect::<Vec<_>>(), ["home"]);
+
+        // If a new Composite reveals before DirectRoot attaches, promote to FlushAlphaOnOuter.
+        let mut promoted = Vec::new();
+        queue.promote_holds_for_export(BRIDGE_REATTACH_SETTLE_FRAMES, |p| promoted.push(*p));
+        assert_eq!(promoted, vec!["home"]);
+        assert_eq!(
+            queue.on_frame_callback(id),
+            ReattachTick::DetachFromOuter("home")
+        );
+        assert_eq!(queue.on_frame_callback(id), ReattachTick::WaitMore);
+        assert_eq!(queue.on_frame_callback(id), ReattachTick::Complete("home"));
+    }
+
+    #[test]
+    fn lingering_queue_waits_for_direct_attach_then_commits_and_disposes() {
+        let mut q = LingeringQueue::default();
+        q.enqueue(7, true, false);
+
+        // Before DirectRoot attaches, ticking stays in WaitingDirectAttach without hiding early.
+        for _ in 0..15 {
+            assert_eq!(q.on_frame_callback(7), LingeringTick::WaitMore);
+        }
+
+        // DirectRoot attaches -> promotes to 6-frame commit countdown.
+        assert_eq!(q.on_direct_attached(), vec![7]);
+        for _ in 0..(LINGERING_OPAQUE_COMMIT_FRAMES - 1) {
+            assert_eq!(q.on_frame_callback(7), LingeringTick::WaitMore);
+        }
+        assert_eq!(q.on_frame_callback(7), LingeringTick::HideAndWaitMore);
+
+        // Settles 3 frames at opacity 0 before disposing XComponent.
+        for _ in 0..(LINGERING_DISPOSE_SETTLE_FRAMES - 1) {
+            assert_eq!(q.on_frame_callback(7), LingeringTick::WaitMore);
+        }
+        assert_eq!(q.on_frame_callback(7), LingeringTick::Dispose);
+        assert_eq!(q.on_frame_callback(7), LingeringTick::Stale);
+
+        // Successor Composite reveal hides immediately and still waits settle frames before dispose.
+        q.enqueue(8, true, false);
+        assert_eq!(q.mark_all_hidden(), vec![8]);
+        assert!(q.mark_all_hidden().is_empty());
+        for _ in 0..(LINGERING_DISPOSE_SETTLE_FRAMES - 1) {
+            assert_eq!(q.on_frame_callback(8), LingeringTick::WaitMore);
+        }
+        assert_eq!(q.on_frame_callback(8), LingeringTick::Dispose);
+
+        // Translucent already-direct commits in 1 frame, fallback releases holds, and clear resets.
+        q.enqueue(9, false, true);
+        assert_eq!(q.on_frame_callback(9), LingeringTick::HideAndWaitMore);
+        q.clear();
+        assert_eq!(q.on_frame_callback(9), LingeringTick::Stale);
+
+        q.enqueue(10, true, false);
+        for _ in 0..(LINGERING_ATTACH_FALLBACK_FRAMES - 1) {
+            assert_eq!(q.on_frame_callback(10), LingeringTick::WaitMore);
+        }
+        assert_eq!(
+            q.on_frame_callback(10),
+            LingeringTick::ReleaseFallbackHoldsHideAndWaitMore
+        );
     }
 
     #[test]

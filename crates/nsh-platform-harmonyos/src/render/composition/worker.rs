@@ -67,6 +67,7 @@ struct Shared {
     released: AtomicBool,
     active: AtomicBool,
     frozen: AtomicBool,
+    present_gate: Mutex<bool>,
     awaiting_origin: AtomicBool,
     state: Mutex<State>,
     queued: AtomicBool,
@@ -1327,11 +1328,17 @@ impl Entry {
             self.shaders.clear_output();
             self.shared.awaiting_origin.store(false, Ordering::Release);
             if let Some(window) = &mut self.window {
-                match self
-                    .reader
-                    .present_passthrough(window, changed)
-                    .map_err(|e| e.to_string())?
-                {
+                let outcome = {
+                    let gate = self.shared.present_gate.lock().unwrap();
+                    if !*gate || self.shared.frozen.load(Ordering::Acquire) {
+                        self.shared.animating.store(false, Ordering::Release);
+                        return Ok(false);
+                    }
+                    self.reader
+                        .present_passthrough(window, changed)
+                        .map_err(|e| e.to_string())?
+                };
+                match outcome {
                     super::readback::PassthroughOutcome::Presented { width, height } => {
                         self.shared.animating.store(false, Ordering::Release);
                         self.record_gpu_output(width, height, x, y);
@@ -1568,7 +1575,15 @@ impl Entry {
         if !repaint {
             return Ok(false);
         }
-        if !output.present(window)? {
+        let presented = {
+            let gate = self.shared.present_gate.lock().unwrap();
+            if !*gate || self.shared.frozen.load(Ordering::Acquire) {
+                self.shared.animating.store(false, Ordering::Release);
+                return Ok(false);
+            }
+            output.present(window)?
+        };
+        if !presented {
             self.window_dirty = true;
             self.shared.animating.store(true, Ordering::Release);
             return Ok(false);
@@ -1717,6 +1732,7 @@ fn next_composite_generation() -> u32 {
 pub(crate) struct Composite {
     owner: std::rc::Weak<Node>,
     presentation: RefCell<Option<super::presentation::Presentation>>,
+    bridge: Cell<Option<(f32, f32)>>,
     surface: RefCell<Option<String>>,
     failed: Cell<bool>,
     pub(crate) generation: u32,
@@ -1737,7 +1753,7 @@ impl Composite {
                 .scene
                 .borrow()
                 .as_ref()
-                .is_some_and(|scene| scene.has_output())
+                .is_some_and(|scene| scene.has_output_for(owner.id))
         } else {
             self.shared.state.lock().unwrap().presented
         }
@@ -1762,6 +1778,7 @@ impl Composite {
             released: AtomicBool::new(false),
             active: AtomicBool::new(true),
             frozen: AtomicBool::new(false),
+            present_gate: Mutex::new(true),
             awaiting_origin: AtomicBool::new(false),
             state: Mutex::new(State {
                 settings: initial_settings.clone(),
@@ -1824,6 +1841,7 @@ impl Composite {
         Ok(Self {
             owner: Rc::downgrade(owner),
             presentation: RefCell::new(presentation),
+            bridge: Cell::new(None),
             surface: RefCell::new(None),
             failed: Cell::new(false),
             generation,
@@ -1853,14 +1871,18 @@ impl Composite {
         }
         let settings = settings(owner, self.key.overlay)?;
         if settings.gpu && self.presentation.borrow().is_none() {
-            *self.presentation.borrow_mut() = Some(super::presentation::Presentation::new(
+            let mut layer = super::presentation::Presentation::new(
                 owner,
                 self.key,
                 WindowEvents {
                     target: WindowTarget::Composite(self.key),
                     send: self.worker.send.clone(),
                 },
-            )?);
+            )?;
+            if let Some((alpha, dx_vp)) = self.bridge.get() {
+                layer.set_bridge(alpha, dx_vp)?;
+            }
+            *self.presentation.borrow_mut() = Some(layer);
         } else if !settings.gpu
             && let Some(mut layer) = self.presentation.borrow_mut().take()
         {
@@ -1944,12 +1966,33 @@ impl Composite {
             complete: false,
         }));
     }
+    pub(crate) fn set_bridge_presentation(&self, alpha: f32, dx_vp: f32) -> Result<()> {
+        self.bridge.set(Some((alpha, dx_vp)));
+        if let Some(layer) = self.presentation.borrow_mut().as_mut() {
+            layer.set_bridge(alpha, dx_vp)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn clear_bridge_presentation(&self) -> Result<()> {
+        self.bridge.set(None);
+        if let Some(layer) = self.presentation.borrow_mut().as_mut() {
+            layer.clear_bridge()?;
+        }
+        Ok(())
+    }
     pub(crate) fn freeze(&self) {
+        let mut gate = self.shared.present_gate.lock().unwrap();
+        *gate = false;
         self.shared.frozen.store(true, Ordering::Release);
         self.shared.active.store(false, Ordering::Release);
     }
     pub(crate) fn unfreeze(&self) {
-        if self.shared.frozen.swap(false, Ordering::AcqRel) {
+        let was_frozen = {
+            let mut gate = self.shared.present_gate.lock().unwrap();
+            *gate = true;
+            self.shared.frozen.swap(false, Ordering::AcqRel)
+        };
+        if was_frozen {
             self.shared.active.store(true, Ordering::Release);
             wake(&self.worker.send, self.key, &self.shared);
         }
@@ -2025,6 +2068,9 @@ impl Composite {
         }
         self.shared.posted.store(false, Ordering::Release);
         let output = self.shared.state.lock().unwrap().output.take();
+        if self.shared.frozen.load(Ordering::Acquire) {
+            return (initialized, false);
+        }
         if let Some(output) = output {
             let mut presentation = self.presentation.borrow_mut();
             if let Some(layer) = presentation.as_mut() {

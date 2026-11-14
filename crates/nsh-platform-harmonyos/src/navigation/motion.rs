@@ -1,20 +1,22 @@
 //! Pure push/pop interpolation and edge-swipe completion decisions.
 
+use std::cell::Cell;
+
 pub(crate) struct Motion {
-    start: f64,
+    start: Cell<Option<f64>>,
     duration: f64,
     from: f32,
     pub(crate) to: f32,
 }
 impl Motion {
     pub(crate) fn new(
-        start: f64,
+        start: Option<f64>,
         from: f32,
         to: f32,
         duration: Option<std::time::Duration>,
     ) -> Self {
         Self {
-            start,
+            start: Cell::new(start),
             from,
             to,
             duration: duration.map_or(0.0, |duration| {
@@ -23,10 +25,17 @@ impl Motion {
         }
     }
     pub(crate) fn step(&self, now: f64) -> (f32, bool, f32) {
+        let start = match self.start.get() {
+            Some(start) => start,
+            None => {
+                self.start.set(Some(now));
+                now
+            }
+        };
         let t = if self.duration <= 0.0 {
             1.0
         } else {
-            ((now - self.start) / self.duration).clamp(0.0, 1.0) as f32
+            ((now - start) / self.duration).clamp(0.0, 1.0) as f32
         };
         (
             self.from + (self.to - self.from) * nsh_core::navigation::ease(t as f64),
@@ -73,7 +82,7 @@ mod tests {
     }
     #[test]
     fn cancelling_a_partial_swipe_preserves_position_and_finishes_at_rest() {
-        let cancel = Motion::new(100.0, 0.4, 0.0, Some(nsh_core::navigation::SLIDE));
+        let cancel = Motion::new(Some(100.0), 0.4, 0.0, Some(nsh_core::navigation::SLIDE));
         assert_eq!(cancel.step(100.0), (0.4, false, 0.0));
         let middle = cancel.step(160.0);
         assert!(middle.0 > 0.0 && middle.0 < 0.4 && !middle.1);
@@ -85,11 +94,22 @@ mod tests {
             let motion =
                 nsh_core::navigation::screen_motion(nsh_core::ScreenAnimation::Fade, reduced)
                     .map(|m| m.0);
-            let fade = Motion::new(0.0, 0.0, 1.0, motion);
+            let fade = Motion::new(Some(0.0), 0.0, 1.0, motion);
             assert!(!fade.step(100.0).1);
             assert_eq!(fade.step(200.0), (1.0, true, 1.0));
         }
-        assert_eq!(Motion::new(0.0, 1.0, 0.0, None).step(0.0), (0.0, true, 0.0));
+        assert_eq!(
+            Motion::new(Some(0.0), 1.0, 0.0, None).step(0.0),
+            (0.0, true, 0.0)
+        );
+    }
+    #[test]
+    fn unanchored_motion_starts_on_first_vsync_sample() {
+        let slide = Motion::new(None, 1.0, 0.0, Some(nsh_core::navigation::SLIDE));
+        assert_eq!(slide.step(540.0), (1.0, false, 0.0));
+        let mid = slide.step(690.0);
+        assert!(mid.0 > 0.0 && mid.0 < 1.0 && !mid.1);
+        assert_eq!(slide.step(840.0), (0.0, true, 0.0));
     }
     #[test]
     fn completion_accounts_for_fling_direction_and_invalid_geometry() {

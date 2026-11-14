@@ -338,12 +338,16 @@ impl Effects {
                 .filter_map(Weak::upgrade)
                 .any(|scope| mounted_and_unhidden_in_root(&scope));
             let root_capable = desired.get(&root.id).is_some_and(|&(_, keep)| keep);
+            let root_has_active_composite = root.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                wrapper.composite.borrow().is_some() && !wrapper.retiring_export()
+            });
             let root_keep = retainable
                 && mounted_and_unhidden_in_root(root)
                 && (has_fill_in_root
                     || has_non_nav_effect_in_root
                     || has_screen_scope
-                    || root_capable);
+                    || root_capable
+                    || (root_has_active_composite && root.has_active_screen_transition()));
             desired.insert(root.id, (root.clone(), root_keep));
         }
 

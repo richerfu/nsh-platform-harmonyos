@@ -351,6 +351,10 @@ pub(crate) fn nsh_attach_native_subtree(
             })
         })
         .ok_or_else(|| Error::from_reason("Native subtree route is no longer live"))?;
+    let is_direct = owner.is_current_direct_target(target_id);
+    if is_direct && let Err(error) = owner.prepare_direct_target_attach() {
+        log::warn!("OHOS pre-attach direct hold release failed for target {target_id}: {error}");
+    }
     export
         .prepare(&owner, &inner)
         .map_err(|error| Error::from_reason(error.to_string()))?;
@@ -361,6 +365,9 @@ pub(crate) fn nsh_attach_native_subtree(
     if let Err(error) = owner.flush_pending_bridge_reattach_if_direct() {
         log::warn!("OHOS post-attach bridge reattach failed for target {target_id}: {error}");
     }
+    if is_direct && let Err(error) = owner.restore_subtree_scroll_offsets(true) {
+        log::warn!("OHOS post-attach scroll restore failed for target {target_id}: {error}");
+    }
     if let Err(error) = owner.sync_subtree_scroll_offsets() {
         log::warn!("OHOS post-attach scroll sync failed for target {target_id}: {error}");
     }
@@ -370,8 +377,14 @@ pub(crate) fn nsh_attach_native_subtree(
     // Reparenting into or out of a texture export changes the render target
     // across the attachment and surface-export frames. ArkUI's retained custom
     // draw recordings must be rebuilt once the destination pipeline is live.
-    if let Err(error) = owner.schedule_subtree_paint(4) {
+    if let Err(error) = owner.invalidate_subtree_paint() {
+        log::warn!("OHOS post-attach subtree invalidate failed for target {target_id}: {error}");
+    }
+    if let Err(error) = owner.schedule_subtree_paint(6) {
         log::warn!("OHOS post-attach subtree paint failed for target {target_id}: {error}");
+    }
+    if is_direct {
+        owner.notify_direct_target_attached();
     }
     Ok(())
 }

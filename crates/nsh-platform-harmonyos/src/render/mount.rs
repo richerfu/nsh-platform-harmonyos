@@ -722,6 +722,8 @@ impl Mounter {
             | MountItem::Text { id, .. }
             | MountItem::ScreenConfig { id, .. }
             | MountItem::ModalConfig { id, .. }
+            | MountItem::Shader { id, .. }
+            | MountItem::ShaderTransition { id, .. }
             | MountItem::NavShader { id, .. }
             | MountItem::Remove { id } => Some(*id),
             _ => None,
@@ -1120,10 +1122,14 @@ impl Mounter {
                         }
                     }
                     MountItem::Shader { id, layer } => {
-                        self.shaders.set(self.node(id)?, layer)?;
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
+                            self.shaders.set(self.node(id)?, layer)?;
+                        }
                     }
                     MountItem::ShaderTransition { id, duration } => {
-                        self.shaders.transition(id, duration)
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
+                            self.shaders.transition(id, duration);
+                        }
                     }
                     // ArkUI's texture producer reports native content changes,
                     // including native input/scroll updates between core batches.

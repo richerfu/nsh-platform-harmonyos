@@ -104,6 +104,9 @@ impl Scene {
     pub(crate) fn has_output(&self) -> bool {
         !self.bitmaps.borrow().is_empty()
     }
+    pub(crate) fn has_output_for(&self, id: u32) -> bool {
+        self.bitmaps.borrow().contains_key(&id)
+    }
     pub(crate) fn require(&self, node: &Rc<Node>) {
         let required = node.effects_plan().requires_scene;
         let mut nodes = self.requirements.borrow_mut();
