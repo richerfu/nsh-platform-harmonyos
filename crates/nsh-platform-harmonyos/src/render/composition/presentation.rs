@@ -67,8 +67,11 @@ impl Presentation {
         Ok(false)
     }
 
-    pub(super) fn hide(&self) {
-        let _ = self.surface.native.borrow().opacity(0.0);
+    pub(super) fn hide(&mut self) {
+        let node = self.surface.native.borrow();
+        let _ = node.opacity(0.0);
+        let _ = node.mark_dirty(NodeDirtyFlag::NeedRender);
+        self.revealed = false;
     }
 
     pub(super) fn update(

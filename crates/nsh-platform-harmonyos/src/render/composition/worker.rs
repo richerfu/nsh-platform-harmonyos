@@ -1781,7 +1781,7 @@ impl Composite {
                 },
             )?);
         } else if !settings.gpu
-            && let Some(layer) = self.presentation.borrow_mut().take()
+            && let Some(mut layer) = self.presentation.borrow_mut().take()
         {
             layer.hide();
             let released = Arc::new(AtomicBool::new(false));
@@ -1918,6 +1918,11 @@ impl Composite {
             .as_ref()
             .is_some_and(super::presentation::Presentation::is_revealed)
     }
+    pub(crate) fn hide_presentation(&self) {
+        if let Some(layer) = self.presentation.borrow_mut().as_mut() {
+            layer.hide();
+        }
+    }
     pub(crate) fn ready(&self) -> (bool, bool) {
         let surface = self.shared.state.lock().unwrap().surface.take();
         let mut initialized = false;
@@ -1930,7 +1935,7 @@ impl Composite {
                 Err(error) => {
                     log::warn!("OHOS compositor initialization: {error}");
                     self.failed.set(true);
-                    if let Some(layer) = self.presentation.borrow_mut().take() {
+                    if let Some(mut layer) = self.presentation.borrow_mut().take() {
                         layer.hide();
                     }
                 }
@@ -1997,7 +2002,7 @@ impl Composite {
 }
 impl Drop for Composite {
     fn drop(&mut self) {
-        if let Some(layer) = self.presentation.get_mut().take() {
+        if let Some(mut layer) = self.presentation.get_mut().take() {
             layer.hide();
             self.worker
                 .retired

@@ -22,7 +22,10 @@ use crate::{
 
 impl SubtreePaintNode for Rc<Node> {
     fn is_live(&self) -> bool {
-        self.active.get() && !self.pending_delete.get()
+        // Nodes marked `pending_delete` are frozen for an active exit animation
+        // (leaving Screen or closing Modal) and still render until `delete_now`
+        // runs `deactivate()` (`active = false`).
+        self.active.get()
     }
 
     fn paint_state(&self) -> SubtreePaint {
@@ -241,10 +244,16 @@ impl Node {
     }
     /// Re-record custom paint after a native visibility or render-target change.
     pub(crate) fn invalidate_subtree_paint(&self) -> Result<()> {
-        if !self.active.get() || self.pending_delete.get() {
+        if !self.active.get() {
             return Ok(());
         }
         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        if let Some(image) = self.image.borrow().as_ref() {
+            image
+                .native
+                .borrow()
+                .mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
         if let Some(wrapper) = self.wrapper.borrow().as_ref() {
             wrapper
                 .outer

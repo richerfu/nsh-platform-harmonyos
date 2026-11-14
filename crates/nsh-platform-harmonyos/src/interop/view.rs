@@ -995,6 +995,16 @@ impl Wrapper {
                         .mark_dirty(NodeDirtyFlag::NeedRender)?;
                 }
                 node.update_wrapper()?;
+                if crate::interop::handoff::should_hide_lingering_presentation(
+                    node.placeholder_fill().is_some(),
+                ) && let Some(wrapper) = node.wrapper.borrow().as_ref()
+                {
+                    for lingering in wrapper.lingering.borrow().iter() {
+                        if lingering.generation == old_generation {
+                            lingering.hide_presentation();
+                        }
+                    }
+                }
                 if let Some(wrapper) = node.wrapper.borrow().as_ref() {
                     wrapper.release_clearing_export_holds()?;
                 }
@@ -1780,19 +1790,32 @@ impl Node {
         }
         let mut created_composite = false;
         if !requires_texture {
-            let immediate_retire = !self.shaders.hosts_retainable()
-                || self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
-                    wrapper
-                        .composite
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|composite| !composite.is_revealed())
-                });
+            let unmounted_modal = self
+                .modal
+                .try_borrow()
+                .ok()
+                .is_some_and(|modal| modal.as_ref().is_some_and(|m| !m.is_visible()));
+            let unrevealed = self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                wrapper
+                    .composite
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|composite| !composite.is_revealed())
+            });
+            let retainable = self.shaders.hosts_retainable();
+            let immediate_retire = crate::interop::handoff::should_immediately_retire_composite(
+                retainable,
+                unmounted_modal,
+                unrevealed,
+            );
             if immediate_retire {
                 if let Some(wrapper) = self.wrapper.borrow().as_ref() {
                     wrapper.cancel_retiring(Some(self))?;
+                    if unmounted_modal || !retainable {
+                        wrapper.lingering.borrow_mut().clear();
+                    }
                     if wrapper.composite.borrow_mut().take().is_some() {
-                        if !self.shaders.hosts_retainable() {
+                        if !retainable {
                             wrapper.retired_for_background.set(true);
                         }
                         wrapper

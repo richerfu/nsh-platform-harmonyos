@@ -561,6 +561,36 @@ impl<T> PendingReattachQueue<T> {
     }
 }
 
+/// Whether a retiring `Composite` pushed to `Wrapper::lingering` must hide its
+/// `Presentation` surface as soon as `DirectRoot` mounts.
+///
+/// Opaque surfaces (`has_opaque_placeholder_fill == true`, e.g. `ROOT_ID`) keep
+/// `Presentation` visible across the linger window so `DirectRoot` has time to
+/// record custom-drawn children (`<Text>`, `<Canvas>`) without flashing blank.
+/// Translucent subtrees (`has_opaque_placeholder_fill == false`, e.g. a
+/// `FullScreen` `Modal` with `rgba(0,0,0,0.45)`) cannot stack `Presentation`
+/// over `DirectRoot` without double-blending alpha (`0.45 + 0.45 * 0.55`), so
+/// `Presentation` hides (`opacity = 0.0`) when `DirectRoot` commits while the
+/// `Composite` stays retained in `lingering` for safe native surface release.
+pub(crate) fn should_hide_lingering_presentation(has_opaque_placeholder_fill: bool) -> bool {
+    !has_opaque_placeholder_fill
+}
+
+/// Whether a `Composite` whose owner no longer requires texture export should
+/// drop immediately instead of entering the multi-frame `retire_composite`
+/// `post_frame_callback` pipeline.
+///
+/// An unmounted/closed `Modal` (`unmounted_modal == true`) has already detached
+/// `wrapper.outer` via `dialog.remove_content()`, so `post_frame_callback` will
+/// never fire on `outer`; dropping synchronously avoids stranding the `Composite`.
+pub(crate) fn should_immediately_retire_composite(
+    hosts_retainable: bool,
+    unmounted_modal: bool,
+    composite_unrevealed: bool,
+) -> bool {
+    !hosts_retainable || unmounted_modal || composite_unrevealed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,5 +1047,19 @@ mod tests {
         let _ = queue.enqueue(10, 32, false, BRIDGE_REATTACH_SETTLE_FRAMES, "d2");
         assert_eq!(queue.drain_all(), vec!["d1", "d2"]);
         assert!(queue.drain_all().is_empty());
+    }
+
+    #[test]
+    fn translucent_lingering_composite_hides_presentation_to_prevent_double_scrim() {
+        assert!(should_hide_lingering_presentation(false));
+        assert!(!should_hide_lingering_presentation(true));
+    }
+
+    #[test]
+    fn closed_modal_and_unrevealed_composites_retire_immediately() {
+        assert!(!should_immediately_retire_composite(true, false, false));
+        assert!(should_immediately_retire_composite(true, true, false));
+        assert!(should_immediately_retire_composite(true, false, true));
+        assert!(should_immediately_retire_composite(false, false, false));
     }
 }
