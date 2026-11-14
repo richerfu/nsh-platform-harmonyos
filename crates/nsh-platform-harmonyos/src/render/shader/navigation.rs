@@ -148,6 +148,38 @@ pub(crate) fn modal_open_waiting(shader: &Navigation, has_presented_frame: bool)
     !shader.backwards && (shader.capturing() || !has_presented_frame)
 }
 
+/// Inputs governing whether an open `Modal` (`Dialog`) with a `transitionShader`
+/// retains its `Composite` in identity-passthrough mode until dismissal completes.
+///
+/// Retaining `Composite(modal_id)` strictly from first `Event::Captured` until
+/// `Modal::finish(0.0)` (or shader removal / reduce-motion / context loss) avoids:
+/// 1. Open-completion `Composite -> DirectRoot` retirement (preventing translucent
+///    modal scrims from double-darkening or flickering on settle), and
+/// 2. Close-start `DirectRoot -> TextureContainer` cold re-export gaps (`30-50ms`
+///    scrim/dialog vanish + custom-draw rebuild) when reverse `transitionShader` runs.
+///
+/// Closed dialogs (`!modal_visible`) keep `0` idle texture exports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModalHostInputs {
+    pub(crate) retainable: bool,
+    pub(crate) reduce_motion: bool,
+    pub(crate) node_active: bool,
+    pub(crate) node_retained: bool,
+    pub(crate) node_hidden: bool,
+    pub(crate) modal_visible: bool,
+    pub(crate) has_navigation_shader: bool,
+}
+
+pub(crate) fn modal_host_keep_alive(inputs: ModalHostInputs) -> bool {
+    inputs.retainable
+        && !inputs.reduce_motion
+        && inputs.node_active
+        && !inputs.node_retained
+        && !inputs.node_hidden
+        && inputs.modal_visible
+        && inputs.has_navigation_shader
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Demand {
     pub(crate) key: Key,
@@ -572,5 +604,53 @@ mod tests {
         assert!(!modal_open_waiting(&modal_close, false));
         assert!(modal_close.mark_running(modal_close.key));
         assert!(!modal_open_waiting(&modal_close, false));
+    }
+
+    #[test]
+    fn modal_host_keep_alive_holds_only_visible_shader_modals_and_releases_on_close() {
+        let open_shader_modal = ModalHostInputs {
+            retainable: true,
+            reduce_motion: false,
+            node_active: true,
+            node_retained: false,
+            node_hidden: false,
+            modal_visible: true,
+            has_navigation_shader: true,
+        };
+        assert!(modal_host_keep_alive(open_shader_modal));
+
+        // Closed / idle modal configured with NavShader exports 0 textures.
+        assert!(!modal_host_keep_alive(ModalHostInputs {
+            modal_visible: false,
+            ..open_shader_modal
+        }));
+
+        // Open modal without transitionShader stays on DirectRoot.
+        assert!(!modal_host_keep_alive(ModalHostInputs {
+            has_navigation_shader: false,
+            ..open_shader_modal
+        }));
+
+        // Reduce-motion, hidden, retained, deactivated, or lost context release keep-alive.
+        assert!(!modal_host_keep_alive(ModalHostInputs {
+            reduce_motion: true,
+            ..open_shader_modal
+        }));
+        assert!(!modal_host_keep_alive(ModalHostInputs {
+            node_hidden: true,
+            ..open_shader_modal
+        }));
+        assert!(!modal_host_keep_alive(ModalHostInputs {
+            node_retained: true,
+            ..open_shader_modal
+        }));
+        assert!(!modal_host_keep_alive(ModalHostInputs {
+            node_active: false,
+            ..open_shader_modal
+        }));
+        assert!(!modal_host_keep_alive(ModalHostInputs {
+            retainable: false,
+            ..open_shader_modal
+        }));
     }
 }

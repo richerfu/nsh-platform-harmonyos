@@ -246,7 +246,26 @@ impl Shaders {
         self.effects.navigation_event(event)
     }
     pub(crate) fn end_navigation(&self, id: NodeId) -> Result<()> {
-        self.effects.end_navigation(id)
+        let end = self.effects.end_navigation(id);
+        let hosts = if self
+            .effects
+            .root_node()
+            .is_some_and(|root| !root.flushing_batch.get())
+        {
+            self.reconcile_hosts()
+        } else {
+            Ok(())
+        };
+        end.and(hosts)
+    }
+    pub(crate) fn finish_modal_close(&self, owner: &Rc<Node>, had_shader: bool) -> Result<()> {
+        let close = self.effects.finish_modal_close(owner, had_shader);
+        let hosts = if !owner.flushing_batch.get() {
+            self.reconcile_hosts()
+        } else {
+            Ok(())
+        };
+        close.and(hosts)
     }
     pub(crate) fn reconcile_navigation_capture(&self, reduce_motion: bool) -> Result<()> {
         let capture = self.effects.reconcile_navigation_capture(reduce_motion);
@@ -429,6 +448,13 @@ fn in_sight_uncached(node: &Rc<Node>) -> bool {
     if !node.visible_in_tree() {
         return false;
     }
+    if node.kind == nsh_core::ViewKind::Modal {
+        return node
+            .modal
+            .try_borrow()
+            .ok()
+            .is_some_and(|modal| modal.as_ref().is_some_and(|m| m.is_visible()));
+    }
     let rect = |n: &Node| -> Option<(i32, i32, i32, i32)> {
         let native = n.mounted();
         let native = native.borrow();
@@ -449,6 +475,13 @@ fn in_sight_uncached(node: &Rc<Node>) -> bool {
     }
     let mut at = node.parent_node.borrow().upgrade();
     while let Some(ancestor) = at {
+        if ancestor.kind == nsh_core::ViewKind::Modal {
+            return ancestor
+                .modal
+                .try_borrow()
+                .ok()
+                .is_some_and(|modal| modal.as_ref().is_some_and(|m| m.is_visible()));
+        }
         let clips = ancestor.id == nsh_core::ROOT_ID || ancestor.scroll.borrow().is_some();
         if clips
             && let Some(r) = rect(&ancestor)

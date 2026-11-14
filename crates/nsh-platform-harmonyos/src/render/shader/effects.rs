@@ -74,6 +74,7 @@ pub(super) struct Effects {
     held: RefCell<HeldViews>,
     capture_nodes: RefCell<FxHashMap<NodeId, Weak<Node>>>,
     capable_nodes: RefCell<FxHashMap<NodeId, (Weak<Node>, f32)>>,
+    modal_hosts: RefCell<FxHashMap<NodeId, (Weak<Node>, f32)>>,
     screen_effect_owners: RefCell<FxHashMap<NodeId, Weak<Node>>>,
     screen_scopes: RefCell<FxHashMap<NodeId, Weak<Node>>>,
     root_max_overflow: Cell<f32>,
@@ -147,12 +148,75 @@ impl Effects {
             .capable_nodes
             .borrow()
             .get(&id)
-            .map_or(0.0, |&(_, overflow)| overflow);
+            .map_or(0.0, |&(_, overflow)| overflow)
+            .max(
+                self.modal_hosts
+                    .borrow()
+                    .get(&id)
+                    .map_or(0.0, |&(_, overflow)| overflow),
+            );
         if id == nsh_core::ROOT_ID {
             own.max(self.root_max_overflow.get())
         } else {
             own
         }
+    }
+
+    fn modal_node_keep_alive(
+        &self,
+        node: &Rc<Node>,
+        retainable: bool,
+        reduce_motion: bool,
+    ) -> bool {
+        let node_hidden = node.style.borrow().hidden;
+        let has_navigation_shader = node.navigation_shader.borrow().is_some();
+        let modal_visible = node
+            .modal
+            .try_borrow()
+            .ok()
+            .is_some_and(|modal| modal.as_ref().is_some_and(|m| m.is_visible()));
+        super::navigation::modal_host_keep_alive(super::navigation::ModalHostInputs {
+            retainable,
+            reduce_motion,
+            node_active: node.active.get(),
+            node_retained: node.retained.get(),
+            node_hidden,
+            modal_visible,
+            has_navigation_shader,
+        })
+    }
+
+    fn drop_modal_host_keep_alive(&self, id: NodeId) {
+        self.modal_hosts.borrow_mut().remove(&id);
+        self.keep_alive_active.borrow_mut().remove(&id);
+    }
+
+    pub(super) fn finish_modal_close(&self, owner: &Rc<Node>, had_shader: bool) -> Result<()> {
+        let removed_host = self.modal_hosts.borrow_mut().remove(&owner.id).is_some();
+        let removed_keep = self
+            .keep_alive_active
+            .borrow_mut()
+            .remove(&owner.id)
+            .unwrap_or(false);
+        let detaches_view = had_shader
+            && !self.held.borrow().is_held(owner.id)
+            && self
+                .views
+                .borrow()
+                .get(&owner.id)
+                .is_some_and(|state| state.navigation.is_some());
+        if had_shader {
+            self.end_navigation(owner.id)?;
+        }
+        if (removed_host || removed_keep) && !detaches_view && owner.active.get() {
+            owner.invalidate_composites();
+            if let Some(scene) = owner.scene.borrow().as_ref() {
+                scene.require(owner);
+            }
+            owner.ensure_wrapper()?;
+            owner.restore_style()?;
+        }
+        Ok(())
     }
 
     pub(super) fn has_navigation_layer(&self, target_id: NodeId) -> bool {
@@ -224,6 +288,21 @@ impl Effects {
             });
         }
 
+        let mut modal_list = Vec::new();
+        {
+            let mut modals = self.modal_hosts.borrow_mut();
+            modals.retain(|&id, (weak, _)| {
+                let Some(node) = weak.upgrade() else {
+                    return false;
+                };
+                if !node.active.get() || node.retained.get() {
+                    return false;
+                }
+                modal_list.push((id, node));
+                true
+            });
+        }
+
         let has_screen_views = self.views.borrow().values().any(|state| {
             state.navigation.is_none()
                 && matches!(
@@ -266,6 +345,33 @@ impl Effects {
                     || has_screen_scope
                     || root_capable);
             desired.insert(root.id, (root.clone(), root_keep));
+        }
+
+        let reduce_motion = root_node
+            .as_ref()
+            .is_some_and(|root| root.platform.get().reduce_motion);
+        let mut pruned_modals = Vec::new();
+        for (id, node) in modal_list {
+            let modal_keep = self.modal_node_keep_alive(&node, retainable, reduce_motion);
+            let has_navigation_shader = node.navigation_shader.borrow().is_some();
+            let modal_visible = node
+                .modal
+                .try_borrow()
+                .ok()
+                .is_some_and(|modal| modal.as_ref().is_some_and(|m| m.is_visible()));
+            if !modal_visible || !has_navigation_shader {
+                pruned_modals.push(id);
+            }
+            desired
+                .entry(id)
+                .and_modify(|entry| entry.1 |= modal_keep)
+                .or_insert((node, modal_keep));
+        }
+        if !pruned_modals.is_empty() {
+            let mut modals = self.modal_hosts.borrow_mut();
+            for id in pruned_modals {
+                modals.remove(&id);
+            }
         }
 
         let mut to_refresh: Vec<Rc<Node>> = Vec::new();
@@ -489,6 +595,9 @@ impl Effects {
             })
             .collect();
         for (id, owner) in nav_owners {
+            if reason != "background" {
+                self.drop_modal_host_keep_alive(id);
+            }
             self.detach_view(id)?;
             if let Some(owner) = owner {
                 owner.animator.track(&owner);
@@ -628,6 +737,21 @@ impl Effects {
                 entry.1 = entry.1.max(overflow);
             }
             if self.hosts_retainable() && unhidden_chain(owner) && unhidden_chain(target) {
+                self.keep_alive_active.borrow_mut().insert(target.id, true);
+            }
+        } else if target.kind == ViewKind::Modal {
+            let overflow = layer.overflow.0.max(0.0);
+            {
+                let mut modals = self.modal_hosts.borrow_mut();
+                let entry = modals
+                    .entry(target.id)
+                    .or_insert_with(|| (Rc::downgrade(target), 0.0));
+                entry.0 = Rc::downgrade(target);
+                entry.1 = entry.1.max(overflow);
+            }
+            let retainable = self.hosts_retainable();
+            let reduce_motion = target.platform.get().reduce_motion;
+            if self.modal_node_keep_alive(target, retainable, reduce_motion) {
                 self.keep_alive_active.borrow_mut().insert(target.id, true);
             }
         }
@@ -802,6 +926,7 @@ impl Effects {
     }
 
     pub(super) fn remove(&self, id: NodeId) -> Result<()> {
+        self.drop_modal_host_keep_alive(id);
         let mut removed_pending = Vec::new();
         {
             let mut pending = self.pending.borrow_mut();
@@ -1174,6 +1299,7 @@ impl Effects {
                     });
                 }
                 if !started {
+                    self.drop_modal_host_keep_alive(owner.id);
                     self.detach_view(owner.id)?;
                     pending.navigation.mark_fallback(key);
                     owner.animator.track(&owner);
@@ -1208,6 +1334,7 @@ impl Effects {
                             })
                     };
                     if let Some(owner) = running_owner {
+                        self.drop_modal_host_keep_alive(key.owner);
                         self.detach_view(key.owner)?;
                         if let Some(owner) = owner {
                             owner.animator.track(&owner);
@@ -1367,6 +1494,7 @@ impl Effects {
         let keep_hosts: Vec<Rc<Node>> = {
             let root = self.root.borrow().upgrade();
             let capable = self.capable_nodes.borrow();
+            let modals = self.modal_hosts.borrow();
             self.keep_alive_active
                 .borrow()
                 .iter()
@@ -1375,14 +1503,26 @@ impl Effects {
                     if id == nsh_core::ROOT_ID {
                         root.clone()
                     } else {
-                        capable.get(&id).and_then(|(weak, _)| weak.upgrade())
+                        capable
+                            .get(&id)
+                            .or_else(|| modals.get(&id))
+                            .and_then(|(weak, _)| weak.upgrade())
                     }
                 })
                 .filter(|node| node.active.get())
                 .collect()
         };
         for host in keep_hosts {
-            let shown = super::in_sight(&host);
+            let shown = if host.kind == ViewKind::Modal {
+                !host.style.borrow().hidden
+                    && host
+                        .modal
+                        .try_borrow()
+                        .ok()
+                        .is_some_and(|modal| modal.as_ref().is_some_and(|m| m.is_visible()))
+            } else {
+                super::in_sight(&host)
+            };
             let entry = targets.entry(host.id).or_insert((host, false));
             entry.1 |= shown;
         }

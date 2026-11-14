@@ -300,10 +300,13 @@ impl Modal {
             owner.animator.request_frame();
             return Ok(());
         }
-        if self.shader.borrow_mut().take().is_some()
-            && let Some(owner) = self.owner.upgrade()
-        {
-            owner.shaders.end_navigation(owner.id)?;
+        let had_shader = self.shader.borrow_mut().take().is_some();
+        if let Some(owner) = self.owner.upgrade() {
+            if to == 0.0 {
+                owner.shaders.finish_modal_close(&owner, had_shader)?;
+            } else if had_shader {
+                owner.shaders.end_navigation(owner.id)?;
+            }
         }
         self.start_transition(to)
     }
@@ -322,7 +325,11 @@ impl Modal {
             if fallback {
                 self.shader.borrow_mut().take();
                 if let Some(owner) = self.owner.upgrade() {
-                    owner.shaders.end_navigation(owner.id)?;
+                    if backwards {
+                        owner.shaders.finish_modal_close(&owner, true)?;
+                    } else {
+                        owner.shaders.end_navigation(owner.id)?;
+                    }
                 }
                 if !backwards && self.progress.get() == 1.0 {
                     self.progress.set(0.0);
@@ -382,28 +389,29 @@ impl Modal {
         Ok(())
     }
     fn finish(&self, to: f32) -> Result<()> {
-        let shader = self.shader.borrow_mut().take();
-        if shader.is_some()
-            && let Some(owner) = self.owner.upgrade()
-        {
-            owner.shaders.end_navigation(owner.id)?;
-        }
+        let had_shader = self.shader.borrow_mut().take().is_some();
         self.transition.borrow_mut().take();
         self.progress.set(to);
         if to == 0.0 {
+            self.closing.set(false);
             self.show_emitted.set(false);
-            if self.shown.replace(false) {
+            let was_shown = self.shown.replace(false);
+            if was_shown {
                 self.dialog.borrow().close()?;
                 self.overlay.borrow_mut().take();
                 self.dialog.borrow().remove_content()?;
-                if let Some(owner) = self.owner.upgrade() {
-                    owner.presentation(1.0, 0.0)?;
+            }
+            if let Some(owner) = self.owner.upgrade() {
+                owner.shaders.finish_modal_close(&owner, had_shader)?;
+                owner.presentation(1.0, 0.0)?;
+                if was_shown {
                     owner.emit(EventKind::Dismiss, EventPayload::None);
                 }
-            } else if let Some(owner) = self.owner.upgrade() {
-                owner.presentation(1.0, 0.0)?;
             }
         } else {
+            if had_shader && let Some(owner) = self.owner.upgrade() {
+                owner.shaders.end_navigation(owner.id)?;
+            }
             self.paint()?;
             if !self.show_emitted.replace(true)
                 && let Some(owner) = self.owner.upgrade()
