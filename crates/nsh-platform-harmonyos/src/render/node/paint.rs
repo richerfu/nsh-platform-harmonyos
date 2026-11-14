@@ -237,6 +237,7 @@ impl Node {
             self.ensure_wrapper()?;
         }
         if !same_layout || !same_placement {
+            self.clear_drawn_export_target();
             self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         }
         self.set_events(self.interaction.mask())?;
@@ -276,6 +277,7 @@ impl Node {
         if let Some(layer) = self.shadow_layer.borrow().as_ref() {
             layer.invalidate()?;
         }
+        self.clear_drawn_export_target();
         for child in self.children.borrow().iter().filter_map(Weak::upgrade) {
             child.invalidate_subtree_paint()?;
         }
@@ -288,19 +290,6 @@ impl Node {
             if child.retained.get() {
                 child.invalidate_subtree_paint()?;
             }
-        }
-        Ok(())
-    }
-    pub(crate) fn repaint_subtree_now_and_schedule(&self, frames: u8) -> Result<()> {
-        self.invalidate_subtree_paint()?;
-        let Some(owner) = self.weak.upgrade() else {
-            return Ok(());
-        };
-        let Some(plan) = plan_schedule(&owner, frames) else {
-            return Ok(());
-        };
-        if commit_schedule(&owner, plan) {
-            Self::arm_subtree_paint(self.weak.clone());
         }
         Ok(())
     }
@@ -319,7 +308,7 @@ impl Node {
         }
         Ok(())
     }
-    fn post_subtree_frame_callback(
+    pub(super) fn post_subtree_frame_callback(
         owner: &Rc<Self>,
         callback_fn: impl Fn(u64, u32) + 'static,
     ) -> bool {
@@ -489,6 +478,8 @@ impl Node {
                 }
             }
             self.draw_selection(&canvas, true);
+            self.drawn_export_target
+                .set(self.recordable_export_target_id());
         }
     }
 }

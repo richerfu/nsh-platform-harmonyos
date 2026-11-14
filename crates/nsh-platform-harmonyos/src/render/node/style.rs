@@ -23,6 +23,7 @@ impl Node {
         self.native
             .borrow()
             .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+        self.clear_drawn_export_target();
         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         Ok(())
     }
@@ -80,6 +81,8 @@ impl Node {
                                 Size::new(frame.width, frame.height),
                                 node.scale.get(),
                             );
+                            node.drawn_outline_export_target
+                                .set(node.recordable_export_target_id());
                         }
                         Ok(())
                     })
@@ -88,6 +91,7 @@ impl Node {
         if self.style.borrow().effects != style.effects
             || self.style.borrow().outline != style.outline
         {
+            self.clear_drawn_export_target();
             self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         }
         let cursor_changed = self.style.borrow().cursor != style.cursor;
@@ -585,6 +589,7 @@ impl Node {
     }
     pub(crate) fn reset_text_tint(&self) -> Result<()> {
         if self.tint.take().is_some() {
+            self.clear_drawn_export_target();
             self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         }
         Ok(())
@@ -596,6 +601,7 @@ impl Node {
         if !self.active.get() {
             return Ok(());
         }
+        self.clear_drawn_export_target();
         let mut applied = self.applied.get();
         applied.visibility = -1;
         self.applied.set(applied);

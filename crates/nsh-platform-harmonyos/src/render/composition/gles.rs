@@ -177,10 +177,11 @@ impl Target {
     fn blit_rect(&self, picture: Picture, flip: bool, rect: [i32; 4]) -> Result<()> {
         let _current = self.gpu.context.enter()?;
         let gl = &self.gpu.gl;
+        let full_rect = rect == [0, 0, self.width as i32, self.height as i32];
         // SAFETY: source and destination textures are owned on this context and
-        // never alias; the temporary read framebuffer is detached before deletion.
+        // never alias; the shared read framebuffer detaches its texture after blit.
         unsafe {
-            let read = gl.create_framebuffer()?;
+            let read = self.gpu.blit_framebuffer();
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read));
             gl.framebuffer_texture_2d(
                 glow::READ_FRAMEBUFFER,
@@ -191,8 +192,10 @@ impl Target {
             );
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.framebuffer));
             gl.disable(glow::SCISSOR_TEST);
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
+            if !full_rect {
+                gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
             let (y0, y1) = if flip {
                 (picture.2 as i32, 0)
             } else {
@@ -210,7 +213,13 @@ impl Target {
                 glow::COLOR_BUFFER_BIT,
                 glow::LINEAR,
             );
-            gl.delete_framebuffer(read);
+            gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                None,
+                0,
+            );
         }
         Ok(())
     }
@@ -250,6 +259,7 @@ impl Target {
                 // tree. Retry on the next VSync/created window; the logical shader
                 // remains visible. Clear only the failed window operation's GL
                 // errors so another layer does not inherit its OUT_OF_MEMORY flag.
+                window.on_present_unavailable();
                 let _current = self.gpu.context.enter()?;
                 // SAFETY: the surface's shared GLES context is current here.
                 unsafe { while self.gpu.gl.get_error() != glow::NO_ERROR {} }
@@ -874,6 +884,11 @@ impl Effects {
             return Ok(true);
         }
         Ok(false)
+    }
+    pub(super) fn clear_output(&mut self) {
+        self.shown = None;
+        self.direct_output = false;
+        self.output = None;
     }
     pub(super) fn output(&self) -> Option<&Target> {
         if self.direct_output {

@@ -127,6 +127,7 @@ impl Node {
             self.selection.invalidate_menu();
             self.selection.handles.set([false; 2]);
             *self.selection.geometry.borrow_mut() = Default::default();
+            self.clear_drawn_export_target();
             self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         }
         Ok(())
@@ -170,6 +171,7 @@ impl Node {
         }
         self.selection.invalidate_menu();
         self.selection.range.set(Some((range.start, range.end)));
+        self.clear_drawn_export_target();
         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         Ok(())
     }

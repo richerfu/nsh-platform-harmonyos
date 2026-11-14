@@ -57,6 +57,8 @@ struct State {
     settings: Settings,
     screen_origin: Option<(i32, i32)>,
     output: Option<Output>,
+    published_geom: Option<(u32, u32, u32, u32)>,
+    ui_revealed: bool,
     presented: bool,
     surface: Option<std::result::Result<u64, String>>,
     closed: bool,
@@ -65,6 +67,7 @@ struct Shared {
     released: AtomicBool,
     active: AtomicBool,
     frozen: AtomicBool,
+    awaiting_origin: AtomicBool,
     state: Mutex<State>,
     queued: AtomicBool,
     posted: AtomicBool,
@@ -569,6 +572,7 @@ impl Worker {
                                 vote.update(false);
                                 continue;
                             }
+                            let was_animating = entry.shared.animating.load(Ordering::Acquire);
                             let settings = entry.shared.state.lock().unwrap().settings.clone();
                             let result =
                                 check_pixels(&entries, key, settings.pixels()).and_then(|()| {
@@ -580,6 +584,7 @@ impl Worker {
                                 Err(error) => {
                                     let entry = entries[key.slot()].as_mut().unwrap();
                                     entry.shared.animating.store(false, Ordering::Release);
+                                    entry.shared.awaiting_origin.store(false, Ordering::Release);
                                     if let Some(navigation) = entry.navigation.take()
                                         && !navigation.complete
                                         && let Some(route) = &upgraded
@@ -615,9 +620,12 @@ impl Worker {
                                 entries[key.slot()].as_mut().unwrap().completed.take();
                             if let Some(route) = &upgraded {
                                 let shared = &entries[key.slot()].as_ref().unwrap().shared;
+                                let started_animating =
+                                    !was_animating && shared.animating.load(Ordering::Acquire);
                                 let publish = {
                                     let state = shared.state.lock().unwrap();
-                                    !state.settings.scene && state.output.is_some()
+                                    !state.settings.scene
+                                        && (state.output.is_some() || started_animating)
                                 };
                                 if publish && !shared.posted.swap(true, Ordering::AcqRel) {
                                     route.send(Message::Composite {
@@ -760,6 +768,17 @@ impl Worker {
                                         ));
                                     }
                                 } else {
+                                    let need_origin = entry
+                                        .shared
+                                        .state
+                                        .lock()
+                                        .unwrap()
+                                        .screen_origin
+                                        .is_none();
+                                    entry
+                                        .shared
+                                        .awaiting_origin
+                                        .store(need_origin, Ordering::Release);
                                     if let Some(old) = entry.navigation.replace(request)
                                         && !old.complete
                                         && let Some(route) = route.upgrade()
@@ -800,6 +819,9 @@ impl Worker {
                                             entry.window = Some(next);
                                             entry.window_dirty = true;
                                             entry.window_retry.on_window_attached();
+                                            let mut state = entry.shared.state.lock().unwrap();
+                                            state.ui_revealed = false;
+                                            state.published_geom = None;
                                         }
                                         Err(error) => {
                                             entry.window_dirty = true;
@@ -828,6 +850,9 @@ impl Worker {
                                 .filter(|entry| entry.key == key)
                             {
                                 entry.window = None;
+                                let mut state = entry.shared.state.lock().unwrap();
+                                state.ui_revealed = false;
+                                state.published_geom = None;
                             }
                             released.store(true, Ordering::Release);
                             if let Some(route) = route.upgrade() {
@@ -845,6 +870,9 @@ impl Worker {
                                 && entry.window.as_ref().is_some_and(|w| w.raw() == raw)
                             {
                                 entry.window = None;
+                                let mut state = entry.shared.state.lock().unwrap();
+                                state.ui_revealed = false;
+                                state.published_geom = None;
                             }
                         }
                     }
@@ -1287,12 +1315,49 @@ impl Entry {
         }
         self.settings = settings;
         let direct = !self.settings.scene;
-        for _ in 0..4 {
-            if direct {
-                if !self.reader.update_texture().map_err(|e| e.to_string())? {
-                    break;
+        let x = -(self.settings.insets[0] as f32);
+        let y = -(self.settings.insets[1] as f32);
+        let passthrough = direct
+            && self.settings.filters.is_empty()
+            && self.settings.shaders.is_empty()
+            && self.navigation.is_none();
+        if passthrough {
+            self.scene_source = None;
+            self.scene_output = None;
+            self.shaders.clear_output();
+            self.shared.awaiting_origin.store(false, Ordering::Release);
+            if let Some(window) = &mut self.window {
+                match self
+                    .reader
+                    .present_passthrough(window, changed)
+                    .map_err(|e| e.to_string())?
+                {
+                    super::readback::PassthroughOutcome::Presented { width, height } => {
+                        self.shared.animating.store(false, Ordering::Release);
+                        self.record_gpu_output(width, height, x, y);
+                        return Ok(true);
+                    }
+                    super::readback::PassthroughOutcome::Deferred => {
+                        self.window_dirty = true;
+                        self.shared.animating.store(true, Ordering::Release);
+                        return Ok(false);
+                    }
+                    super::readback::PassthroughOutcome::Idle => {
+                        self.shared.animating.store(false, Ordering::Release);
+                        return Ok(false);
+                    }
                 }
-            } else {
+            }
+            let updated = self.reader.drain_oes(4).map_err(|e| e.to_string())?;
+            self.shared.animating.store(false, Ordering::Release);
+            return Ok(updated);
+        }
+        if direct {
+            if self.reader.drain_oes(4).map_err(|e| e.to_string())? {
+                changed = true;
+            }
+        } else {
+            for _ in 0..4 {
                 let Some(frame) = self.reader.read().map_err(|e| e.to_string())? else {
                     break;
                 };
@@ -1305,8 +1370,8 @@ impl Entry {
                 image.x = -(self.settings.insets[0] as f32);
                 image.y = -(self.settings.insets[1] as f32);
                 self.scene_source = Some(image);
+                changed = true;
             }
-            changed = true;
         }
         changed |= self.start_navigation()?;
         let pending_nav = self.navigation.as_ref().is_some_and(|nav| !nav.complete);
@@ -1314,10 +1379,8 @@ impl Entry {
             self.shared.animating.store(false, Ordering::Release);
             return Ok(false);
         }
-        let x = -(self.settings.insets[0] as f32);
-        let y = -(self.settings.insets[1] as f32);
         if direct {
-            let Some(source) = self.reader.texture() else {
+            let Some(source) = self.reader.ensure_texture().map_err(|e| e.to_string())? else {
                 self.shared
                     .animating
                     .store(self.shaders.wants_frame() || pending_nav, Ordering::Release);
@@ -1397,20 +1460,16 @@ impl Entry {
         if self.settings.scene {
             return Ok(None);
         }
-        for _ in 0..4 {
-            if !self
+        self.reader
+            .drain_oes(4)
+            .map_err(|error| error.to_string())?;
+        let picture = match self.shaders.output().map(super::gles::Target::picture) {
+            Some(output) => Some(output),
+            None => self
                 .reader
-                .update_texture()
-                .map_err(|error| error.to_string())?
-            {
-                break;
-            }
-        }
-        let picture = self
-            .shaders
-            .output()
-            .map(super::gles::Target::picture)
-            .or(self.reader.texture());
+                .ensure_texture()
+                .map_err(|error| error.to_string())?,
+        };
         let origin = self
             .shared
             .state
@@ -1431,15 +1490,20 @@ impl Entry {
     fn start_navigation(&mut self) -> std::result::Result<bool, String> {
         let coverage = self.coverage();
         let origin = self.shared.state.lock().unwrap().screen_origin;
-        let Some(origin) = origin else {
-            return Ok(false);
-        };
         let Some(navigation) = self.navigation.as_mut() else {
+            self.shared.awaiting_origin.store(false, Ordering::Release);
             return Ok(false);
         };
-        let Some(snapshot) = navigation.snapshot.take() else {
+        if navigation.snapshot.is_none() {
+            self.shared.awaiting_origin.store(false, Ordering::Release);
+            return Ok(false);
+        }
+        let Some(origin) = origin else {
+            self.shared.awaiting_origin.store(true, Ordering::Release);
             return Ok(false);
         };
+        self.shared.awaiting_origin.store(false, Ordering::Release);
+        let snapshot = navigation.snapshot.take().unwrap();
         let overflow = self
             .settings
             .shaders
@@ -1469,6 +1533,27 @@ impl Entry {
         )?;
         Ok(true)
     }
+    fn record_gpu_output(&self, width: u32, height: u32, x: f32, y: f32) {
+        let geom = (width, height, x.to_bits(), y.to_bits());
+        let mut state = self.shared.state.lock().unwrap();
+        state.presented = true;
+        if crate::render::subtree_paint::should_publish_gpu_output(
+            state.ui_revealed,
+            state.published_geom,
+            geom,
+        ) {
+            state.published_geom = Some(geom);
+            state.output = Some(Output {
+                frame: RgbaFrame {
+                    width,
+                    height,
+                    pixels: Vec::new(),
+                },
+                x,
+                y,
+            });
+        }
+    }
     fn publish_gpu(&mut self, repaint: bool, x: f32, y: f32) -> std::result::Result<bool, String> {
         let pending_nav = self.navigation.as_ref().is_some_and(|nav| !nav.complete);
         self.shared
@@ -1489,14 +1574,7 @@ impl Entry {
             return Ok(false);
         }
         let (_, width, height) = output.picture();
-        let frame = RgbaFrame {
-            width,
-            height,
-            pixels: Vec::new(),
-        };
-        let mut state = self.shared.state.lock().unwrap();
-        state.output = Some(Output { frame, x, y });
-        state.presented = true;
+        self.record_gpu_output(width, height, x, y);
         Ok(true)
     }
 }
@@ -1684,10 +1762,13 @@ impl Composite {
             released: AtomicBool::new(false),
             active: AtomicBool::new(true),
             frozen: AtomicBool::new(false),
+            awaiting_origin: AtomicBool::new(false),
             state: Mutex::new(State {
                 settings: initial_settings.clone(),
                 screen_origin: initial_origin,
                 output: None,
+                published_geom: None,
+                ui_revealed: false,
                 presented: false,
                 surface: None,
                 closed: false,
@@ -1922,6 +2003,7 @@ impl Composite {
         if let Some(layer) = self.presentation.borrow_mut().as_mut() {
             layer.hide();
         }
+        self.shared.state.lock().unwrap().ui_revealed = false;
     }
     pub(crate) fn ready(&self) -> (bool, bool) {
         let surface = self.shared.state.lock().unwrap().surface.take();
@@ -1961,7 +2043,9 @@ impl Composite {
                 };
                 match result {
                     Ok(revealed) => {
+                        let is_revealed = layer.is_revealed();
                         drop(presentation);
+                        self.shared.state.lock().unwrap().ui_revealed = is_revealed;
                         return (initialized, revealed);
                     }
                     Err(error) => log::warn!("shader frame presentation: {error}"),
@@ -1991,7 +2075,9 @@ impl Composite {
             if state.screen_origin != origin {
                 state.screen_origin = origin;
                 drop(state);
-                wake(&self.worker.send, self.key, &self.shared);
+                if self.shared.awaiting_origin.load(Ordering::Acquire) {
+                    wake(&self.worker.send, self.key, &self.shared);
+                }
             }
         }
         if let Some(layer) = self.presentation.borrow().as_ref() {

@@ -51,6 +51,9 @@ struct State {
     size: Option<(Size, f32)>,
     shown: Option<bool>,
     overflow: f32,
+    /// Latest uniform slot updates coalesced while `shown == Some(false)` so
+    /// off-screen looping uniform animations do not wake the compositor thread.
+    deferred_slots: Vec<(u16, AnimationValue)>,
 }
 
 /// A view's surface kept after it went, with the view's native node it is
@@ -209,12 +212,14 @@ impl Shaders {
                     size: None,
                     shown: None,
                     overflow,
+                    deferred_slots: Vec::new(),
                 },
             );
             owner.enable_layout();
         }
         if let Some(state) = self.views.borrow_mut().get_mut(&owner.id) {
             state.overflow = overflow;
+            state.deferred_slots.clear();
             state.surface.native.borrow().set_clip(overflow <= 0.0)?;
         }
         owner.invalidate_composites();
@@ -328,10 +333,14 @@ impl Shaders {
 
     pub(crate) fn slot(&self, id: NodeId, slot: u16, value: AnimationValue) {
         self.effects.slot(id, slot, value);
-        if let Some(state) = self.views.borrow().get(&id)
-            && let Some(worker) = self.worker.borrow().as_ref()
-        {
-            worker.fill(Command::Slot(state.key, slot, value));
+        if let Some(state) = self.views.borrow_mut().get_mut(&id) {
+            if state.shown == Some(false) {
+                coalesce_deferred_slot(&mut state.deferred_slots, slot, value);
+                return;
+            }
+            if let Some(worker) = self.worker.borrow().as_ref() {
+                worker.fill(Command::Slot(state.key, slot, value));
+            }
         }
     }
 
@@ -352,6 +361,11 @@ impl Shaders {
             let shown = in_sight(&owner);
             if state.shown != Some(shown) {
                 state.shown = Some(shown);
+                if shown {
+                    for (slot, value) in state.deferred_slots.drain(..) {
+                        worker.fill(Command::Slot(state.key, slot, value));
+                    }
+                }
                 worker.fill(Command::Shown(state.key, shown));
             }
             let frame = owner.frame.get();
@@ -434,6 +448,40 @@ impl Shaders {
             }
         }
         Ok(())
+    }
+}
+
+fn coalesce_deferred_slot(
+    deferred: &mut Vec<(u16, AnimationValue)>,
+    slot: u16,
+    value: AnimationValue,
+) {
+    if let Some((_, existing)) = deferred.iter_mut().find(|(s, _)| *s == slot) {
+        *existing = value;
+    } else {
+        deferred.push((slot, value));
+    }
+}
+
+#[cfg(test)]
+mod slot_coalesce_tests {
+    use nsh_core::animation::AnimationValue;
+
+    use super::coalesce_deferred_slot;
+
+    #[test]
+    fn offscreen_slot_updates_coalesce_in_place_per_slot_index() {
+        let mut deferred = Vec::new();
+        coalesce_deferred_slot(&mut deferred, 1, AnimationValue::Number(0.2));
+        coalesce_deferred_slot(&mut deferred, 3, AnimationValue::Number(0.5));
+        coalesce_deferred_slot(&mut deferred, 1, AnimationValue::Number(0.9));
+        assert_eq!(
+            deferred,
+            vec![
+                (1, AnimationValue::Number(0.9)),
+                (3, AnimationValue::Number(0.5)),
+            ]
+        );
     }
 }
 

@@ -178,6 +178,7 @@ impl CanvasView {
             return Ok(());
         }
         if let Some(owner) = self.owner.upgrade() {
+            owner.clear_drawn_export_target();
             owner
                 .native
                 .borrow()

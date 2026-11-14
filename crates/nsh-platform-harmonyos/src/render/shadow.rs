@@ -38,6 +38,7 @@ struct PaintKey {
 pub(crate) struct ShadowLayer {
     native: NativeNode,
     bounds: Cell<PaintBounds>,
+    drawn_export_target: Cell<u32>,
     key: RefCell<Option<PaintKey>>,
 }
 impl ShadowLayer {
@@ -46,6 +47,7 @@ impl ShadowLayer {
         let layer = Rc::new(Self {
             native,
             bounds: Cell::default(),
+            drawn_export_target: Cell::new(0),
             key: RefCell::default(),
         });
         let setup = || -> Result<()> {
@@ -89,6 +91,9 @@ impl ShadowLayer {
                         canvas.translate(-b.x as f32, -b.y as f32);
                         owner.draw_outer_shadows(&canvas);
                         canvas.restore();
+                        layer
+                            .drawn_export_target
+                            .set(owner.recordable_export_target_id());
                     }
                 }
                 Ok(())
@@ -143,6 +148,7 @@ impl ShadowLayer {
                 .borrow()
                 .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
         }
+        self.drawn_export_target.set(0);
         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         *self.key.borrow_mut() = Some(next);
         Ok(())
@@ -156,8 +162,32 @@ impl ShadowLayer {
         event.layout_child(&self.native.borrow(), b.x, b.y)?;
         Ok(())
     }
+    pub(crate) fn clear_drawn_export_target(&self) {
+        self.drawn_export_target.set(0);
+    }
     pub(crate) fn invalidate(&self) -> Result<()> {
+        self.drawn_export_target.set(0);
         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         Ok(())
+    }
+    pub(crate) fn invalidate_if_unrecorded(&self, target_id: u32) -> Result<bool> {
+        let b = self.bounds.get();
+        if target_id == 0
+            || b.width <= 0
+            || b.height <= 0
+            || self.drawn_export_target.get() == target_id
+        {
+            return Ok(false);
+        }
+        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        Ok(true)
+    }
+    pub(crate) fn outset_points(&self, scale: f32) -> f32 {
+        let b = self.bounds.get();
+        if b.width <= 0 || b.height <= 0 {
+            return 0.0;
+        }
+        let s = scale.max(0.01);
+        ((-b.x).max(0).max((-b.y).max(0)) as f32) / s
     }
 }

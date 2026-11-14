@@ -137,6 +137,76 @@ pub(crate) fn step_frame<N: SubtreePaintNode>(node: &N, frame_id: (u64, u64)) ->
     }
 }
 
+/// Lookahead margin (in logical points) around a scroll viewport when checking
+/// for incoming unrecorded custom-draw nodes during flings.
+pub(crate) const SCROLL_EXPORT_LOOKAHEAD_PT: f32 = 96.0;
+
+#[inline]
+pub(crate) fn needs_custom_export_record(
+    has_custom_paint: bool,
+    drawn_target_id: u32,
+    active_target_id: u32,
+) -> bool {
+    active_target_id != 0 && has_custom_paint && drawn_target_id != active_target_id
+}
+
+#[inline]
+pub(crate) fn rect_intersects_viewport(rect: [f32; 4], viewport: [f32; 4]) -> bool {
+    rect[2] > viewport[0] && rect[0] < viewport[2] && rect[3] > viewport[1] && rect[1] < viewport[3]
+}
+
+#[inline]
+pub(crate) fn scroll_viewport_rect(
+    offset: (f32, f32),
+    viewport_size: (f32, f32),
+    margin: f32,
+) -> Option<[f32; 4]> {
+    if viewport_size.0 <= 0.0 || viewport_size.1 <= 0.0 {
+        return None;
+    }
+    let m = margin.max(0.0);
+    Some([
+        offset.0 - m,
+        offset.1 - m,
+        offset.0 + viewport_size.0 + m,
+        offset.1 + viewport_size.1 + m,
+    ])
+}
+
+#[inline]
+pub(crate) fn is_rect_unclipped_in_scroll(
+    own: (i32, i32, i32, i32),
+    scroll: (i32, i32, i32, i32),
+    tolerance_px: i32,
+) -> bool {
+    let own_w = own.2 - own.0;
+    let own_h = own.3 - own.1;
+    let scr_w = scroll.2 - scroll.0;
+    let scr_h = scroll.3 - scroll.1;
+    if own_w <= 0 || own_h <= 0 || scr_w <= 0 || scr_h <= 0 {
+        return false;
+    }
+    if own.0 >= scroll.2 || own.2 <= scroll.0 || own.1 >= scroll.3 || own.3 <= scroll.1 {
+        return false;
+    }
+    let tol = tolerance_px.max(0);
+    own_w <= scr_w
+        && own_h <= scr_h
+        && own.0 >= scroll.0 - tol
+        && own.2 <= scroll.2 + tol
+        && own.1 >= scroll.1 - tol
+        && own.3 <= scroll.3 + tol
+}
+
+#[inline]
+pub(crate) fn should_publish_gpu_output(
+    ui_revealed: bool,
+    previous_geom: Option<(u32, u32, u32, u32)>,
+    next_geom: (u32, u32, u32, u32),
+) -> bool {
+    !ui_revealed || previous_geom != Some(next_geom)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -413,5 +483,61 @@ mod tests {
             assert_eq!(harness.run_frame(false).0, 1);
         }
         assert_eq!(harness.run_frame(false), (0, 0));
+    }
+
+    #[test]
+    fn custom_export_record_only_marks_unrecorded_or_changed_targets() {
+        assert!(!needs_custom_export_record(false, 0, 7));
+        assert!(!needs_custom_export_record(true, 0, 0));
+        assert!(needs_custom_export_record(true, 0, 7));
+        assert!(!needs_custom_export_record(true, 7, 7));
+        // Replacing the export attachment (target 7 -> 8) automatically re-arms recording.
+        assert!(needs_custom_export_record(true, 7, 8));
+    }
+
+    #[test]
+    fn scroll_viewport_rect_expands_by_lookahead_and_rejects_empty_viewport() {
+        assert_eq!(scroll_viewport_rect((0.0, 120.0), (0.0, 800.0), 96.0), None);
+        assert_eq!(scroll_viewport_rect((0.0, 120.0), (420.0, 0.0), 96.0), None);
+        let vp = scroll_viewport_rect((0.0, 300.0), (420.0, 892.0), SCROLL_EXPORT_LOOKAHEAD_PT)
+            .expect("non-empty viewport");
+        assert_eq!(vp, [-96.0, 204.0, 516.0, 1288.0]);
+        assert!(!rect_intersects_viewport([16.0, 1400.0, 404.0, 1600.0], vp));
+        assert!(rect_intersects_viewport([16.0, 1260.0, 404.0, 1460.0], vp));
+    }
+
+    #[test]
+    fn gpu_output_notifies_ui_only_until_revealed_or_when_geometry_changes() {
+        let g1 = (1260, 2769, 0.0_f32.to_bits(), 0.0_f32.to_bits());
+        let g2 = (1260, 2769, (-12.0_f32).to_bits(), 0.0_f32.to_bits());
+        assert!(should_publish_gpu_output(false, None, g1));
+        assert!(should_publish_gpu_output(false, Some(g1), g1));
+        assert!(!should_publish_gpu_output(true, Some(g1), g1));
+        assert!(should_publish_gpu_output(true, Some(g1), g2));
+    }
+
+    #[test]
+    fn unclipped_scroll_check_rejects_offscreen_and_partially_clipped_nodes() {
+        let scroll = (0, 240, 1260, 2640);
+        // Completely inside scroll viewport:
+        assert!(is_rect_unclipped_in_scroll((104, 560, 420, 620), scroll, 2));
+        // Off-screen below the fold:
+        assert!(!is_rect_unclipped_in_scroll(
+            (104, 2700, 420, 2760),
+            scroll,
+            2
+        ));
+        // Partially peeking across the bottom fold:
+        assert!(!is_rect_unclipped_in_scroll(
+            (104, 2610, 420, 2680),
+            scroll,
+            2
+        ));
+        // Rounding tolerance within 2px at edge:
+        assert!(is_rect_unclipped_in_scroll(
+            (104, 2580, 420, 2642),
+            scroll,
+            2
+        ));
     }
 }

@@ -753,8 +753,43 @@ impl Scroller {
     }
     /// Under `RenderType.RENDER_TYPE_TEXTURE`, ArkUI culls `on_custom_draw` for
     /// custom nodes outside the scroll viewport while clearing `NeedRender`.
-    /// Re-mark custom-draw descendants as the scroll viewport moves so newly
-    /// revealed text and canvas nodes record into their exported `RSCanvasNode`s.
+    /// Mark only newly exposed custom-draw descendants that have not yet
+    /// recorded into `target_id`, avoiding full-subtree repaints each frame.
+    pub(crate) fn export_content_viewports(&self) -> (Option<[f32; 4]>, Option<[f32; 4]>) {
+        let offset = self
+            .read_native_offset()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.offset.get());
+        self.export_content_viewports_for(offset)
+    }
+    fn export_content_viewports_for(
+        &self,
+        offset: (f32, f32),
+    ) -> (Option<[f32; 4]>, Option<[f32; 4]>) {
+        let zoom = self.zoom.get().max(0.01);
+        let viewport = self.viewport_size.get();
+        let inset = self.behavior.borrow().content_inset;
+        let content_offset = (
+            (offset.0 + inset.left.0) / zoom,
+            (offset.1 + inset.top.0) / zoom,
+        );
+        let content_viewport = (
+            (viewport.width - inset.left.0 - inset.right.0).max(0.0) / zoom,
+            (viewport.height - inset.top.0 - inset.bottom.0).max(0.0) / zoom,
+        );
+        let strict_vp = crate::render::node::export_paint::scroll_viewport_rect(
+            content_offset,
+            content_viewport,
+            0.0,
+        );
+        let mark_vp = crate::render::node::export_paint::scroll_viewport_rect(
+            content_offset,
+            content_viewport,
+            crate::render::node::export_paint::SCROLL_EXPORT_LOOKAHEAD_PT,
+        );
+        (strict_vp, mark_vp)
+    }
     fn invalidate_exported_scroll(&self, force: bool) -> Result<()> {
         let Some(owner) = self.owner.upgrade() else {
             self.export_paint_offset.set(None);
@@ -767,16 +802,21 @@ impl Scroller {
         let offset = self
             .read_native_offset()?
             .unwrap_or_else(|| self.offset.get());
-        let should_repaint = match self.export_paint_offset.get() {
+        let should_check = match self.export_paint_offset.get() {
             Some((prev_target, px, py)) if prev_target == target_id && !force => {
-                (offset.0 - px).abs() >= 0.5 || (offset.1 - py).abs() >= 0.5
+                (offset.0 - px).abs() >= 2.0 || (offset.1 - py).abs() >= 2.0
             }
             _ => true,
         };
-        if should_repaint {
+        if should_check {
             self.export_paint_offset
                 .set(Some((target_id, offset.0, offset.1)));
-            owner.repaint_subtree_now_and_schedule(2)?;
+            let (strict_vp, mark_vp) = self.export_content_viewports_for(offset);
+            let marked =
+                owner.invalidate_unrecorded_scroller_export_paint(target_id, strict_vp, mark_vp)?;
+            if marked > 0 || force {
+                owner.schedule_unrecorded_export_check(target_id, 2);
+            }
         }
         Ok(())
     }

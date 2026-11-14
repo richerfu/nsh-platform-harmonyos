@@ -1,6 +1,7 @@
 //! Main-thread ArkUI nodes. Callbacks hold weak references; the mounter owns
 //! the nodes through detachment and frame-delayed retirement.
 
+pub(crate) mod export_paint;
 mod layout;
 mod lifecycle;
 mod motion;
@@ -158,6 +159,9 @@ pub(crate) struct Node {
     layout_callbacks: Cell<bool>,
     drawing: Cell<bool>,
     outlined: Cell<bool>,
+    drawn_export_target: Cell<u32>,
+    drawn_outline_export_target: Cell<u32>,
+    unrecorded_check_state: Cell<(u32, u8)>,
     shadow_layer: RefCell<Option<Rc<super::shadow::ShadowLayer>>>,
     pub(crate) text_drawing: RefCell<Option<crate::text::typography::TextDrawing>>,
     pub(crate) selection_area: RefCell<Option<crate::text::selection::area::Area>>,

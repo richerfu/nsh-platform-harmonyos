@@ -166,6 +166,7 @@ impl Node {
             live.step(now, self.frame.get(), &mut self.style.borrow_mut())
         };
         if live.recolor {
+            self.clear_drawn_export_target();
             self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
             self.invalidate_scene();
         }
@@ -185,6 +186,7 @@ impl Node {
                 owner.ensure_wrapper()?;
             }
             self.restore_style()?;
+            self.clear_drawn_export_target();
             self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         } else {
             let style = self.style.borrow();
@@ -261,6 +263,7 @@ impl Node {
                 P::Color => {
                     let color = Some(crate::render::animation::color(*value));
                     if self.tint.replace(color) != color {
+                        self.clear_drawn_export_target();
                         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
                     }
                 }
