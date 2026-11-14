@@ -160,6 +160,10 @@ impl Mounter {
             node.composite_ready(generation)?;
             if id == nsh_core::ROOT_ID {
                 self.shaders.reveal()?;
+            } else if let Some(Some(root)) = self.slots.get(nsh_core::ROOT_ID as usize)
+                && root.composite_dirty.get()
+            {
+                Self::attribute(root.update_wrapper());
             }
             if let Some(modal) = node.modal.borrow().as_ref() {
                 modal.refresh_presentation()?;

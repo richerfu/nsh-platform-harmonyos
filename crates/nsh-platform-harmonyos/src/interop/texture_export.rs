@@ -47,6 +47,10 @@ struct Hidden {
 }
 
 impl Export {
+    pub(crate) fn is_repairing(&self) -> bool {
+        !self.hidden.borrow().is_empty()
+    }
+
     pub(crate) fn prepare(&self, owner: &Rc<Node>, inner: &NativeNode) -> Result<()> {
         if !self.enabled.get() {
             return Ok(());
@@ -94,6 +98,9 @@ impl Export {
             .get(&(Rc::as_ptr(native) as usize))
             .and_then(Weak::upgrade);
         if let Some(owner) = &owner {
+            if owner.clearing_export.get() {
+                return Ok(());
+            }
             if owner.export_hidden() {
                 return self.hide(&owner.visual_node(), Some(owner), None);
             }
@@ -132,11 +139,6 @@ impl Export {
             owner.export_repair.set(owner.export_repair.get() + 1);
         }
         self.hidden.borrow_mut().push(hidden);
-        // Pulse through MIN_POSITIVE first so ArkUI dirties RSNode::SetAlpha(0.0)
-        // even when FrameNode's Opacity attribute was already 0.0 before Visibility
-        // switches to Visible across SetTextureExport tree rebuilds.
-        node.opacity(f32::MIN_POSITIVE)?;
-        node.opacity(0.0)?;
         node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
         node.set_i32_attribute(
             A::AccessibilityMode,
@@ -144,15 +146,52 @@ impl Export {
         )?;
         node.set_i32_attribute(A::Focusable, 0)?;
         node.set_i32_attribute(A::Visibility, 0)?;
+        // Keep MIN_POSITIVE (1.175e-38 == 0 in compositor alpha) rather than
+        // overwriting back to 0.0 in the same turn, so ArkUI's property diff
+        // always flushes RSNode::SetAlpha when Visibility transitions to Visible.
+        node.opacity(f32::MIN_POSITIVE)?;
         Ok(())
     }
 
-    pub(crate) fn after_attach(self: &Rc<Self>, inner: &NativeNode) -> Result<()> {
+    pub(crate) fn after_attach(
+        self: &Rc<Self>,
+        callback_host: &NativeNode,
+        inner: &NativeNode,
+    ) -> Result<()> {
         if self.hidden.borrow().is_empty() {
             return Ok(());
         }
+        for hidden in self.hidden.borrow().iter() {
+            if let Some(owner) = hidden.owner.as_ref().and_then(Weak::upgrade) {
+                owner.invalidate_applied_transform();
+                let _ = owner.transform(&owner.style.borrow(), |_| None);
+            }
+            if let Some(native) = hidden.native.upgrade()
+                && native.borrow().is_owned()
+            {
+                let node = native.borrow();
+                node.set_i32_attribute(A::Visibility, 0)?;
+                node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
+                node.set_i32_attribute(
+                    A::AccessibilityMode,
+                    AccessibilityMode::DisabledForDescendants.into(),
+                )?;
+                node.set_i32_attribute(A::Focusable, 0)?;
+                node.opacity(0.0)?;
+                node.opacity(f32::MIN_POSITIVE)?;
+            }
+        }
+        if inner.borrow().is_owned() {
+            let _ = inner.borrow().mark_dirty(NodeDirtyFlag::NeedRender);
+        }
         let epoch = self.epoch.get();
-        let result = Self::defer_restore(Rc::downgrade(self), Rc::downgrade(inner), epoch, 3);
+        let result = Self::defer_restore(
+            Rc::downgrade(self),
+            Rc::downgrade(callback_host),
+            Rc::downgrade(inner),
+            epoch,
+            3,
+        );
         if result.is_err() {
             self.restore();
         }
@@ -161,11 +200,12 @@ impl Export {
 
     fn defer_restore(
         repair: Weak<Self>,
-        native: Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
+        callback_host: Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
+        inner: Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
         epoch: u64,
         remaining: u8,
     ) -> Result<()> {
-        let Some(node) = native.upgrade() else {
+        let Some(host_node) = callback_host.upgrade().or_else(|| inner.upgrade()) else {
             if let Some(repair) = repair.upgrade()
                 && repair.epoch.get() == epoch
             {
@@ -174,7 +214,8 @@ impl Export {
             return Ok(());
         };
         let repair_for_wake = repair.clone();
-        node.borrow().post_frame_callback_dirty(move |_, _| {
+        let inner_for_wake = inner.clone();
+        host_node.borrow().post_frame_callback_dirty(move |_, _| {
             let Some(current) = repair.upgrade() else {
                 return;
             };
@@ -212,15 +253,19 @@ impl Export {
             for hidden in released {
                 Self::restore_one(hidden);
             }
+            let tick_alpha = if remaining & 1 == 1 {
+                0.0
+            } else {
+                f32::MIN_POSITIVE
+            };
             for hidden in current.hidden.borrow().iter() {
                 if let Some(native) = hidden.native.upgrade()
                     && native.borrow().is_owned()
                 {
                     callback(|| {
                         let node = native.borrow();
-                        node.opacity(f32::MIN_POSITIVE)?;
-                        node.opacity(0.0)?;
                         node.set_i32_attribute(A::Visibility, 0)?;
+                        node.opacity(tick_alpha)?;
                         node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
                         node.set_i32_attribute(
                             A::AccessibilityMode,
@@ -231,10 +276,16 @@ impl Export {
                     });
                 }
             }
-            if Self::defer_restore(repair, native, epoch, remaining - 1).is_err() {
+            if Self::defer_restore(repair, callback_host, inner, epoch, remaining - 1).is_err() {
                 current.restore();
             }
         })?;
+        if let Some(inner_node) = inner_for_wake.upgrade()
+            && let Ok(inner_ref) = inner_node.try_borrow()
+            && inner_ref.is_owned()
+        {
+            let _ = inner_ref.mark_dirty(NodeDirtyFlag::NeedRender);
+        }
         if let Some(current) = repair_for_wake.upgrade()
             && let Some(viewport) = current.viewport.borrow().upgrade()
             && let Ok(vp) = viewport.try_borrow()

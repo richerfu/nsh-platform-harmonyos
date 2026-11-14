@@ -442,7 +442,10 @@ impl State {
                 }
             }
             Message::Back => {
-                self.mounter.as_mut().unwrap().back()?;
+                let mounter = self.mounter.as_mut().unwrap();
+                mounter.back()?;
+                mounter.flush_arkui()?;
+                self.request_frame()?;
             }
             Message::UpdateBack => {}
             Message::DismissKeyboard => {
@@ -467,7 +470,10 @@ impl State {
                 report_only,
             )?,
             Message::ReconcileNavigation => {
-                self.mounter.as_mut().unwrap().reconcile_navigation()?;
+                let mounter = self.mounter.as_mut().unwrap();
+                mounter.reconcile_navigation()?;
+                mounter.flush_arkui()?;
+                self.request_frame()?;
             }
             Message::DialogResult { id, index } => {
                 self.mounter.as_mut().unwrap().dialog_result(id, index)?;

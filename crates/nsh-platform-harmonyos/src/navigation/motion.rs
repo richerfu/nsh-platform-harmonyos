@@ -2,6 +2,12 @@
 
 use std::cell::Cell;
 
+/// One 120 Hz VSync interval (`~8.33 ms`) of initial lead when an unanchored
+/// `Motion` samples its first VSync. Keeps cold-mount delays out of the curve
+/// while ensuring VSync 1 always produces a non-zero transform/alpha delta so
+/// ArkUI's `FlushRenderTask` commits frame 1 and schedules VSync 2.
+const INITIAL_VSYNC_LEAD_MS: f64 = 1000.0 / 120.0;
+
 pub(crate) struct Motion {
     start: Cell<Option<f64>>,
     duration: f64,
@@ -28,8 +34,14 @@ impl Motion {
         let start = match self.start.get() {
             Some(start) => start,
             None => {
-                self.start.set(Some(now));
-                now
+                let lead = if self.duration > 0.0 {
+                    INITIAL_VSYNC_LEAD_MS.min(self.duration * 0.25)
+                } else {
+                    0.0
+                };
+                let anchored = now - lead;
+                self.start.set(Some(anchored));
+                anchored
             }
         };
         let t = if self.duration <= 0.0 {
@@ -105,11 +117,21 @@ mod tests {
     }
     #[test]
     fn unanchored_motion_starts_on_first_vsync_sample() {
+        // Push (1.0 -> 0.0): advances off 1.0 on VSync 1 even after a 540ms cold stall,
+        // while preserving >97% of the 300ms curve.
         let slide = Motion::new(None, 1.0, 0.0, Some(nsh_core::navigation::SLIDE));
-        assert_eq!(slide.step(540.0), (1.0, false, 0.0));
-        let mid = slide.step(690.0);
-        assert!(mid.0 > 0.0 && mid.0 < 1.0 && !mid.1);
+        let first = slide.step(540.0);
+        assert!(first.0 < 1.0 && first.0 > 0.9 && !first.1);
+        let mid = slide.step(680.0);
+        assert!(mid.0 > 0.0 && mid.0 < first.0 && !mid.1);
         assert_eq!(slide.step(840.0), (0.0, true, 0.0));
+
+        // Pop (0.0 -> 1.0, e.g. hardware back): steps > 0.0 on VSync 1 so Transform
+        // immediately mutates and keeps ArkUI's VSync loop running.
+        let pop = Motion::new(None, 0.0, 1.0, Some(nsh_core::navigation::SLIDE));
+        let pop_first = pop.step(1000.0);
+        assert!(pop_first.0 > 0.0 && pop_first.0 < 0.1 && !pop_first.1);
+        assert_eq!(pop.step(1300.0), (1.0, true, 1.0));
     }
     #[test]
     fn completion_accounts_for_fling_direction_and_invalid_geometry() {

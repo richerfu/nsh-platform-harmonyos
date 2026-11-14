@@ -656,6 +656,10 @@ pub(crate) fn should_immediately_retire_composite(
 /// Committed VSyncs after `DirectRoot` attaches before hiding an opaque lingering
 /// `Presentation` (`> 3` `Export::after_attach` repair frames + custom draw rebuilds).
 pub(crate) const LINGERING_OPAQUE_COMMIT_FRAMES: u8 = 6;
+/// Minimum committed VSyncs *after* `Export` repair finishes (`!export_repairing`)
+/// before hiding an opaque lingering `Presentation`, ensuring `Visibility::None`
+/// restoration on `DirectRoot` has flushed to `render_service`.
+pub(crate) const LINGERING_POST_REPAIR_COMMIT_FRAMES: u8 = 2;
 /// Committed VSyncs after `DirectRoot` attaches before hiding a translucent lingering
 /// `Presentation` (avoids stacking semi-transparent scrims while ensuring `DirectRoot` drew).
 pub(crate) const LINGERING_TRANSLUCENT_COMMIT_FRAMES: u8 = 1;
@@ -669,9 +673,12 @@ enum LingeringPhase {
     WaitingDirectAttach {
         remaining_fallback: u8,
         commit_frames: u8,
+        await_export_repair: bool,
     },
     WaitingDirectCommit {
         remaining_frames: u8,
+        await_export_repair: bool,
+        remaining_repair_fallback: u8,
     },
     HiddenWaitingDispose {
         remaining_frames: u8,
@@ -701,19 +708,24 @@ pub(crate) struct LingeringQueue {
 impl LingeringQueue {
     pub(crate) fn enqueue(&mut self, generation: u32, has_opaque_fill: bool, already_direct: bool) {
         self.remove(generation);
-        let commit_frames = if should_hide_lingering_presentation(has_opaque_fill) {
+        let hide_on_commit = should_hide_lingering_presentation(has_opaque_fill);
+        let commit_frames = if hide_on_commit {
             LINGERING_TRANSLUCENT_COMMIT_FRAMES
         } else {
             LINGERING_OPAQUE_COMMIT_FRAMES
         };
+        let await_export_repair = !hide_on_commit;
         let phase = if already_direct {
             LingeringPhase::WaitingDirectCommit {
                 remaining_frames: commit_frames,
+                await_export_repair,
+                remaining_repair_fallback: LINGERING_ATTACH_FALLBACK_FRAMES,
             }
         } else {
             LingeringPhase::WaitingDirectAttach {
                 remaining_fallback: LINGERING_ATTACH_FALLBACK_FRAMES,
                 commit_frames,
+                await_export_repair,
             }
         };
         self.entries.push(LingeringGateEntry { generation, phase });
@@ -722,9 +734,16 @@ impl LingeringQueue {
     pub(crate) fn on_direct_attached(&mut self) -> Vec<u32> {
         let mut promoted = Vec::new();
         for entry in &mut self.entries {
-            if let LingeringPhase::WaitingDirectAttach { commit_frames, .. } = entry.phase {
+            if let LingeringPhase::WaitingDirectAttach {
+                commit_frames,
+                await_export_repair,
+                ..
+            } = entry.phase
+            {
                 entry.phase = LingeringPhase::WaitingDirectCommit {
                     remaining_frames: commit_frames,
+                    await_export_repair,
+                    remaining_repair_fallback: LINGERING_ATTACH_FALLBACK_FRAMES,
                 };
                 promoted.push(entry.generation);
             }
@@ -753,7 +772,11 @@ impl LingeringQueue {
         self.entries.clear();
     }
 
-    pub(crate) fn on_frame_callback(&mut self, generation: u32) -> LingeringTick {
+    pub(crate) fn on_frame_callback(
+        &mut self,
+        generation: u32,
+        export_repairing: bool,
+    ) -> LingeringTick {
         let Some(pos) = self
             .entries
             .iter()
@@ -765,11 +788,13 @@ impl LingeringQueue {
             LingeringPhase::WaitingDirectAttach {
                 remaining_fallback,
                 commit_frames,
+                await_export_repair,
             } => {
                 if remaining_fallback > 1 {
                     self.entries[pos].phase = LingeringPhase::WaitingDirectAttach {
                         remaining_fallback: remaining_fallback - 1,
                         commit_frames,
+                        await_export_repair,
                     };
                     LingeringTick::WaitMore
                 } else {
@@ -779,10 +804,25 @@ impl LingeringQueue {
                     LingeringTick::ReleaseFallbackHoldsHideAndWaitMore
                 }
             }
-            LingeringPhase::WaitingDirectCommit { remaining_frames } => {
-                if remaining_frames > 1 {
+            LingeringPhase::WaitingDirectCommit {
+                remaining_frames,
+                await_export_repair,
+                remaining_repair_fallback,
+            } => {
+                if await_export_repair && export_repairing && remaining_repair_fallback > 1 {
+                    self.entries[pos].phase = LingeringPhase::WaitingDirectCommit {
+                        remaining_frames: remaining_frames
+                            .saturating_sub(1)
+                            .max(LINGERING_POST_REPAIR_COMMIT_FRAMES),
+                        await_export_repair,
+                        remaining_repair_fallback: remaining_repair_fallback - 1,
+                    };
+                    LingeringTick::WaitMore
+                } else if remaining_frames > 1 {
                     self.entries[pos].phase = LingeringPhase::WaitingDirectCommit {
                         remaining_frames: remaining_frames - 1,
+                        await_export_repair: false,
+                        remaining_repair_fallback,
                     };
                     LingeringTick::WaitMore
                 } else {
@@ -1192,44 +1232,61 @@ mod tests {
 
         // Before DirectRoot attaches, ticking stays in WaitingDirectAttach without hiding early.
         for _ in 0..15 {
-            assert_eq!(q.on_frame_callback(7), LingeringTick::WaitMore);
+            assert_eq!(q.on_frame_callback(7, false), LingeringTick::WaitMore);
         }
 
         // DirectRoot attaches -> promotes to 6-frame commit countdown.
         assert_eq!(q.on_direct_attached(), vec![7]);
         for _ in 0..(LINGERING_OPAQUE_COMMIT_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(7), LingeringTick::WaitMore);
+            assert_eq!(q.on_frame_callback(7, false), LingeringTick::WaitMore);
         }
-        assert_eq!(q.on_frame_callback(7), LingeringTick::HideAndWaitMore);
+        assert_eq!(
+            q.on_frame_callback(7, false),
+            LingeringTick::HideAndWaitMore
+        );
 
         // Settles 3 frames at opacity 0 before disposing XComponent.
         for _ in 0..(LINGERING_DISPOSE_SETTLE_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(7), LingeringTick::WaitMore);
+            assert_eq!(q.on_frame_callback(7, false), LingeringTick::WaitMore);
         }
-        assert_eq!(q.on_frame_callback(7), LingeringTick::Dispose);
-        assert_eq!(q.on_frame_callback(7), LingeringTick::Stale);
+        assert_eq!(q.on_frame_callback(7, false), LingeringTick::Dispose);
+        assert_eq!(q.on_frame_callback(7, false), LingeringTick::Stale);
+
+        // If `Export` repair takes longer than `LINGERING_OPAQUE_COMMIT_FRAMES`, opaque lingering
+        // `Presentation` stays visible until `!export_repairing` + `LINGERING_POST_REPAIR_COMMIT_FRAMES`.
+        q.enqueue(11, true, true);
+        for _ in 0..12 {
+            assert_eq!(q.on_frame_callback(11, true), LingeringTick::WaitMore);
+        }
+        for _ in 0..(LINGERING_POST_REPAIR_COMMIT_FRAMES - 1) {
+            assert_eq!(q.on_frame_callback(11, false), LingeringTick::WaitMore);
+        }
+        assert_eq!(
+            q.on_frame_callback(11, false),
+            LingeringTick::HideAndWaitMore
+        );
 
         // Successor Composite reveal hides immediately and still waits settle frames before dispose.
         q.enqueue(8, true, false);
         assert_eq!(q.mark_all_hidden(), vec![8]);
         assert!(q.mark_all_hidden().is_empty());
         for _ in 0..(LINGERING_DISPOSE_SETTLE_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(8), LingeringTick::WaitMore);
+            assert_eq!(q.on_frame_callback(8, false), LingeringTick::WaitMore);
         }
-        assert_eq!(q.on_frame_callback(8), LingeringTick::Dispose);
+        assert_eq!(q.on_frame_callback(8, false), LingeringTick::Dispose);
 
-        // Translucent already-direct commits in 1 frame, fallback releases holds, and clear resets.
+        // Translucent already-direct commits in 1 frame even during export repair, fallback releases holds, and clear resets.
         q.enqueue(9, false, true);
-        assert_eq!(q.on_frame_callback(9), LingeringTick::HideAndWaitMore);
+        assert_eq!(q.on_frame_callback(9, true), LingeringTick::HideAndWaitMore);
         q.clear();
-        assert_eq!(q.on_frame_callback(9), LingeringTick::Stale);
+        assert_eq!(q.on_frame_callback(9, false), LingeringTick::Stale);
 
         q.enqueue(10, true, false);
         for _ in 0..(LINGERING_ATTACH_FALLBACK_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(10), LingeringTick::WaitMore);
+            assert_eq!(q.on_frame_callback(10, false), LingeringTick::WaitMore);
         }
         assert_eq!(
-            q.on_frame_callback(10),
+            q.on_frame_callback(10, false),
             LingeringTick::ReleaseFallbackHoldsHideAndWaitMore
         );
     }

@@ -69,6 +69,7 @@ pub(crate) struct Wrapper {
     bridge: RefCell<Option<Rc<RootBridge>>>,
     pending_reattach: RefCell<crate::interop::handoff::PendingReattachQueue<PendingBridgeNodes>>,
     reattach_export: RefCell<Option<Rc<crate::interop::texture_export::Export>>>,
+    export_subtree_attached: Cell<bool>,
     context_live: Cell<bool>,
     owner: std::rc::Weak<Node>,
     settings: std::cell::RefCell<Option<ViewOptions>>,
@@ -140,6 +141,17 @@ impl Wrapper {
     pub(crate) fn retiring_export(&self) -> bool {
         self.retiring.get().is_some()
     }
+    fn is_export_repairing(&self) -> bool {
+        self.route
+            .try_borrow()
+            .ok()
+            .is_some_and(|route| route.as_ref().is_some_and(ViewRoute::is_repairing))
+            || self
+                .reattach_export
+                .try_borrow()
+                .ok()
+                .is_some_and(|export| export.as_ref().is_some_and(|e| e.is_repairing()))
+    }
     pub(crate) fn blocks_composite_update(&self) -> bool {
         matches!(
             self.retiring.get(),
@@ -164,6 +176,7 @@ impl Wrapper {
         }
     }
     fn begin_clearing_export(&self, owner: &Rc<Node>) -> Result<()> {
+        owner.snapshot_subtree_scroll_offsets();
         let mut screens = Vec::new();
         Self::collect_clearing_screens(owner, &mut screens);
         let mut held = self.clearing_export_nodes.borrow_mut();
@@ -171,12 +184,11 @@ impl Wrapper {
             if !screen.clearing_export.replace(true) {
                 held.push(Rc::downgrade(&screen));
             }
+            screen.restore_style()?;
             let visual = screen.visual_node();
             if visual.borrow().is_owned() {
                 visual.borrow().opacity(f32::MIN_POSITIVE)?;
-                visual.borrow().opacity(0.0)?;
             }
-            screen.restore_style()?;
         }
         drop(held);
         if owner.native.borrow().is_owned() {
@@ -199,7 +211,9 @@ impl Wrapper {
                 && screen.active.get()
             {
                 screen.restore_after_export()?;
+                screen.restore_subtree_scroll_offsets(true)?;
                 screen.invalidate_subtree_paint()?;
+                screen.schedule_subtree_paint(4)?;
             }
         }
         Ok(())
@@ -455,6 +469,7 @@ impl Wrapper {
             || !export_requested
             || revealed
             || !active_surface_ready
+            || !self.export_subtree_attached.get()
         {
             return Ok(());
         }
@@ -530,7 +545,7 @@ impl Wrapper {
                 }
             }
         }
-        if active_target_is_texture {
+        if active_target_is_texture && self.export_subtree_attached.get() {
             if current_phase != Some(crate::navigation::stack::RootBridgePhase::RenderingExport) {
                 if let Some(screen) = screen_owner.screen.borrow().as_ref() {
                     screen
@@ -672,7 +687,6 @@ impl Wrapper {
             }
             if repair.is_some() && peer.export_repair.get() != 0 && mounted.borrow().is_owned() {
                 mounted.borrow().opacity(f32::MIN_POSITIVE)?;
-                mounted.borrow().opacity(0.0)?;
             }
             *peer.mount_parent.borrow_mut() = Rc::downgrade(&container);
             container.borrow().mark_dirty(NodeDirtyFlag::NeedMeasure)?;
@@ -683,13 +697,14 @@ impl Wrapper {
                 peer.update_layout_bounds()?;
             }
             if let Some(export) = repair {
+                let callback_host = root_owner.map_or_else(|| container.clone(), Node::mounted);
                 if let Some(root) = root_owner
                     && let Ok(borrow) = root.wrapper.try_borrow()
                     && let Some(wrapper) = borrow.as_ref()
                 {
                     *wrapper.reattach_export.borrow_mut() = Some(export.clone());
                 }
-                let _ = export.after_attach(&container);
+                let _ = export.after_attach(&callback_host, &container);
             }
         } else {
             Self::release_entry_export_repair(&mut entry);
@@ -834,7 +849,6 @@ impl Wrapper {
                 let mounted = peer.mounted();
                 if mounted.borrow().is_owned() {
                     mounted.borrow().opacity(f32::MIN_POSITIVE)?;
-                    mounted.borrow().opacity(0.0)?;
                 }
             }
             if self.outer.borrow().is_owned() {
@@ -976,7 +990,6 @@ impl Wrapper {
                             peer.interaction.invalidate_opacity();
                             peer.restore_style()?;
                             peer.mounted().borrow().opacity(f32::MIN_POSITIVE)?;
-                            peer.mounted().borrow().opacity(0.0)?;
                             self.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
                         } else {
                             Self::detach_peer_from_outer(&self.outer, &peer)?;
@@ -1294,12 +1307,13 @@ impl Wrapper {
                     wrapper.lingering_gate.borrow_mut().remove(generation);
                     return Ok(());
                 }
+                let export_repairing = wrapper.is_export_repairing();
                 (
                     wrapper.outer.clone(),
                     wrapper
                         .lingering_gate
                         .borrow_mut()
-                        .on_frame_callback(generation),
+                        .on_frame_callback(generation, export_repairing),
                 )
             };
             let (outer, tick) = step;
@@ -1390,6 +1404,7 @@ impl Wrapper {
         }
         self.settings.borrow_mut().take();
         self.route.borrow_mut().take();
+        self.export_subtree_attached.set(false);
         self.handoff.borrow_mut().reset();
         self.retired_for_background.set(false);
         // Keep the old target through SDK lifecycle cleanup; replacement queues its final owner.
@@ -1406,6 +1421,7 @@ impl Wrapper {
         self.active_target_id().is_some()
     }
     fn replace_target(&self, owner: &Node) -> Result<u32> {
+        self.export_subtree_attached.set(false);
         if let Some(old_export) = self.reattach_export.borrow_mut().take() {
             old_export.restore();
         }
@@ -1668,6 +1684,7 @@ impl Wrapper {
             bridge: RefCell::default(),
             pending_reattach: RefCell::default(),
             reattach_export: RefCell::default(),
+            export_subtree_attached: Cell::new(false),
             context_live: Cell::new(true),
             owner: Rc::downgrade(owner),
             settings: std::cell::RefCell::default(),
@@ -1878,6 +1895,7 @@ impl Wrapper {
         }
         let _ = self.cancel_retiring(Some(owner));
         self.retired_for_background.set(false);
+        self.export_subtree_attached.set(false);
         self.handoff.borrow_mut().reset();
         self.route.borrow_mut().take();
         if let Some(old) = self.target.borrow_mut().take() {
@@ -2267,6 +2285,23 @@ impl Node {
             let _ = wrapper.lingering_gate.borrow_mut().on_direct_attached();
         }
     }
+    pub(crate) fn on_export_target_attached(&self, target_id: u32) -> Result<()> {
+        let matched = self.wrapper.try_borrow().ok().is_some_and(|borrow| {
+            let Some(wrapper) = borrow.as_ref() else {
+                return false;
+            };
+            if !wrapper.closed.get() && wrapper.active_target_id() == Some(target_id) {
+                wrapper.export_subtree_attached.set(true);
+                true
+            } else {
+                false
+            }
+        });
+        if matched {
+            self.update_wrapper()?;
+        }
+        Ok(())
+    }
     pub(crate) fn can_bridge_cold_export(&self) -> bool {
         if self.id != nsh_core::ROOT_ID || !self.needs_texture() || self.navigation_capture.get() {
             return false;
@@ -2496,6 +2531,9 @@ impl Node {
         if initialized || revealed || drop_failed {
             self.restore_style()?;
             self.update_wrapper()?;
+            if revealed || drop_failed {
+                self.invalidate_composites();
+            }
             self.invalidate_scene();
             if !drop_failed {
                 self.schedule_subtree_paint(4)?;

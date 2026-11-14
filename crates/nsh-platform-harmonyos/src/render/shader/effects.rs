@@ -684,6 +684,12 @@ impl Effects {
         if let Some(scene) = root.scene.borrow().as_ref() {
             scene.require(&root);
         }
+        // Inside `Mounter::apply`, `reconcile_navigation()` reconciles hosts and
+        // `RootBridge` atomically at the end of the batch; deferring `ensure_wrapper`
+        // until then avoids arming and cancelling a placeholder gate mid-batch.
+        if root.flushing_batch.get() {
+            return Ok(());
+        }
         root.ensure_wrapper()?;
         root.restore_style()?;
         Ok(())

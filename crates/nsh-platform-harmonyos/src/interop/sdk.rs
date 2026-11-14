@@ -259,6 +259,9 @@ impl ViewRoute {
             self.export.enabled.set(true);
         }
     }
+    pub(crate) fn is_repairing(&self) -> bool {
+        self.export.is_repairing()
+    }
 }
 impl Drop for ViewRoute {
     fn drop(&mut self) {
@@ -352,15 +355,21 @@ pub(crate) fn nsh_attach_native_subtree(
         })
         .ok_or_else(|| Error::from_reason("Native subtree route is no longer live"))?;
     let is_direct = owner.is_current_direct_target(target_id);
-    if is_direct && let Err(error) = owner.prepare_direct_target_attach() {
-        log::warn!("OHOS pre-attach direct hold release failed for target {target_id}: {error}");
-    }
     export
         .prepare(&owner, &inner)
         .map_err(|error| Error::from_reason(error.to_string()))?;
     if let Err(error) = NativeAttachment::attach_subtree(&env, target_id, &content, &slot) {
         export.restore();
         return Err(error);
+    }
+    if is_direct {
+        if let Err(error) = owner.prepare_direct_target_attach() {
+            log::warn!(
+                "OHOS post-attach direct hold release failed for target {target_id}: {error}"
+            );
+        }
+    } else if let Err(error) = owner.on_export_target_attached(target_id) {
+        log::warn!("OHOS post-attach export target hook failed for target {target_id}: {error}");
     }
     if let Err(error) = owner.flush_pending_bridge_reattach_if_direct() {
         log::warn!("OHOS post-attach bridge reattach failed for target {target_id}: {error}");
@@ -371,7 +380,8 @@ pub(crate) fn nsh_attach_native_subtree(
     if let Err(error) = owner.sync_subtree_scroll_offsets() {
         log::warn!("OHOS post-attach scroll sync failed for target {target_id}: {error}");
     }
-    if let Err(error) = export.after_attach(&inner) {
+    let callback_host = owner.mounted();
+    if let Err(error) = export.after_attach(&callback_host, &inner) {
         log::warn!("OHOS post-attach export repair failed for target {target_id}: {error}");
     }
     // Reparenting into or out of a texture export changes the render target

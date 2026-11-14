@@ -12,6 +12,7 @@ use super::{Node, Result};
 impl Node {
     pub(crate) fn desired_visibility(&self) -> i32 {
         if self.retained.get()
+            || self.clearing_export.get()
             || !self.header_item_visible()
             || self
                 .screen
@@ -20,17 +21,21 @@ impl Node {
                 .is_some_and(|screen| screen.popped.get() && screen.is_unanimated())
         {
             2
-        } else if self.clearing_export.get()
-            || self
-                .screen
-                .borrow()
-                .as_ref()
-                .is_some_and(|screen| !screen.paint_visible())
+        } else if self
+            .screen
+            .borrow()
+            .as_ref()
+            .is_some_and(|screen| !screen.paint_visible())
         {
             1
         } else {
             i32::from(self.style.borrow().hidden)
         }
+    }
+    pub(crate) fn invalidate_applied_transform(&self) {
+        let mut applied = self.applied.get();
+        applied.transform = None;
+        self.applied.set(applied);
     }
     pub(crate) fn native_visibility_hidden(&self) -> bool {
         self.desired_visibility() != 0 || self.backface_away.get()
