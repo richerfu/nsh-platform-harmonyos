@@ -138,12 +138,20 @@ impl Node {
         }
     }
     fn unhidden_for_effects(&self, style: &ViewStyle) -> bool {
-        if !self.active.get() || self.retained.get() || style.hidden {
+        if !self.active.get()
+            || self.retained.get()
+            || self.is_settled_popped_screen()
+            || style.hidden
+        {
             return false;
         }
         let mut at = self.parent_node.borrow().upgrade();
         while let Some(current) = at {
-            if !current.active.get() || current.retained.get() || current.style.borrow().hidden {
+            if !current.active.get()
+                || current.retained.get()
+                || current.is_settled_popped_screen()
+                || current.style.borrow().hidden
+            {
                 return false;
             }
             at = current.parent_node.borrow().upgrade();

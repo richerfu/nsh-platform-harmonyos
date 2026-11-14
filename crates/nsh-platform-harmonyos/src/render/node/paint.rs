@@ -245,7 +245,11 @@ impl Node {
     }
     /// Re-record custom paint after a native visibility or render-target change.
     pub(crate) fn invalidate_subtree_paint(&self) -> Result<()> {
-        if !self.active.get() {
+        if !self.active.get()
+            || self.retained.get()
+            || self.pending_delete.get()
+            || self.is_settled_popped_screen()
+        {
             return Ok(());
         }
         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
@@ -280,16 +284,6 @@ impl Node {
         self.clear_drawn_export_target();
         for child in self.children.borrow().iter().filter_map(Weak::upgrade) {
             child.invalidate_subtree_paint()?;
-        }
-        for child in self
-            .retained_children
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-        {
-            if child.retained.get() {
-                child.invalidate_subtree_paint()?;
-            }
         }
         Ok(())
     }

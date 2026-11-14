@@ -10,15 +10,18 @@ use ohos_arkui_binding::{
 use super::{Node, Result};
 
 impl Node {
+    pub(crate) fn is_settled_popped_screen(&self) -> bool {
+        self.screen.try_borrow().ok().is_some_and(|screen| {
+            screen
+                .as_ref()
+                .is_some_and(|screen| screen.popped.get() && screen.is_unanimated())
+        })
+    }
     pub(crate) fn desired_visibility(&self) -> i32 {
         if self.retained.get()
             || self.clearing_export.get()
             || !self.header_item_visible()
-            || self
-                .screen
-                .borrow()
-                .as_ref()
-                .is_some_and(|screen| screen.popped.get() && screen.is_unanimated())
+            || self.is_settled_popped_screen()
         {
             2
         } else if self
@@ -41,19 +44,10 @@ impl Node {
         self.desired_visibility() != 0 || self.backface_away.get()
     }
     fn notify_mount_parent_visibility_hidden(&self) -> Result<()> {
-        let visual = self.visual_node();
-        if let Ok(visual_node) = visual.try_borrow()
-            && visual_node.is_owned()
-        {
-            visual_node.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-            visual_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
-            visual_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
-        }
         if let Some(parent) = self.mount_parent.borrow().upgrade()
             && let Ok(parent_node) = parent.try_borrow()
             && parent_node.is_owned()
         {
-            parent_node.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             parent_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
             parent_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
         }

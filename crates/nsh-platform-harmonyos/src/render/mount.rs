@@ -597,16 +597,17 @@ impl Mounter {
             Self::attribute(modal.close(true));
         } else if !retain && let Some(container) = node.mount_parent.borrow().upgrade() {
             let mounted = node.mounted();
-            let index = container
+            if let Some(index) = container
                 .borrow()
                 .children()
                 .iter()
                 .position(|entry| Rc::ptr_eq(entry, &mounted))
-                .ok_or(Error::InvalidNode(id))?;
-            container
-                .borrow_mut()
-                .remove_child(index)
-                .map_err(|error| Error::Tree(Box::new(error.into())))?;
+            {
+                container
+                    .borrow_mut()
+                    .remove_child(index)
+                    .map_err(|error| Error::Tree(Box::new(error.into())))?;
+            }
         }
         if let Some(parent) = parent {
             let index = parent
@@ -645,6 +646,7 @@ impl Mounter {
         }
         node.parent.set(None);
         *node.parent_node.borrow_mut() = std::rc::Weak::new();
+        self.shaders.invalidate_visibility();
         node.invalidate_scene();
         Ok(())
     }
@@ -719,8 +721,13 @@ impl Mounter {
         if let Some(modal) = self.node(id)?.modal.borrow().as_ref() {
             Self::attribute(modal.close(true));
         }
-        if self.frozen(id) || self.awaiting_direct_attach(id) {
-            if !self.node(id)?.pending_delete.replace(true) {
+        let frozen = self.frozen(id);
+        if frozen || self.awaiting_direct_attach(id) {
+            let node = self.node(id)?.clone();
+            if !frozen {
+                Self::attribute(node.quiesce_retiring_subtree());
+            }
+            if !node.pending_delete.replace(true) {
                 // Both exits still render their retained subtree. Deactivation
                 // closes texture wrappers, so it belongs to delete_now after
                 // the page/dialog transition has finished.
@@ -1649,7 +1656,6 @@ impl Mounter {
     pub(crate) fn frame(&mut self, timestamp: Option<u64>) -> Result<bool> {
         self.shaders.expire_captures()?;
         let mut animating = self.animator.tick(timestamp)?;
-        animating |= self.shaders.frame()?;
         let mut settled_leaving = false;
         for id in self.animator.take_removals() {
             if let Ok(node) = self.node(id) {
@@ -1662,6 +1668,7 @@ impl Mounter {
                 }
             }
         }
+        animating |= self.shaders.frame()?;
         self.modals.retain(|modal| modal.strong_count() > 0);
         for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
             animating |= modal.frame(self.animator.frame_time())?;

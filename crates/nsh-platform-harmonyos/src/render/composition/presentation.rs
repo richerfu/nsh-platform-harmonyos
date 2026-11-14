@@ -148,6 +148,14 @@ impl Presentation {
         self.revealed = false;
     }
 
+    pub(super) fn retire_gone(&mut self) {
+        self.hide();
+        let node = self.surface.native.borrow();
+        if node.is_owned() {
+            let _ = node.set_i32_attribute(Attribute::Visibility, 2);
+        }
+    }
+
     pub(super) fn update(
         &mut self,
         width: u32,

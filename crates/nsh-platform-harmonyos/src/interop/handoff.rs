@@ -656,31 +656,31 @@ pub(crate) fn should_immediately_retire_composite(
 /// Whether a child node of a retiring export wrapper must enter `clearing_export`
 /// (`Visibility::None` = `2`) before switching back to `DirectRoot`.
 ///
-/// Both active screens AND popped/`pending_delete` screens are included so they stay
-/// at `Visibility = 2` across `DirectRoot` attachment and never undergo `Export::hide`
-/// (`Visibility = 0`), which would re-attach hardware `XComponent` `RSSurfaceRenderNode`s
-/// that ignore ancestor canvas opacity.
+/// Active visible screens enter `clearing_export` so their exported `RSNode`s detach
+/// cleanly before `DirectRoot` attaches. Settled popped screens stay out of
+/// `clearing_export` (after their descendant hardware surfaces are set to
+/// `Visibility::None`) so `Export` can re-sync and detach their server-side `RSNode`
+/// on `DirectRoot` while the lingering `Presentation` remains opaque.
 pub(crate) fn should_clear_screen_on_export_retire(
     active: bool,
     retained: bool,
     has_modal: bool,
     is_screen: bool,
+    is_settled_popped_screen: bool,
 ) -> bool {
-    active && !retained && !has_modal && is_screen
+    active && !retained && !has_modal && is_screen && !is_settled_popped_screen
 }
 
 /// Whether `Export::walk` may visit or call `Export::hide` (`Visibility = 0`) on an owner.
 ///
-/// Screens held in `clearing_export`, queued in `pending_delete`, or already settled in
-/// a popped state must never be flipped to `Visibility = 0` during export repair; popped
-/// screens are instead removed on `DirectRoot` via `delete_now` + `Reclaim` while the
-/// retiring `Presentation` remains opaque.
-pub(crate) fn should_export_repair_visit_owner(
-    clearing_export: bool,
-    pending_delete: bool,
-    popped_unanimated_screen: bool,
-) -> bool {
-    !clearing_export && !pending_delete && !popped_unanimated_screen
+/// Screens held in `clearing_export` are skipped because they were just cycled to
+/// `Visibility = 2` on `ExportRoot` and immediately restored before `DirectRoot` attach.
+/// Retained and settled-popped owners ARE visited (with their descendant `XComponent`s
+/// already quiesced to `Visibility = 2`) so `Export::restore_one` transitions
+/// `Visibility: 0 -> 2` on the main UI `RSUIContext` and detaches their server-side
+/// `RSNode` from `render_service`.
+pub(crate) fn should_export_repair_visit_owner(clearing_export: bool) -> bool {
+    !clearing_export
 }
 
 /// Committed VSyncs after `DirectRoot` attaches before hiding an opaque lingering
@@ -688,8 +688,9 @@ pub(crate) fn should_export_repair_visit_owner(
 pub(crate) const LINGERING_OPAQUE_COMMIT_FRAMES: u8 = 6;
 /// Minimum committed VSyncs *after* `Export` repair and pending deletions/reclaims finish
 /// before hiding an opaque lingering `Presentation`, ensuring `Visibility::None`
-/// restoration and `~RSNode` destruction on `DirectRoot` have flushed to `render_service`.
-pub(crate) const LINGERING_POST_REPAIR_COMMIT_FRAMES: u8 = 2;
+/// restoration, `remove_child`, and `~RSNode` destruction on `DirectRoot` have flushed
+/// to `render_service`.
+pub(crate) const LINGERING_POST_REPAIR_COMMIT_FRAMES: u8 = 3;
 /// Committed VSyncs after `DirectRoot` attaches before hiding a translucent lingering
 /// `Presentation` (avoids stacking semi-transparent scrims while ensuring `DirectRoot` drew).
 pub(crate) const LINGERING_TRANSLUCENT_COMMIT_FRAMES: u8 = 1;
@@ -1358,35 +1359,37 @@ mod tests {
     }
 
     #[test]
-    fn popped_and_pending_delete_screens_stay_in_clearing_export_and_never_export_hide() {
-        // Active screens AND popped/pending-delete screens (active == true, retained == false)
-        // both enter `clearing_export` (`Visibility::None` = 2) when retiring `ExportRoot`.
+    fn settled_popped_screens_bypass_clearing_export_so_export_repairs_and_detaches_rsnode() {
+        // Active visible non-popped screens enter `clearing_export` (`Visibility::None` = 2)
+        // when retiring `ExportRoot`.
         assert!(should_clear_screen_on_export_retire(
-            true, false, false, true
+            true, false, false, true, false
+        ));
+        // Settled popped screens stay out of `clearing_export` (after their descendant
+        // hardware surfaces are quiesced to `Visibility = 2`) so `Export` repairs and
+        // detaches their server-side `RSNode` on `DirectRoot`.
+        assert!(!should_clear_screen_on_export_retire(
+            true, false, false, true, true
         ));
         // Inactive, retained, modal, or non-screen nodes do not enter screen clearing_export.
         assert!(!should_clear_screen_on_export_retire(
-            false, false, false, true
+            false, false, false, true, false
         ));
         assert!(!should_clear_screen_on_export_retire(
-            true, true, false, true
+            true, true, false, true, false
         ));
         assert!(!should_clear_screen_on_export_retire(
-            true, false, true, true
+            true, false, true, true, false
         ));
         assert!(!should_clear_screen_on_export_retire(
-            true, false, false, false
+            true, false, false, false, false
         ));
 
-        // Popped, `pending_delete`, and `clearing_export` screens are NEVER visited by
-        // `Export::walk` / `Export::hide` (`Visibility = 0`), preventing dead descendant
-        // `XComponent` `RSSurfaceRenderNode`s from re-attaching on `render_service`.
-        assert!(!should_export_repair_visit_owner(true, false, false));
-        assert!(!should_export_repair_visit_owner(false, true, false));
-        assert!(!should_export_repair_visit_owner(false, false, true));
-        assert!(!should_export_repair_visit_owner(true, true, true));
-        // Normal retained/hidden non-popped views still undergo `Export` reconciliation.
-        assert!(should_export_repair_visit_owner(false, false, false));
+        // `clearing_export` screens are skipped by `Export::walk`, whereas retained and
+        // settled-popped views ARE visited so `Export::restore_one` flushes `Visibility: 0 -> 2`
+        // and `remove_child` on `DirectRoot`.
+        assert!(!should_export_repair_visit_owner(true));
+        assert!(should_export_repair_visit_owner(false));
     }
 
     #[test]

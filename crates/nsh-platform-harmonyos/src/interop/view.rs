@@ -143,13 +143,14 @@ impl Wrapper {
     }
     pub(crate) fn is_awaiting_direct_attach(&self) -> bool {
         self.retiring_export()
+            || self.is_export_repairing()
             || self
                 .lingering_gate
                 .try_borrow()
                 .ok()
                 .is_some_and(|gate| gate.is_waiting_direct_attach())
     }
-    fn is_export_repairing(&self) -> bool {
+    pub(crate) fn is_export_repairing(&self) -> bool {
         self.route
             .try_borrow()
             .ok()
@@ -176,14 +177,16 @@ impl Wrapper {
             let active = child.active.get();
             let retained = child.retained.get();
             let has_modal = child.modal.borrow().is_some();
+            let settled_popped = child.is_settled_popped_screen();
             if crate::interop::handoff::should_clear_screen_on_export_retire(
                 active,
                 retained,
                 has_modal,
                 child.kind == nsh_core::ViewKind::Screen,
+                settled_popped,
             ) {
                 out.push(child);
-            } else if active && !retained && !has_modal {
+            } else if active && !retained && !has_modal && !settled_popped {
                 Self::collect_clearing_screens(&child, out);
             }
         }
@@ -1930,6 +1933,75 @@ impl Wrapper {
     }
 }
 impl Node {
+    /// Quiesces all shaders, wrappers, and hardware surface children inside a
+    /// subtree whose exit transition has permanently settled (or is being
+    /// deleted while an ancestor export retires), setting every descendant to
+    /// `Visibility::None` (`2`) so `Export` can safely repair and detach the
+    /// subtree root's `RSNode` on `DirectRoot` without waking any `XComponent`.
+    pub(crate) fn quiesce_retiring_subtree(self: &Rc<Self>) -> Result<()> {
+        Self::quiesce_retiring_node(self, true)
+    }
+
+    fn quiesce_retiring_node(node: &Rc<Self>, is_root: bool) -> Result<()> {
+        use ohos_arkui_binding::types::attribute::ArkUINodeAttributeType as A;
+
+        node.shaders.detach_immediately(node.id)?;
+        if is_root {
+            if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+                wrapper.composite.borrow_mut().take();
+                wrapper.lingering_gate.borrow_mut().clear();
+                wrapper.lingering.borrow_mut().clear();
+            }
+        } else {
+            if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+                let _ = wrapper.close(node);
+                if wrapper.outer.borrow().is_owned() {
+                    let outer = wrapper.outer.borrow();
+                    let _ = outer.opacity(0.0);
+                    let _ = outer.set_i32_attribute(A::Visibility, 2);
+                }
+            }
+            if node.native.borrow().is_owned() {
+                let native_children = node.native.borrow().children().to_vec();
+                for child_native in native_children {
+                    if child_native.borrow().is_owned() {
+                        let c = child_native.borrow();
+                        let _ = c.opacity(0.0);
+                        let _ = c.set_i32_attribute(A::Visibility, 2);
+                    }
+                }
+                let native = node.native.borrow();
+                let _ = native.opacity(0.0);
+                let _ = native.set_i32_attribute(A::Visibility, 2);
+            }
+        }
+        let mut descendants: Vec<Rc<Self>> = node
+            .children
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .filter(|child| child.modal.borrow().is_none())
+            .collect();
+        for retained in node
+            .retained_children
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .filter(|child| child.modal.borrow().is_none())
+        {
+            if !descendants
+                .iter()
+                .any(|existing| Rc::ptr_eq(existing, &retained))
+            {
+                descendants.push(retained);
+            }
+        }
+        for child in descendants {
+            Self::quiesce_retiring_node(&child, false)?;
+        }
+        Ok(())
+    }
+
     fn is_handoff_revealed(&self, wrapper: &Wrapper) -> bool {
         if self.scene_active() {
             self.scene_root.get()

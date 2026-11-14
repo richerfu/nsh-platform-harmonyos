@@ -2135,7 +2135,7 @@ impl Composite {
 impl Drop for Composite {
     fn drop(&mut self) {
         if let Some(mut layer) = self.presentation.get_mut().take() {
-            layer.hide();
+            layer.retire_gone();
             self.worker
                 .retired
                 .borrow_mut()

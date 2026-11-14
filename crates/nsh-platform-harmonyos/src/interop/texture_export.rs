@@ -100,15 +100,8 @@ impl Export {
             .get(&(Rc::as_ptr(native) as usize))
             .and_then(Weak::upgrade);
         if let Some(owner) = &owner {
-            let popped_unanimated = owner
-                .screen
-                .borrow()
-                .as_ref()
-                .is_some_and(|screen| screen.popped.get() && screen.is_unanimated());
             if !crate::interop::handoff::should_export_repair_visit_owner(
                 owner.clearing_export.get(),
-                owner.pending_delete.get(),
-                popped_unanimated,
             ) {
                 return Ok(());
             }
@@ -356,7 +349,31 @@ impl Export {
             if let Some(owner) = owner {
                 owner.restore_after_export()?;
                 owner.invalidate_subtree_paint()?;
-                if owner.native_visibility_hidden()
+                let detach_settled_from_direct = (owner.retained.get()
+                    || owner.is_settled_popped_screen())
+                    && !owner.inside_texture_export();
+                if detach_settled_from_direct {
+                    let mounted = owner.mounted();
+                    let parent = owner.mount_parent.borrow().upgrade();
+                    if let Some(parent) = parent {
+                        let index = parent
+                            .borrow()
+                            .children()
+                            .iter()
+                            .position(|entry| Rc::ptr_eq(entry, &mounted));
+                        if let Some(index) = index {
+                            parent.borrow_mut().remove_child(index)?;
+                        }
+                        if let Ok(parent_node) = parent.try_borrow()
+                            && parent_node.is_owned()
+                        {
+                            parent_node.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+                            parent_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+                            parent_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
+                        }
+                    }
+                    *owner.mount_parent.borrow_mut() = Weak::new();
+                } else if owner.native_visibility_hidden()
                     && let Some(parent) = owner.mount_parent.borrow().upgrade()
                     && let Ok(parent_node) = parent.try_borrow()
                     && parent_node.is_owned()

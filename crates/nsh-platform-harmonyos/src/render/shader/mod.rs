@@ -13,7 +13,8 @@ use std::{
 
 use nsh_core::{NodeId, animation::AnimationValue, shader::ShaderLayer};
 use ohos_arkui_binding::{
-    component::attribute::ArkUICommonAttribute, types::advanced::NodeDirtyFlag,
+    component::attribute::ArkUICommonAttribute,
+    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
 };
 use rustc_hash::FxHashMap;
 
@@ -302,12 +303,15 @@ impl Shaders {
             .map(|state| state.surface.native.clone())
     }
 
-    pub(crate) fn remove(&self, id: NodeId) {
-        self.visibility.borrow_mut().remove(&id);
-        callback(|| self.effects.remove(id));
+    fn retire_fill_view(&self, id: NodeId) {
         if let Some(state) = self.views.borrow_mut().remove(&id) {
             if let Some(owner) = state.owner.upgrade() {
                 owner.invalidate_composites();
+            }
+            if state.surface.native.borrow().is_owned() {
+                let node = state.surface.native.borrow();
+                let _ = node.opacity(0.0);
+                let _ = node.set_i32_attribute(Attribute::Visibility, 2);
             }
             if let Some(worker) = self.worker.borrow().as_ref() {
                 worker.fill(Command::Remove(state.key));
@@ -322,6 +326,20 @@ impl Shaders {
                 callback(|| state.surface.dispose(Some(&state.parent)));
             }
         }
+    }
+
+    pub(crate) fn detach_immediately(&self, id: NodeId) -> Result<()> {
+        self.visibility.borrow_mut().remove(&id);
+        self.invalidate_visibility();
+        let effect_res = self.effects.remove(id);
+        self.retire_fill_view(id);
+        effect_res
+    }
+
+    pub(crate) fn remove(&self, id: NodeId) {
+        self.visibility.borrow_mut().remove(&id);
+        callback(|| self.effects.remove(id));
+        self.retire_fill_view(id);
         if self
             .effects
             .root_node()

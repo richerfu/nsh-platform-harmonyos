@@ -764,6 +764,9 @@ impl Screen {
             }
         }
         self.show()?;
+        if popped && let Some(owner) = self.owner.upgrade() {
+            owner.quiesce_retiring_subtree()?;
+        }
         // Establish final native visibility before switching the root out of
         // export, so its attachment repair includes every newly hidden screen.
         if shader.is_some()

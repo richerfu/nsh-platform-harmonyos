@@ -133,9 +133,8 @@ impl Node {
         Ok(true)
     }
     pub(crate) fn tick_transition(&self, now: f64) -> Result<(bool, bool)> {
-        let (navigation_active, navigation_removed) = self
-            .screen
-            .borrow()
+        let screen = self.screen.borrow().clone();
+        let (navigation_active, navigation_removed) = screen
             .as_ref()
             .map(|screen| screen.frame(now))
             .transpose()?

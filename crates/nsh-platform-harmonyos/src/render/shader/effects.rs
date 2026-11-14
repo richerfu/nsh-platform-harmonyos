@@ -20,7 +20,11 @@ use crate::render::node::{Node, Result};
 pub(super) fn unhidden_chain(node: &Rc<Node>) -> bool {
     let mut at = Some(node.clone());
     while let Some(current) = at {
-        if !current.active.get() || current.retained.get() || current.style.borrow().hidden {
+        if !current.active.get()
+            || current.retained.get()
+            || current.is_settled_popped_screen()
+            || current.style.borrow().hidden
+        {
             return false;
         }
         at = current.parent_node.borrow().upgrade();
@@ -32,7 +36,11 @@ pub(super) fn mounted_and_unhidden_in_root(node: &Rc<Node>) -> bool {
     let mut at = Some(node.clone());
     let mut reached_root = false;
     while let Some(current) = at {
-        if !current.active.get() || current.retained.get() || current.style.borrow().hidden {
+        if !current.active.get()
+            || current.retained.get()
+            || current.is_settled_popped_screen()
+            || current.style.borrow().hidden
+        {
             return false;
         }
         if current.id == nsh_core::ROOT_ID {
@@ -49,7 +57,7 @@ fn enclosing_screen_scope(owner: &Rc<Node>) -> Option<Rc<Node>> {
     let mut scope: Option<Rc<Node>> = None;
     let mut root: Option<Rc<Node>> = None;
     while let Some(current) = at {
-        if !current.active.get() || current.retained.get() {
+        if !current.active.get() || current.retained.get() || current.is_settled_popped_screen() {
             return None;
         }
         if scope.is_none() && matches!(current.kind, ViewKind::Screen | ViewKind::Modal) {
@@ -259,7 +267,7 @@ impl Effects {
                 let Some(owner) = weak.upgrade() else {
                     return false;
                 };
-                if !owner.active.get() || owner.retained.get() {
+                if !owner.active.get() || owner.retained.get() || owner.is_settled_popped_screen() {
                     return false;
                 }
                 if let Some(scope) = enclosing_screen_scope(&owner) {
@@ -268,9 +276,39 @@ impl Effects {
                 true
             });
             scopes.retain(|_, weak| {
-                weak.upgrade()
-                    .is_some_and(|scope| scope.active.get() && !scope.retained.get())
+                weak.upgrade().is_some_and(|scope| {
+                    scope.active.get() && !scope.retained.get() && !scope.is_settled_popped_screen()
+                })
             });
+        }
+
+        let mut layer_changed_targets: Vec<Rc<Node>> = Vec::new();
+        for (&id, state) in self.views.borrow().iter() {
+            if state.navigation.is_some() {
+                continue;
+            }
+            let Some(owner) = state.owner.upgrade() else {
+                continue;
+            };
+            let Some(target) = state.target.upgrade() else {
+                continue;
+            };
+            let active = owner.shaders.visibility(&owner).0 && unhidden_chain(&owner);
+            if active != state.active.replace(active) {
+                target
+                    .shader_layers
+                    .borrow_mut()
+                    .retain(|(owner_id, _)| *owner_id != id);
+                if active {
+                    target
+                        .shader_layers
+                        .borrow_mut()
+                        .push((id, state.layer.clone()));
+                }
+                if !layer_changed_targets.iter().any(|n| n.id == target.id) {
+                    layer_changed_targets.push(target);
+                }
+            }
         }
 
         let mut capable_list = Vec::new();
@@ -280,7 +318,7 @@ impl Effects {
                 let Some(node) = weak.upgrade() else {
                     return false;
                 };
-                if !node.active.get() || node.retained.get() {
+                if !node.active.get() || node.retained.get() || node.is_settled_popped_screen() {
                     return false;
                 }
                 capable_list.push((id, node));
@@ -378,7 +416,7 @@ impl Effects {
             }
         }
 
-        let mut to_refresh: Vec<Rc<Node>> = Vec::new();
+        let mut to_refresh: Vec<Rc<Node>> = layer_changed_targets;
         {
             let mut active_map = self.keep_alive_active.borrow_mut();
             let stale_keys: Vec<NodeId> = active_map
@@ -403,7 +441,9 @@ impl Effects {
                         .borrow()
                         .as_ref()
                         .is_none_or(|wrapper| wrapper.composite.borrow().is_none());
-                if prev != *keep || missing_composite || retainable_changed || surface_changed {
+                if (prev != *keep || missing_composite || retainable_changed || surface_changed)
+                    && !to_refresh.iter().any(|n| n.id == node.id)
+                {
                     to_refresh.push(node.clone());
                 }
             }
