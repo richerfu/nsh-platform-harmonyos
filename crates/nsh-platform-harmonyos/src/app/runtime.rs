@@ -375,6 +375,13 @@ impl State {
             if let Some(mounter) = &mut self.mounter {
                 mounter.reclaim(epoch);
             }
+            if let Some(parent) = self.parent.upgrade()
+                && let Ok(node) = parent.try_borrow()
+                && node.is_owned()
+            {
+                let _ =
+                    node.mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
+            }
             return Ok(());
         }
         if let Message::VideoRetired(token) = message {
@@ -554,7 +561,7 @@ impl State {
             Message::PokeVsync(epoch, fallback) => {
                 if self.frame_pending && self.frame_epoch == epoch && self.is_active() {
                     if fallback {
-                        self.step_frame(true, false, None)?;
+                        self.step_frame(true, true, None)?;
                     } else if let Some(parent) = self.parent.upgrade()
                         && let Ok(node) = parent.try_borrow()
                         && node.is_owned()
@@ -564,7 +571,7 @@ impl State {
                         );
                         let _ = self.schedule(Message::PokeVsync(epoch, true));
                     } else {
-                        self.step_frame(true, false, None)?;
+                        self.step_frame(true, true, None)?;
                     }
                 }
                 return Ok(());
@@ -1086,6 +1093,8 @@ impl Runtime {
             accessibility_live_regions: std::cell::Cell::new(0),
             accessibility_wrappers: std::cell::Cell::new(0),
             leaving_nodes: std::cell::Cell::new(0),
+            pending_delete_count: std::cell::Cell::new(0),
+            unreclaimed_delete_count: std::cell::Cell::new(0),
             arkui: crate::render::arkui::empty_batch(),
             arkui_views: Default::default(),
             host: config.host.clone(),

@@ -31,6 +31,7 @@ use crate::render::node::{FrameCallbackExt as _, NativeNode, Node, Result, callb
 pub(crate) struct Export {
     pub(crate) enabled: Cell<bool>,
     epoch: Cell<u64>,
+    owner: RefCell<Weak<Node>>,
     viewport: RefCell<Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>>,
     hidden: RefCell<Vec<Hidden>>,
 }
@@ -56,6 +57,7 @@ impl Export {
             return Ok(());
         }
         self.restore();
+        *self.owner.borrow_mut() = Rc::downgrade(owner);
         *self.viewport.borrow_mut() = owner.viewport.clone();
         self.epoch.set(self.epoch.get().wrapping_add(1));
         let mut owners = FxHashMap::default();
@@ -98,7 +100,16 @@ impl Export {
             .get(&(Rc::as_ptr(native) as usize))
             .and_then(Weak::upgrade);
         if let Some(owner) = &owner {
-            if owner.clearing_export.get() {
+            let popped_unanimated = owner
+                .screen
+                .borrow()
+                .as_ref()
+                .is_some_and(|screen| screen.popped.get() && screen.is_unanimated());
+            if !crate::interop::handoff::should_export_repair_visit_owner(
+                owner.clearing_export.get(),
+                owner.pending_delete.get(),
+                popped_unanimated,
+            ) {
                 return Ok(());
             }
             if owner.export_hidden() {
@@ -298,8 +309,13 @@ impl Export {
 
     pub(crate) fn restore(&self) {
         self.epoch.set(self.epoch.get().wrapping_add(1));
-        for hidden in self.hidden.take() {
-            Self::restore_one(hidden);
+        let hidden = self.hidden.take();
+        let had_hidden = !hidden.is_empty();
+        for item in hidden {
+            Self::restore_one(item);
+        }
+        if had_hidden && let Some(owner) = self.owner.borrow().upgrade() {
+            owner.wake_pending_deletions();
         }
     }
 
@@ -345,6 +361,7 @@ impl Export {
                     && let Ok(parent_node) = parent.try_borrow()
                     && parent_node.is_owned()
                 {
+                    parent_node.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
                     parent_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
                     parent_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
                 }

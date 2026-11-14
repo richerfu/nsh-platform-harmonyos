@@ -100,6 +100,8 @@ pub(crate) struct UiContext {
     /// none is, no mount item needs the walk up its ancestors that looks
     /// for one ([`Node::set_leaving`]).
     pub(crate) leaving_nodes: std::cell::Cell<usize>,
+    pub(crate) pending_delete_count: std::cell::Cell<usize>,
+    pub(crate) unreclaimed_delete_count: std::cell::Cell<usize>,
     pub(crate) arkui: std::cell::RefCell<crate::interop::sdk::Batch>,
     pub(crate) arkui_views: std::cell::RefCell<Vec<crate::interop::attachment::NativeAttachment>>,
     pub(crate) host: Arc<crate::app::session::Services>,
@@ -118,6 +120,20 @@ pub(crate) struct UiContext {
     pub(crate) canvas_bytes: Rc<std::cell::Cell<usize>>,
     pub(crate) platform: std::cell::Cell<nsh_engine::Environment>,
     pub(crate) appearance: std::cell::Cell<nsh_core::platform::Appearance>,
+}
+
+impl UiContext {
+    pub(crate) fn has_pending_deletions(&self) -> bool {
+        self.pending_delete_count.get() > 0 || self.unreclaimed_delete_count.get() > 0
+    }
+
+    pub(crate) fn wake_pending_deletions(&self) {
+        if self.pending_delete_count.get() > 0
+            && let Some(dispatcher) = self.dispatcher.upgrade()
+        {
+            dispatcher.send(crate::app::runtime::Message::Frame(None));
+        }
+    }
 }
 
 pub(crate) struct Mounter {
@@ -663,11 +679,12 @@ impl Mounter {
         }
     }
     /// Whether an ancestor wrapper is retiring an export surface back to
-    /// `DirectRoot` or running its post-attach RenderService export repair.
-    /// Detaching/disposing a `FrameNode` while its parent is still on
-    /// `ExportRoot` routes `RemoveChild` / `RSNodeDestroy` only to the
-    /// RenderThread side, stranding pre-export RenderService `RSNode` children.
-    fn export_transitioning(&self, mut id: NodeId) -> bool {
+    /// `DirectRoot` and `DirectRoot` has not attached yet. Detaching/disposing a
+    /// `FrameNode` while its parent is still on `ExportRoot` routes `RemoveChild` /
+    /// `RSNodeDestroy` only to the RenderThread side; gating until `DirectRoot`
+    /// attaches lets `delete_now` + `Reclaim` run immediately on `DirectRoot`
+    /// while the lingering `Presentation` remains opaque.
+    fn awaiting_direct_attach(&self, mut id: NodeId) -> bool {
         for _ in 0..=self.slots.len() {
             let Ok(node) = self.node(id) else {
                 return false;
@@ -676,7 +693,7 @@ impl Mounter {
                 .wrapper
                 .borrow()
                 .as_ref()
-                .is_some_and(crate::interop::view::Wrapper::is_export_transitioning)
+                .is_some_and(crate::interop::view::Wrapper::is_awaiting_direct_attach)
             {
                 return true;
             }
@@ -693,16 +710,22 @@ impl Mounter {
         }
         false
     }
+    fn sync_pending_deletions(&self) {
+        self.pending_delete_count.set(self.pending_delete.len());
+        self.unreclaimed_delete_count
+            .set(self.removed.len() + self.retired.len());
+    }
     fn delete(&mut self, id: NodeId) -> Result<()> {
         if let Some(modal) = self.node(id)?.modal.borrow().as_ref() {
             Self::attribute(modal.close(true));
         }
-        if self.frozen(id) || self.export_transitioning(id) {
+        if self.frozen(id) || self.awaiting_direct_attach(id) {
             if !self.node(id)?.pending_delete.replace(true) {
                 // Both exits still render their retained subtree. Deactivation
                 // closes texture wrappers, so it belongs to delete_now after
                 // the page/dialog transition has finished.
                 self.pending_delete.push(id);
+                self.sync_pending_deletions();
             }
             return Ok(());
         }
@@ -747,6 +770,7 @@ impl Mounter {
         while self.slots.last().is_some_and(Option::is_none) {
             self.slots.pop();
         }
+        self.sync_pending_deletions();
         Ok(())
     }
 
@@ -1566,6 +1590,7 @@ impl Mounter {
         if let Some(owner) = selected {
             Self::attribute(owner.selection_refresh());
         }
+        self.sync_pending_deletions();
         self.flush_arkui()
     }
 
@@ -1649,7 +1674,7 @@ impl Mounter {
             for id in pending {
                 if self.frozen(id) {
                     self.pending_delete.push(id);
-                } else if self.export_transitioning(id) {
+                } else if self.awaiting_direct_attach(id) {
                     self.pending_delete.push(id);
                     animating = true;
                 } else {
@@ -1661,6 +1686,7 @@ impl Mounter {
                 self.reconcile_navigation_capture()?;
             }
         }
+        self.sync_pending_deletions();
         self.finish_deferred()?;
         self.flush_arkui()?;
         Ok(animating)
@@ -1735,16 +1761,19 @@ impl Mounter {
             worker.collect();
             worker.drain();
         }
+        self.sync_pending_deletions();
         self.flush_arkui()
     }
 
     pub(crate) fn freeze_retired(&mut self) -> Option<u64> {
         if self.removed.is_empty() {
+            self.sync_pending_deletions();
             return None;
         }
         self.epoch += 1;
         self.retired
             .push_back((self.epoch, std::mem::take(&mut self.removed)));
+        self.sync_pending_deletions();
         Some(self.epoch)
     }
 
@@ -1752,6 +1781,7 @@ impl Mounter {
         while self.retired.front().is_some_and(|(id, _)| *id <= epoch) {
             self.retired.pop_front();
         }
+        self.sync_pending_deletions();
     }
 }
 

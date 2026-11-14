@@ -653,12 +653,42 @@ pub(crate) fn should_immediately_retire_composite(
     !hosts_retainable || unmounted_modal || composite_unrevealed
 }
 
+/// Whether a child node of a retiring export wrapper must enter `clearing_export`
+/// (`Visibility::None` = `2`) before switching back to `DirectRoot`.
+///
+/// Both active screens AND popped/`pending_delete` screens are included so they stay
+/// at `Visibility = 2` across `DirectRoot` attachment and never undergo `Export::hide`
+/// (`Visibility = 0`), which would re-attach hardware `XComponent` `RSSurfaceRenderNode`s
+/// that ignore ancestor canvas opacity.
+pub(crate) fn should_clear_screen_on_export_retire(
+    active: bool,
+    retained: bool,
+    has_modal: bool,
+    is_screen: bool,
+) -> bool {
+    active && !retained && !has_modal && is_screen
+}
+
+/// Whether `Export::walk` may visit or call `Export::hide` (`Visibility = 0`) on an owner.
+///
+/// Screens held in `clearing_export`, queued in `pending_delete`, or already settled in
+/// a popped state must never be flipped to `Visibility = 0` during export repair; popped
+/// screens are instead removed on `DirectRoot` via `delete_now` + `Reclaim` while the
+/// retiring `Presentation` remains opaque.
+pub(crate) fn should_export_repair_visit_owner(
+    clearing_export: bool,
+    pending_delete: bool,
+    popped_unanimated_screen: bool,
+) -> bool {
+    !clearing_export && !pending_delete && !popped_unanimated_screen
+}
+
 /// Committed VSyncs after `DirectRoot` attaches before hiding an opaque lingering
 /// `Presentation` (`> 3` `Export::after_attach` repair frames + custom draw rebuilds).
 pub(crate) const LINGERING_OPAQUE_COMMIT_FRAMES: u8 = 6;
-/// Minimum committed VSyncs *after* `Export` repair finishes (`!export_repairing`)
+/// Minimum committed VSyncs *after* `Export` repair and pending deletions/reclaims finish
 /// before hiding an opaque lingering `Presentation`, ensuring `Visibility::None`
-/// restoration on `DirectRoot` has flushed to `render_service`.
+/// restoration and `~RSNode` destruction on `DirectRoot` have flushed to `render_service`.
 pub(crate) const LINGERING_POST_REPAIR_COMMIT_FRAMES: u8 = 2;
 /// Committed VSyncs after `DirectRoot` attaches before hiding a translucent lingering
 /// `Presentation` (avoids stacking semi-transparent scrims while ensuring `DirectRoot` drew).
@@ -764,6 +794,12 @@ impl LingeringQueue {
         hidden
     }
 
+    pub(crate) fn is_waiting_direct_attach(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry.phase, LingeringPhase::WaitingDirectAttach { .. }))
+    }
+
     pub(crate) fn remove(&mut self, generation: u32) {
         self.entries.retain(|entry| entry.generation != generation);
     }
@@ -776,6 +812,7 @@ impl LingeringQueue {
         &mut self,
         generation: u32,
         export_repairing: bool,
+        pending_deletions: bool,
     ) -> LingeringTick {
         let Some(pos) = self
             .entries
@@ -809,7 +846,10 @@ impl LingeringQueue {
                 await_export_repair,
                 remaining_repair_fallback,
             } => {
-                if await_export_repair && export_repairing && remaining_repair_fallback > 1 {
+                if await_export_repair
+                    && (export_repairing || pending_deletions)
+                    && remaining_repair_fallback > 1
+                {
                     self.entries[pos].phase = LingeringPhase::WaitingDirectCommit {
                         remaining_frames: remaining_frames
                             .saturating_sub(1)
@@ -821,7 +861,7 @@ impl LingeringQueue {
                 } else if remaining_frames > 1 {
                     self.entries[pos].phase = LingeringPhase::WaitingDirectCommit {
                         remaining_frames: remaining_frames - 1,
-                        await_export_repair: false,
+                        await_export_repair,
                         remaining_repair_fallback,
                     };
                     LingeringTick::WaitMore
@@ -1229,40 +1269,57 @@ mod tests {
     fn lingering_queue_waits_for_direct_attach_then_commits_and_disposes() {
         let mut q = LingeringQueue::default();
         q.enqueue(7, true, false);
+        assert!(q.is_waiting_direct_attach());
 
         // Before DirectRoot attaches, ticking stays in WaitingDirectAttach without hiding early.
         for _ in 0..15 {
-            assert_eq!(q.on_frame_callback(7, false), LingeringTick::WaitMore);
+            assert_eq!(
+                q.on_frame_callback(7, false, false),
+                LingeringTick::WaitMore
+            );
         }
 
         // DirectRoot attaches -> promotes to 6-frame commit countdown.
         assert_eq!(q.on_direct_attached(), vec![7]);
+        assert!(!q.is_waiting_direct_attach());
         for _ in 0..(LINGERING_OPAQUE_COMMIT_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(7, false), LingeringTick::WaitMore);
+            assert_eq!(
+                q.on_frame_callback(7, false, false),
+                LingeringTick::WaitMore
+            );
         }
         assert_eq!(
-            q.on_frame_callback(7, false),
+            q.on_frame_callback(7, false, false),
             LingeringTick::HideAndWaitMore
         );
 
         // Settles 3 frames at opacity 0 before disposing XComponent.
         for _ in 0..(LINGERING_DISPOSE_SETTLE_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(7, false), LingeringTick::WaitMore);
+            assert_eq!(
+                q.on_frame_callback(7, false, false),
+                LingeringTick::WaitMore
+            );
         }
-        assert_eq!(q.on_frame_callback(7, false), LingeringTick::Dispose);
-        assert_eq!(q.on_frame_callback(7, false), LingeringTick::Stale);
+        assert_eq!(q.on_frame_callback(7, false, false), LingeringTick::Dispose);
+        assert_eq!(q.on_frame_callback(7, false, false), LingeringTick::Stale);
 
         // If `Export` repair takes longer than `LINGERING_OPAQUE_COMMIT_FRAMES`, opaque lingering
         // `Presentation` stays visible until `!export_repairing` + `LINGERING_POST_REPAIR_COMMIT_FRAMES`.
         q.enqueue(11, true, true);
         for _ in 0..12 {
-            assert_eq!(q.on_frame_callback(11, true), LingeringTick::WaitMore);
+            assert_eq!(
+                q.on_frame_callback(11, true, false),
+                LingeringTick::WaitMore
+            );
         }
         for _ in 0..(LINGERING_POST_REPAIR_COMMIT_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(11, false), LingeringTick::WaitMore);
+            assert_eq!(
+                q.on_frame_callback(11, false, false),
+                LingeringTick::WaitMore
+            );
         }
         assert_eq!(
-            q.on_frame_callback(11, false),
+            q.on_frame_callback(11, false, false),
             LingeringTick::HideAndWaitMore
         );
 
@@ -1271,23 +1328,103 @@ mod tests {
         assert_eq!(q.mark_all_hidden(), vec![8]);
         assert!(q.mark_all_hidden().is_empty());
         for _ in 0..(LINGERING_DISPOSE_SETTLE_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(8, false), LingeringTick::WaitMore);
+            assert_eq!(
+                q.on_frame_callback(8, false, false),
+                LingeringTick::WaitMore
+            );
         }
-        assert_eq!(q.on_frame_callback(8, false), LingeringTick::Dispose);
+        assert_eq!(q.on_frame_callback(8, false, false), LingeringTick::Dispose);
 
         // Translucent already-direct commits in 1 frame even during export repair, fallback releases holds, and clear resets.
         q.enqueue(9, false, true);
-        assert_eq!(q.on_frame_callback(9, true), LingeringTick::HideAndWaitMore);
+        assert_eq!(
+            q.on_frame_callback(9, true, true),
+            LingeringTick::HideAndWaitMore
+        );
         q.clear();
-        assert_eq!(q.on_frame_callback(9, false), LingeringTick::Stale);
+        assert_eq!(q.on_frame_callback(9, false, false), LingeringTick::Stale);
 
         q.enqueue(10, true, false);
         for _ in 0..(LINGERING_ATTACH_FALLBACK_FRAMES - 1) {
-            assert_eq!(q.on_frame_callback(10, false), LingeringTick::WaitMore);
+            assert_eq!(
+                q.on_frame_callback(10, false, false),
+                LingeringTick::WaitMore
+            );
         }
         assert_eq!(
-            q.on_frame_callback(10, false),
+            q.on_frame_callback(10, false, false),
             LingeringTick::ReleaseFallbackHoldsHideAndWaitMore
+        );
+    }
+
+    #[test]
+    fn popped_and_pending_delete_screens_stay_in_clearing_export_and_never_export_hide() {
+        // Active screens AND popped/pending-delete screens (active == true, retained == false)
+        // both enter `clearing_export` (`Visibility::None` = 2) when retiring `ExportRoot`.
+        assert!(should_clear_screen_on_export_retire(
+            true, false, false, true
+        ));
+        // Inactive, retained, modal, or non-screen nodes do not enter screen clearing_export.
+        assert!(!should_clear_screen_on_export_retire(
+            false, false, false, true
+        ));
+        assert!(!should_clear_screen_on_export_retire(
+            true, true, false, true
+        ));
+        assert!(!should_clear_screen_on_export_retire(
+            true, false, true, true
+        ));
+        assert!(!should_clear_screen_on_export_retire(
+            true, false, false, false
+        ));
+
+        // Popped, `pending_delete`, and `clearing_export` screens are NEVER visited by
+        // `Export::walk` / `Export::hide` (`Visibility = 0`), preventing dead descendant
+        // `XComponent` `RSSurfaceRenderNode`s from re-attaching on `render_service`.
+        assert!(!should_export_repair_visit_owner(true, false, false));
+        assert!(!should_export_repair_visit_owner(false, true, false));
+        assert!(!should_export_repair_visit_owner(false, false, true));
+        assert!(!should_export_repair_visit_owner(true, true, true));
+        // Normal retained/hidden non-popped views still undergo `Export` reconciliation.
+        assert!(should_export_repair_visit_owner(false, false, false));
+    }
+
+    #[test]
+    fn lingering_queue_holds_opaque_presentation_until_pending_deletions_and_reclaim_drain() {
+        let mut q = LingeringQueue::default();
+        q.enqueue(42, true, false);
+        assert!(q.is_waiting_direct_attach());
+
+        // `DirectRoot` attaches while `<Shader>` is still in `pending_delete` / `retired` (`Reclaim`).
+        assert_eq!(q.on_direct_attached(), vec![42]);
+        assert!(!q.is_waiting_direct_attach());
+
+        // Even after `LINGERING_OPAQUE_COMMIT_FRAMES` have elapsed and `export_repairing` is false,
+        // `Presentation` MUST stay opaque (`WaitMore`) while `pending_deletions` is true, including
+        // when `pending_deletions` becomes/remains true partway through `WaitingDirectCommit`.
+        assert_eq!(
+            q.on_frame_callback(42, false, false),
+            LingeringTick::WaitMore
+        );
+        for _ in 0..20 {
+            assert_eq!(
+                q.on_frame_callback(42, false, true),
+                LingeringTick::WaitMore
+            );
+        }
+
+        // Once `delete_now` + `Message::Reclaim` drain (`pending_deletions == false`), `LingeringQueue`
+        // still commits `LINGERING_POST_REPAIR_COMMIT_FRAMES` VSyncs so `~RSNode` (`RSNodeDestroy`)
+        // flushes to `render_service` before hiding `Presentation`.
+        for _ in 0..(LINGERING_POST_REPAIR_COMMIT_FRAMES - 1) {
+            assert_eq!(
+                q.on_frame_callback(42, false, false),
+                LingeringTick::WaitMore
+            );
+        }
+        assert_eq!(
+            q.on_frame_callback(42, false, false),
+            LingeringTick::HideAndWaitMore
         );
     }
 

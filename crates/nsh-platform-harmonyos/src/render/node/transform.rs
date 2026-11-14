@@ -41,10 +41,19 @@ impl Node {
         self.desired_visibility() != 0 || self.backface_away.get()
     }
     fn notify_mount_parent_visibility_hidden(&self) -> Result<()> {
+        let visual = self.visual_node();
+        if let Ok(visual_node) = visual.try_borrow()
+            && visual_node.is_owned()
+        {
+            visual_node.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+            visual_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            visual_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
         if let Some(parent) = self.mount_parent.borrow().upgrade()
             && let Ok(parent_node) = parent.try_borrow()
             && parent_node.is_owned()
         {
+            parent_node.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             parent_node.mark_dirty(NodeDirtyFlag::NeedLayout)?;
             parent_node.mark_dirty(NodeDirtyFlag::NeedRender)?;
         }

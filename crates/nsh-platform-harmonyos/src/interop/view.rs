@@ -141,8 +141,13 @@ impl Wrapper {
     pub(crate) fn retiring_export(&self) -> bool {
         self.retiring.get().is_some()
     }
-    pub(crate) fn is_export_transitioning(&self) -> bool {
-        self.retiring_export() || self.is_export_repairing()
+    pub(crate) fn is_awaiting_direct_attach(&self) -> bool {
+        self.retiring_export()
+            || self
+                .lingering_gate
+                .try_borrow()
+                .ok()
+                .is_some_and(|gate| gate.is_waiting_direct_attach())
     }
     fn is_export_repairing(&self) -> bool {
         self.route
@@ -168,26 +173,17 @@ impl Wrapper {
             .iter()
             .filter_map(std::rc::Weak::upgrade)
         {
-            if !child.active.get()
-                || child.retained.get()
-                || child.pending_delete.get()
-                || child.is_leaving()
-                || child.modal.borrow().is_some()
-            {
-                continue;
-            }
-            if child.kind == nsh_core::ViewKind::Screen {
-                let visible_screen = child.desired_visibility() == 0
-                    && !child.export_hidden()
-                    && child
-                        .screen
-                        .borrow()
-                        .as_ref()
-                        .is_none_or(|screen| !screen.popped.get());
-                if visible_screen {
-                    out.push(child);
-                }
-            } else {
+            let active = child.active.get();
+            let retained = child.retained.get();
+            let has_modal = child.modal.borrow().is_some();
+            if crate::interop::handoff::should_clear_screen_on_export_retire(
+                active,
+                retained,
+                has_modal,
+                child.kind == nsh_core::ViewKind::Screen,
+            ) {
+                out.push(child);
+            } else if active && !retained && !has_modal {
                 Self::collect_clearing_screens(&child, out);
             }
         }
@@ -228,9 +224,11 @@ impl Wrapper {
                 && screen.active.get()
             {
                 screen.restore_after_export()?;
-                screen.restore_subtree_scroll_offsets(true)?;
-                screen.invalidate_subtree_paint()?;
-                screen.schedule_subtree_paint(4)?;
+                if !screen.pending_delete.get() && screen.desired_visibility() == 0 {
+                    screen.restore_subtree_scroll_offsets(true)?;
+                    screen.invalidate_subtree_paint()?;
+                    screen.schedule_subtree_paint(4)?;
+                }
             }
         }
         Ok(())
@@ -1325,15 +1323,22 @@ impl Wrapper {
                     return Ok(());
                 }
                 let export_repairing = wrapper.is_export_repairing();
+                let pending_deletions = node.has_pending_deletions();
+                let can_wake_delete = !wrapper.is_awaiting_direct_attach();
                 (
                     wrapper.outer.clone(),
-                    wrapper
-                        .lingering_gate
-                        .borrow_mut()
-                        .on_frame_callback(generation, export_repairing),
+                    can_wake_delete,
+                    wrapper.lingering_gate.borrow_mut().on_frame_callback(
+                        generation,
+                        export_repairing,
+                        pending_deletions,
+                    ),
                 )
             };
-            let (outer, tick) = step;
+            let (outer, can_wake_delete, tick) = step;
+            if can_wake_delete {
+                node.wake_pending_deletions();
+            }
             match tick {
                 crate::interop::handoff::LingeringTick::Stale => {
                     if let Some(wrapper) = node.wrapper.borrow().as_ref() {
@@ -2301,6 +2306,7 @@ impl Node {
         if let Some(wrapper) = self.wrapper.borrow().as_ref() {
             let _ = wrapper.lingering_gate.borrow_mut().on_direct_attached();
         }
+        self.wake_pending_deletions();
     }
     pub(crate) fn on_export_target_attached(&self, target_id: u32) -> Result<()> {
         let matched = self.wrapper.try_borrow().ok().is_some_and(|borrow| {
