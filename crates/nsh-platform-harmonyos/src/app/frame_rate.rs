@@ -3,10 +3,7 @@
 //! `FrameRate` arbitrates the combined `(min, max, expected)` range and updates
 //! its applied cache only when the underlying setter succeeds.
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_env = "ohos")]
 use ohos_vsync_binding::{OH_NativeVSync_ExpectedRateRange, Vsync};
@@ -34,6 +31,7 @@ pub(crate) trait RateSink: Send + Sync {
 #[cfg(target_env = "ohos")]
 struct OhosSink {
     vsync: Arc<Vsync>,
+    host: Arc<crate::app::session::Services>,
 }
 
 #[cfg(target_env = "ohos")]
@@ -48,7 +46,7 @@ impl RateSink for OhosSink {
     }
 
     fn read_display_hz(&self) -> u32 {
-        display_hz()
+        self.host.max_refresh_rate()
     }
 }
 
@@ -56,7 +54,6 @@ struct State {
     shader_votes: usize,
     ui_demand: UiDemand,
     hz: u32,
-    refreshed: Instant,
     applied: Option<RateRange>,
 }
 
@@ -89,7 +86,12 @@ impl State {
                         expected: capped,
                     }
                 }
-                UiDemand::Idle | UiDemand::Uncapped => RateRange {
+                UiDemand::Uncapped => RateRange {
+                    min: hz,
+                    max: hz,
+                    expected: hz,
+                },
+                UiDemand::Idle => RateRange {
                     min: 0,
                     max: hz,
                     expected: hz.min(60),
@@ -108,9 +110,10 @@ pub(crate) struct FrameRate {
 
 impl FrameRate {
     #[cfg(target_env = "ohos")]
-    pub(crate) fn new(vsync: Arc<Vsync>) -> Arc<Self> {
+    pub(crate) fn new(vsync: Arc<Vsync>, host: Arc<crate::app::session::Services>) -> Arc<Self> {
         let sink = Box::new(OhosSink {
             vsync: vsync.clone(),
+            host,
         });
         let hz = sink.read_display_hz();
         Arc::new(Self {
@@ -120,7 +123,6 @@ impl FrameRate {
                 shader_votes: 0,
                 ui_demand: UiDemand::Idle,
                 hz,
-                refreshed: Instant::now(),
                 applied: None,
             }),
         })
@@ -137,7 +139,6 @@ impl FrameRate {
                 shader_votes: 0,
                 ui_demand: UiDemand::Idle,
                 hz,
-                refreshed: Instant::now(),
                 applied: None,
             }),
         })
@@ -181,10 +182,7 @@ impl FrameRate {
     }
 
     fn maybe_refresh_hz(&self, state: &mut State) {
-        if state.refreshed.elapsed().as_secs() >= 1 {
-            state.refreshed = Instant::now();
-            state.hz = normalize_display_hz(self.sink.read_display_hz());
-        }
+        state.hz = normalize_display_hz(self.sink.read_display_hz());
     }
 
     fn sync_locked(&self, state: &mut State, log_failure: bool) -> i32 {
@@ -235,11 +233,6 @@ pub(crate) fn normalize_display_hz(raw: u32) -> u32 {
         0 => 60,
         hz => hz.clamp(30, 240),
     }
-}
-
-#[cfg(target_env = "ohos")]
-pub(crate) fn display_hz() -> u32 {
-    normalize_display_hz(ohos_display_binding::default_display_refresh_rate())
 }
 
 #[cfg(all(test, not(target_env = "ohos")))]
@@ -370,6 +363,39 @@ mod tests {
                 min: 0,
                 max: 30,
                 expected: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn uncapped_ui_uses_the_panel_rate_without_a_shader_vote() {
+        let sink = MockSink::new(120);
+        let rate = FrameRate::with_sink(Box::new(SharedSink(sink.clone())));
+        rate.set_ui_demand(UiDemand::Uncapped);
+        assert_eq!(
+            sink.last(),
+            Some(RateRange {
+                min: 120,
+                max: 120,
+                expected: 120
+            })
+        );
+        rate.set_ui_demand(UiDemand::Capped(30));
+        assert_eq!(
+            sink.last(),
+            Some(RateRange {
+                min: 0,
+                max: 30,
+                expected: 30
+            })
+        );
+        rate.set_ui_demand(UiDemand::Uncapped);
+        assert_eq!(
+            sink.last(),
+            Some(RateRange {
+                min: 120,
+                max: 120,
+                expected: 120
             })
         );
     }

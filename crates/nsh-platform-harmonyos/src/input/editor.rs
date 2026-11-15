@@ -181,6 +181,7 @@ impl Input {
         let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) else {
             return Ok(());
         };
+        owner.invalidate_composites();
         match event.kind.as_str() {
             "paste" => owner.emit(
                 EventKind::Paste,
@@ -390,7 +391,7 @@ impl Input {
             }
             _ => {}
         }
-        Ok(())
+        owner.flush_arkui()
     }
     fn key(&self, owner: &Node, key: &str) {
         owner.emit(

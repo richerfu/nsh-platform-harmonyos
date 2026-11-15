@@ -6,7 +6,7 @@ use nsh_core::ViewKind;
 use ohos_arkui_binding::{
     common::attribute::ArkUINodeAttributeNumber as Number,
     component::attribute::ArkUICommonAttribute,
-    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
+    types::attribute::ArkUINodeAttributeType as Attribute,
 };
 
 use super::{Node, Result};
@@ -165,8 +165,7 @@ impl Node {
             live.step(now, self.frame.get(), &mut self.style.borrow_mut())
         };
         if live.recolor {
-            self.clear_drawn_export_target();
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
             self.invalidate_scene();
         }
         if step.active {
@@ -185,8 +184,7 @@ impl Node {
                 owner.ensure_wrapper()?;
             }
             self.restore_style()?;
-            self.clear_drawn_export_target();
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
         } else {
             let style = self.style.borrow();
             if previous.0 != step.opacity {
@@ -262,8 +260,7 @@ impl Node {
                 P::Color => {
                     let color = Some(crate::render::animation::color(*value));
                     if self.tint.replace(color) != color {
-                        self.clear_drawn_export_target();
-                        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+                        self.invalidate_paint()?;
                     }
                 }
                 P::Opacity => opacity = Some(value.number().clamp(0.0, 1.0)),

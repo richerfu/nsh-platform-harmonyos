@@ -77,8 +77,6 @@ impl Theme {
 }
 
 pub(crate) struct UiContext {
-    pub(crate) viewport:
-        std::rc::Weak<std::cell::RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
     pub(crate) theme: std::cell::RefCell<Theme>,
     pub(crate) cursor: crate::input::cursor::State,
     pub(crate) shaders: super::shader::Shaders,
@@ -120,20 +118,6 @@ pub(crate) struct UiContext {
     pub(crate) canvas_bytes: Rc<std::cell::Cell<usize>>,
     pub(crate) platform: std::cell::Cell<nsh_engine::Environment>,
     pub(crate) appearance: std::cell::Cell<nsh_core::platform::Appearance>,
-}
-
-impl UiContext {
-    pub(crate) fn has_pending_deletions(&self) -> bool {
-        self.pending_delete_count.get() > 0 || self.unreclaimed_delete_count.get() > 0
-    }
-
-    pub(crate) fn wake_pending_deletions(&self) {
-        if self.pending_delete_count.get() > 0
-            && let Some(dispatcher) = self.dispatcher.upgrade()
-        {
-            dispatcher.send(crate::app::runtime::Message::Frame(None));
-        }
-    }
 }
 
 pub(crate) struct Mounter {
@@ -583,13 +567,6 @@ impl Mounter {
     }
 
     fn unlink(&mut self, id: NodeId, retain: bool) -> Result<()> {
-        if let Some(root) = self
-            .slots
-            .get(nsh_core::ROOT_ID as usize)
-            .and_then(Option::as_ref)
-        {
-            Self::attribute(root.release_root_bridge_for(id));
-        }
         let node = self.node(id)?;
         let parent = node.parent.get().map(|id| self.node(id)).transpose()?;
         let retain = retain && node.modal.borrow().is_none() && parent.is_some();
@@ -597,12 +574,12 @@ impl Mounter {
             Self::attribute(modal.close(true));
         } else if !retain && let Some(container) = node.mount_parent.borrow().upgrade() {
             let mounted = node.mounted();
-            if let Some(index) = container
+            let index = container
                 .borrow()
                 .children()
                 .iter()
-                .position(|entry| Rc::ptr_eq(entry, &mounted))
-            {
+                .position(|entry| Rc::ptr_eq(entry, &mounted));
+            if let Some(index) = index {
                 container
                     .borrow_mut()
                     .remove_child(index)
@@ -680,38 +657,6 @@ impl Mounter {
             id = parent;
         }
     }
-    /// Whether an ancestor wrapper is retiring an export surface back to
-    /// `DirectRoot` and `DirectRoot` has not attached yet. Detaching/disposing a
-    /// `FrameNode` while its parent is still on `ExportRoot` routes `RemoveChild` /
-    /// `RSNodeDestroy` only to the RenderThread side; gating until `DirectRoot`
-    /// attaches lets `delete_now` + `Reclaim` run immediately on `DirectRoot`
-    /// while the lingering `Presentation` remains opaque.
-    fn awaiting_direct_attach(&self, mut id: NodeId) -> bool {
-        for _ in 0..=self.slots.len() {
-            let Ok(node) = self.node(id) else {
-                return false;
-            };
-            if node
-                .wrapper
-                .borrow()
-                .as_ref()
-                .is_some_and(crate::interop::view::Wrapper::is_awaiting_direct_attach)
-            {
-                return true;
-            }
-            let next = node.parent.get().or_else(|| {
-                node.retained_owner
-                    .borrow()
-                    .upgrade()
-                    .map(|parent| parent.id)
-            });
-            let Some(parent) = next else {
-                return false;
-            };
-            id = parent;
-        }
-        false
-    }
     fn sync_pending_deletions(&self) {
         self.pending_delete_count.set(self.pending_delete.len());
         self.unreclaimed_delete_count
@@ -722,11 +667,8 @@ impl Mounter {
             Self::attribute(modal.close(true));
         }
         let frozen = self.frozen(id);
-        if frozen || self.awaiting_direct_attach(id) {
+        if frozen {
             let node = self.node(id)?.clone();
-            if !frozen {
-                Self::attribute(node.quiesce_retiring_subtree());
-            }
             if !node.pending_delete.replace(true) {
                 // Both exits still render their retained subtree. Deactivation
                 // closes texture wrappers, so it belongs to delete_now after
@@ -1197,9 +1139,8 @@ impl Mounter {
                             self.shaders.transition(id, duration);
                         }
                     }
-                    // ArkUI's texture producer reports native content changes,
-                    // including native input/scroll updates between core batches.
-                    MountItem::ShaderInput { .. } => {}
+                    // Core content changes invalidate enclosing shader pictures.
+                    MountItem::ShaderInput { id } => self.node(id)?.invalidate_composites(),
                     MountItem::NavShader { id, shader } => {
                         if !self.frozen(id) {
                             let configured = shader.is_some();
@@ -1654,7 +1595,6 @@ impl Mounter {
         self.shaders.reveal()
     }
     pub(crate) fn frame(&mut self, timestamp: Option<u64>) -> Result<bool> {
-        self.shaders.expire_captures()?;
         let mut animating = self.animator.tick(timestamp)?;
         let mut settled_leaving = false;
         for id in self.animator.take_removals() {
@@ -1681,9 +1621,6 @@ impl Mounter {
             for id in pending {
                 if self.frozen(id) {
                     self.pending_delete.push(id);
-                } else if self.awaiting_direct_attach(id) {
-                    self.pending_delete.push(id);
-                    animating = true;
                 } else {
                     self.delete_now(id)?;
                     deleted_any = true;

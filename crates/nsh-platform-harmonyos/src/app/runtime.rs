@@ -19,7 +19,7 @@ use crate::{
     render::{
         geometry::Size,
         mount::Mounter,
-        node::{Error, FrameCallbackExt as _, NativeNode, Result},
+        node::{Error, NativeNode, Result},
     },
     text::typography::OhosTextEngine,
 };
@@ -344,7 +344,6 @@ struct State {
     testing: Option<Arc<crate::app::testing::Session>>,
     #[cfg(feature = "dev")]
     test_closed: Arc<std::sync::atomic::AtomicBool>,
-    self_ref: std::rc::Weak<RefCell<Self>>,
     parent: std::rc::Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
     engine: Option<Engine>,
     mounter: Option<Mounter>,
@@ -635,6 +634,7 @@ impl State {
         self.errors.report(error);
     }
     fn step_frame(&mut self, wake_engine: bool, timestamp: Option<u64>) -> Result<()> {
+        let _trace = crate::render::composition::trace::Scope::new(c"NSH UI frame");
         self.frame_pending = false;
         if !self.is_active() {
             self.frame_wanted = true;
@@ -676,38 +676,10 @@ impl State {
         }
         if !self.frame_pending {
             self.frame_wanted = false;
-            let state = self.self_ref.clone();
-            // Run UI-thread frame updates inside ArkUI's UIVsyncTask before
-            // layout/render flush via OH_ArkUI_PostFrameCallback, falling back
-            // to NativeVSync if the root node is not yet attached to a context.
-            if self.parent.upgrade().is_none_or(|parent| {
-                parent
-                    .borrow()
-                    .post_frame_callback_dirty(move |timestamp, _| {
-                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let Some(state) = state.upgrade() else {
-                                return;
-                            };
-                            if let Ok(mut state) = state.try_borrow_mut() {
-                                if let Err(error) = state.step_frame(true, Some(timestamp)) {
-                                    state.report(error.to_string());
-                                    log::error!("OHOS surface frame: {error}");
-                                }
-                            } else if let Some(dispatcher) =
-                                state.try_borrow().ok().and_then(|s| s.dispatcher.upgrade())
-                            {
-                                dispatcher.send(Message::Frame(Some(timestamp)));
-                            }
-                        }))
-                        .is_err()
-                        {
-                            log::error!("panic in OHOS frame callback");
-                        }
-                    })
-                    .is_err()
-            }) {
-                self.schedule(Message::Frame(None))?;
-            }
+            // The rate request and the frame source must use the same VSync
+            // connection. Its callback posts UI mutations through the existing
+            // dispatcher; it never accesses ArkUI from the VSync thread.
+            self.schedule(Message::Frame(None))?;
             self.frame_pending = true;
         }
         Ok(())
@@ -877,7 +849,7 @@ impl Runtime {
                     napi_ohos::Error::from_reason("failed to create OHOS native VSync")
                 })?,
         );
-        let frame_rate = crate::app::frame_rate::FrameRate::new(vsync.clone());
+        let frame_rate = crate::app::frame_rate::FrameRate::new(vsync.clone(), config.host.clone());
         let status = frame_rate.apply_initial();
         if status != 0 {
             return Err(napi_ohos::Error::from_reason(format!(
@@ -886,33 +858,30 @@ impl Runtime {
         }
         // The shader thread paces itself on the surface's shared FrameRate too.
         let shader_rate = frame_rate.clone();
-        let state = Rc::new_cyclic(|weak| {
-            RefCell::new(State {
-                #[cfg(feature = "dev")]
-                testing: app.testing.clone(),
-                #[cfg(feature = "dev")]
-                test_closed: Arc::default(),
-                self_ref: weak.clone(),
-                parent: Rc::downgrade(&parent),
-                engine: None,
-                mounter: None,
-                dispatcher: Weak::new(),
-                vsync,
-                frame_rate,
-                errors,
-                frame_pending: false,
-                laid_out: false,
-                attached: true,
-                visible: true,
-                frame_wanted: false,
-                retiring_dispatcher: None,
-                environment: Environment::default(),
-                #[cfg(feature = "dev")]
-                reload: app.reload,
-                #[cfg(feature = "dev")]
-                hot_version: None,
-            })
-        });
+        let state = Rc::new(RefCell::new(State {
+            #[cfg(feature = "dev")]
+            testing: app.testing.clone(),
+            #[cfg(feature = "dev")]
+            test_closed: Arc::default(),
+            parent: Rc::downgrade(&parent),
+            engine: None,
+            mounter: None,
+            dispatcher: Weak::new(),
+            vsync,
+            frame_rate,
+            errors,
+            frame_pending: false,
+            laid_out: false,
+            attached: true,
+            visible: true,
+            frame_wanted: false,
+            retiring_dispatcher: None,
+            environment: Environment::default(),
+            #[cfg(feature = "dev")]
+            reload: app.reload,
+            #[cfg(feature = "dev")]
+            hot_version: None,
+        }));
         let ui_state = state.clone();
         let wake = env.create_function_from_closure::<(), (), _>("nshCommit", |_| Ok(()))?;
         let dispatcher = Arc::new(Dispatcher {
@@ -1042,7 +1011,6 @@ impl Runtime {
             testing.model.engine_started(control.clone());
         }
         let context = Rc::new(crate::render::mount::UiContext {
-            viewport: Rc::downgrade(&parent),
             theme: RefCell::default(),
             cursor: Default::default(),
             shaders: crate::render::shader::Shaders::new(shader_rate),

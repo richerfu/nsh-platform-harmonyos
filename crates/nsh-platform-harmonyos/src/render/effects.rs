@@ -1,5 +1,5 @@
 //! Unified CSS filter and effect routing across native ArkUI attributes,
-//! direct GLES texture export (`Composite`), and surface-level `Scene` drawing.
+//! GLES composition of native snapshots (`Composite`), and surface-level `Scene` drawing.
 
 use nsh_core::{BlendMode, Filter, ViewStyle};
 
@@ -56,15 +56,14 @@ pub(crate) fn resolve_visual_opacity(
 /// `FlushModifyTask`, whereas `Attribute::Visibility` (`Hidden`/`None`) only
 /// detaches the child's `RSNode` when its parent `FrameNode` runs
 /// `RebuildRenderContextTree()`. Keeping `Opacity == 0.0` whenever a node is
-/// hidden (`native_visibility_hidden`) or under `export_repair` prevents any
+/// hidden (`native_visibility_hidden`) prevents any
 /// 1-frame `Alpha = 1.0` flash before parent render-tree rebuilds.
 pub(crate) fn resolve_native_node_opacity(
-    export_repair: u32,
     native_visibility_hidden: bool,
     scene_active: bool,
     combined_opacity: f32,
 ) -> f32 {
-    if export_repair != 0 || native_visibility_hidden {
+    if native_visibility_hidden {
         0.0
     } else if scene_active {
         1.0
@@ -76,11 +75,6 @@ pub(crate) fn resolve_native_node_opacity(
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EffectsContext {
     pub(crate) has_shaders: bool,
-    /// Keeps a shader-capable node (or `ROOT_ID` while a shader page/scope is
-    /// mounted and visible) in `Composite` identity-passthrough mode when its
-    /// active shader layers are toggled off, avoiding `DirectRoot <-> TextureContainer`
-    /// cutovers across toggles.
-    pub(crate) shader_keep_alive: bool,
     pub(crate) shader_samples_backdrop: bool,
     pub(crate) navigation_capture: bool,
     pub(crate) scene_active: bool,
@@ -104,7 +98,7 @@ pub(crate) struct EffectsPlan {
     pub(crate) native_blend: BlendMode,
     /// Whether this node's own style/shaders require surface `Scene` composition.
     pub(crate) requires_scene: bool,
-    /// Whether this node requires offscreen texture export (`Composite`).
+    /// Whether this node requires a native snapshot for `Composite`.
     pub(crate) requires_texture: bool,
 }
 
@@ -119,13 +113,9 @@ impl EffectsPlan {
         let active_backdrops = active_filter_count(backdrop_filters);
         let non_blur_backdrop = has_non_blur_filter(backdrop_filters);
 
-        // When a node exports its own subtree to `RENDER_TYPE_TEXTURE` (for
-        // non-blur CSS filters, active shader layers, or shader keep-alive
-        // passthrough), `self.native` renders into an isolated transparent
-        // buffer and cannot sample the window backdrop via `Attribute::BackdropBlur`;
-        // `Scene` must composite the backdrop instead.
-        let own_texture =
-            non_blur_filter || ctx.has_shaders || ctx.shader_keep_alive || ctx.navigation_capture;
+        // A sampled subtree is rendered in isolation. Compose its backdrop in
+        // Scene so the picture does not depend on the live window behind it.
+        let own_texture = non_blur_filter || ctx.has_shaders || ctx.navigation_capture;
         let requires_scene = style.blend_mode == BlendMode::PlusDarker
             || ctx.shader_samples_backdrop
             || has_masks
@@ -136,8 +126,7 @@ impl EffectsPlan {
         let requires_texture = ctx.navigation_capture
             || (ctx.scene_active && ctx.has_native_paint)
             || non_blur_filter
-            || ctx.has_shaders
-            || ctx.shader_keep_alive;
+            || ctx.has_shaders;
 
         let native_active = !ctx.scene_active && !requires_texture && !ctx.composite_active;
         let mut native_blur = 0.0;
@@ -338,7 +327,7 @@ mod tests {
         };
 
         // Idle NavShader configuration sets `navigation_capture: false`: zero
-        // persistent texture exports and single backdrop-blur stays native.
+        // persistent content snapshots and single backdrop-blur stays native.
         let idle_root = EffectsPlan::compute(&ViewStyle::default(), EffectsContext::default());
         assert!(!idle_root.requires_texture);
         assert!(!idle_root.requires_scene);
@@ -366,47 +355,6 @@ mod tests {
     }
 
     #[test]
-    fn shader_keep_alive_maintains_texture_export_in_passthrough_and_retires_when_cleared() {
-        let plain = ViewStyle::default();
-        let passthrough = EffectsPlan::compute(
-            &plain,
-            EffectsContext {
-                shader_keep_alive: true,
-                composite_active: true,
-                ..EffectsContext::default()
-            },
-        );
-        assert!(passthrough.requires_texture);
-        assert!(!passthrough.requires_scene);
-
-        // If the shader-capable node itself also carries a pure blur filter, GLES
-        // continues owning the blur while passthrough Composite stays active.
-        let blurred = ViewStyle {
-            effects: Some(Arc::new(Effects {
-                filters: vec![Filter::Blur(Points(6.0))],
-                ..Default::default()
-            })),
-            ..ViewStyle::default()
-        };
-        let passthrough_blur = EffectsPlan::compute(
-            &blurred,
-            EffectsContext {
-                shader_keep_alive: true,
-                composite_active: true,
-                ..EffectsContext::default()
-            },
-        );
-        assert!(passthrough_blur.requires_texture);
-        assert_eq!(passthrough_blur.native_blur, 0.0);
-
-        // Unmount / visibility-gone / background clears `shader_keep_alive`,
-        // retiring the export back to native.
-        let retired = EffectsPlan::compute(&plain, EffectsContext::default());
-        assert!(!retired.requires_texture);
-        assert!(!retired.requires_scene);
-    }
-
-    #[test]
     fn visual_opacity_uses_animated_value_across_native_and_scene_paths() {
         assert!((resolve_visual_opacity(0.8, None, 1.0, 1.0, 1.0) - 0.8).abs() < 1e-6);
         assert!((resolve_visual_opacity(0.8, Some(0.25), 1.0, 1.0, 1.0) - 0.25).abs() < 1e-6);
@@ -416,11 +364,10 @@ mod tests {
     }
 
     #[test]
-    fn native_node_opacity_stays_zero_while_visibility_hidden_or_under_export_repair() {
-        assert_eq!(resolve_native_node_opacity(1, false, false, 1.0), 0.0);
-        assert_eq!(resolve_native_node_opacity(0, true, false, 1.0), 0.0);
-        assert_eq!(resolve_native_node_opacity(0, true, true, 0.8), 0.0);
-        assert!((resolve_native_node_opacity(0, false, false, 0.75) - 0.75).abs() < 1e-6);
-        assert!((resolve_native_node_opacity(0, false, true, 0.25) - 1.0).abs() < 1e-6);
+    fn native_node_opacity_stays_zero_while_visibility_hidden() {
+        assert_eq!(resolve_native_node_opacity(true, false, 1.0), 0.0);
+        assert_eq!(resolve_native_node_opacity(true, true, 0.8), 0.0);
+        assert!((resolve_native_node_opacity(false, false, 0.75) - 0.75).abs() < 1e-6);
+        assert!((resolve_native_node_opacity(false, true, 0.25) - 1.0).abs() < 1e-6);
     }
 }

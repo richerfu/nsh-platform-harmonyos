@@ -135,10 +135,9 @@ impl Node {
             if self.text_drawing.borrow().is_some()
                 || self.canvas.borrow().is_some()
                 || self.style.borrow().effects.is_some()
-                || self.outlined.get()
+                || self.outlined.borrow().is_some()
             {
-                self.clear_drawn_export_target();
-                self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+                self.invalidate_paint()?;
             }
             if self.wrapper.borrow().is_some() {
                 // The outer node owns LayoutRect. Its native child still needs
@@ -146,11 +145,6 @@ impl Node {
                 self.native
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-            }
-        } else if let Some(target_id) = self.active_export_target_id() {
-            let marked = self.invalidate_unrecorded_export_paint(target_id)?;
-            if marked > 0 {
-                self.schedule_unrecorded_export_check(target_id, 2);
             }
         }
         // Size changes request measure/layout through LayoutRect. Position is a

@@ -245,8 +245,12 @@ pub(crate) fn nsh_update_window(
     platform_window_id: i32,
     visual: Vec<AvoidArea>,
     keyboard: AvoidArea,
+    max_refresh_rate: Option<u32>,
 ) -> Result<()> {
     if let Ok(host) = crate::app::session::get(session_id) {
+        if let Some(hz) = max_refresh_rate {
+            host.set_max_refresh_rate(hz);
+        }
         let visual = [
             visual.first().copied().unwrap_or_default(),
             visual.get(1).copied().unwrap_or_default(),

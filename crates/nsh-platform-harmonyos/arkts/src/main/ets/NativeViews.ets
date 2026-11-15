@@ -1,17 +1,17 @@
 import { NativeMenuItem, NativeMenuCleanup } from "./NativeMenus";
-import { TouchCoordinates, PointerPosting, TouchCancel, NativeRetirement } from "./NativePointer";
+import { PointerPosting, NativeRetirement } from "./NativePointer";
 import {
   BuilderNode,
+  NodeRenderType,
+  NodeController,
   ComponentContent,
   NodeContent,
-  NodeController,
-  NodeRenderType,
-  RenderOptions,
-  FrameNode,
 } from "@ohos.arkui.node";
 import { UIContext } from "@ohos.arkui.UIContext";
 import deviceInfo from "@ohos.deviceInfo";
 import { NshRuntimeContext } from "./NativeEditors";
+
+
 
 interface ViewAction {
   name: string;
@@ -25,7 +25,7 @@ interface ViewMenu {
   items: NativeMenuItem[];
 }
 export interface Settings {
-  textureSurface?: string | null;
+  textureSurface?: string;
   textureInsets?: TextureInsets | null;
   targetId: number;
   testId?: string | null;
@@ -232,8 +232,7 @@ class ViewState {
     this.settings = settings;
   }
 }
-// Custom roots preserve ArkUI's native export boundary. Observed settings refresh
-// their attributes without rebuilding the slot or changing its native ownership.
+// The source owns one native hierarchy and one texture destination for its lifetime.
 @Component
 struct SourceRoot {
   entry!: ViewEntry;
@@ -254,11 +253,11 @@ function sourceContent(params: ViewParameters) {
   SourceRoot({ entry: params.entry, state: params.entry.state });
 }
 @Component
-struct TextureRoot {
+struct TextureContainer {
   entry!: ViewEntry;
   @ObjectLink state!: ViewState;
   build() {
-    NodeContainer(this.entry.sourceController!)
+    NodeContainer(this.entry.textureController!)
       .width(captureWidth(this.state.settings))
       .height(captureHeight(this.state.settings))
       .clip(false)
@@ -266,53 +265,19 @@ struct TextureRoot {
   }
 }
 @Builder
-function textureContent(params: ViewParameters) {
-  TextureRoot({ entry: params.entry, state: params.entry.state });
-}
-@Component
-struct TextureContainer {
-  entry!: ViewEntry;
-  @ObjectLink state!: ViewState;
-  build() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      NodeContainer(this.entry.textureController!)
-        .width(captureWidth(this.state.settings))
-        .height(captureHeight(this.state.settings))
-        .clip(false)
-        .hitTestBehavior(HitTestMode.Transparent)
-        .onTouch((event: TouchEvent): void => {
-          this.entry.postMouseTouch(event);
-        })
-    }
-    .width(captureWidth(this.state.settings))
-    .height(captureHeight(this.state.settings))
-    .clip(false)
-    .hitTestBehavior(HitTestMode.Transparent);
-  }
-}
-@Component
-struct DirectRoot {
-  entry!: ViewEntry;
-  @ObjectLink state!: ViewState;
-  build() {
-    nativeView({ entry: this.entry, settings: this.state.settings });
-  }
-}
-@Builder
 function viewContent(params: ViewParameters) {
-  if (params.entry.textureNode) {
+  if (params.entry.textureController) {
     TextureContainer({ entry: params.entry, state: params.entry.state });
   } else {
-    DirectRoot({ entry: params.entry, state: params.entry.state });
+    SourceRoot({ entry: params.entry, state: params.entry.state });
   }
 }
 class ViewEntry {
+  readonly textureNode?: BuilderNode<[ViewParameters]>;
+  readonly textureController?: ViewController;
+  private textureDisposed: boolean = false;
   readonly state: ViewState;
   readonly slot: NodeContent = new NodeContent();
-  readonly textureNode?: BuilderNode<[ViewParameters]>;
-  readonly sourceNode?: BuilderNode<[ViewParameters]>;
-  readonly sourceController?: ViewController;
-  readonly textureController?: ViewController;
   private node: BuilderNode<[ViewParameters]>;
   private context: NshRuntimeContext;
   private ui: UIContext;
@@ -321,8 +286,6 @@ class ViewEntry {
   private attached: boolean = false;
   private retiredNative: boolean = false;
   private nodeDisposed: boolean = false;
-  private textureDisposed: boolean = false;
-  private sourceDisposed: boolean = false;
   private sdkBusy: boolean = false;
   private disposePending: boolean = false;
   private retirementFailure?: Error;
@@ -340,18 +303,12 @@ class ViewEntry {
     this.context = context;
     this.ui = context.getUIContext();
     this.pointerPosting = posting;
-    const options: RenderOptions | undefined =
-      settings.textureSurface == null
-        ? undefined
-        : {
-            type: NodeRenderType.RENDER_TYPE_TEXTURE,
-            surfaceId: settings.textureSurface,
-            selfIdealSize: { width: captureWidth(settings), height: captureHeight(settings) },
-          };
-    if (options !== undefined) {
-      this.textureNode = new BuilderNode<[ViewParameters]>(this.ui, options);
-      this.sourceNode = new BuilderNode<[ViewParameters]>(this.ui);
-      this.sourceController = new ViewController(this.sourceNode);
+    if (settings.textureSurface !== undefined) {
+      this.textureNode = new BuilderNode<[ViewParameters]>(this.ui, {
+        type: NodeRenderType.RENDER_TYPE_TEXTURE,
+        surfaceId: settings.textureSurface,
+        selfIdealSize: { width: captureWidth(settings), height: captureHeight(settings) },
+      });
       this.textureController = new ViewController(this.textureNode);
     }
     this.node = new BuilderNode<[ViewParameters]>(this.ui);
@@ -394,20 +351,7 @@ class ViewEntry {
     let stage: string = "build";
     try {
       const params: ViewParameters = { entry: this, settings: this.settings };
-      if (this.textureNode) {
-        this.sourceNode?.build(wrapBuilder(sourceContent), params, {
-          nestingBuilderSupported: true,
-        });
-        if (this.closed) {
-          throw new Error("Native wrapper creation was cancelled");
-        }
-        this.textureNode.build(wrapBuilder(textureContent), params, {
-          nestingBuilderSupported: true,
-        });
-      }
-      if (this.closed) {
-        throw new Error("Native wrapper creation was cancelled");
-      }
+      this.textureNode?.build(wrapBuilder(sourceContent), params, { nestingBuilderSupported: true });
       this.node.build(wrapBuilder(viewContent), params, { nestingBuilderSupported: true });
       if (this.closed || !this.context.isActive()) {
         throw new Error("Native wrapper creation was cancelled");
@@ -545,57 +489,6 @@ class ViewEntry {
     );
   }
 
-  postMouseTouch(event: TouchEvent): void {
-    const pointer = event.changedTouches[0]?.id;
-    const down = event.type === TouchType.Down;
-    const terminal = event.type === TouchType.Up || event.type === TouchType.Cancel;
-    const owner = pointer === undefined ? undefined : this.pointerPosting.owners.get(pointer);
-    const target = this.sourceNode;
-    if (
-      this.closed ||
-      this.pointerPosting.busy ||
-      !target ||
-      !this.context.isActive() ||
-      event.source !== SourceType.Mouse ||
-      pointer === undefined ||
-      (down ? owner !== undefined : owner?.owner !== String(this.settings.targetId))
-    ) {
-      return;
-    }
-    const offset = target.getFrameNode()?.getPositionToWindow();
-    if (!offset) {
-      return;
-    }
-    const coordinates = new TouchCoordinates(event);
-    this.pointerPosting.busy = true;
-    try {
-      coordinates.apply(this.ui, offset.x, offset.y);
-      const accepted = target.postInputEvent(event);
-      if (accepted) {
-        if (!terminal) {
-          const snapshot = new TouchCancel(event);
-          if (owner) {
-            owner.snapshot = snapshot;
-          } else {
-            this.pointerPosting.owners.set(pointer, {
-              owner: String(this.settings.targetId),
-              snapshot: snapshot,
-            });
-          }
-        }
-        event.stopPropagation();
-      } else if (down && !this.closed && this.context.isActive()) {
-        // Even a miss records DOWN in ArkUI. Close that attempt before another export tries.
-        coordinates.cancel();
-        target.postInputEvent(event);
-      }
-    } finally {
-      if (terminal) {
-        this.pointerPosting.owners.delete(pointer);
-      }
-      this.pointerPosting.finish(coordinates);
-    }
-  }
   menuOptions(lease: MenuLease): MenuOptions {
     const menu = this.settings.menu;
     return {
@@ -670,26 +563,7 @@ class ViewEntry {
         failure ??= error instanceof Error ? error : new Error(String(error));
       }
     };
-    step((): void => {
-      this.pointerPosting.owners.forEach((stream, pointer: number): void => {
-        if (stream.owner !== String(this.settings.targetId)) {
-          return;
-        }
-        this.pointerPosting.owners.delete(pointer);
-        if (!this.sourceDisposed && this.sourceNode?.getFrameNode()) {
-          this.pointerPosting.busy = true;
-          try {
-            this.sourceNode.postInputEvent(stream.snapshot as TouchEvent);
-          } finally {
-            this.pointerPosting.finish();
-          }
-        }
-      });
-    });
-    // NodeContainer retains the node returned by its controller. Detach
-    // those edges before disposing the builders, including texture exports.
-    step((): void => this.textureController?.clear());
-    step((): void => this.sourceController?.clear());
+    this.textureController?.clear();
     if (!this.nodeDisposed) {
       step((): void => {
         this.node.dispose();
@@ -700,12 +574,6 @@ class ViewEntry {
       step((): void => {
         this.textureNode!.dispose();
         this.textureDisposed = true;
-      });
-    }
-    if (this.sourceNode && !this.sourceDisposed) {
-      step((): void => {
-        this.sourceNode!.dispose();
-        this.sourceDisposed = true;
       });
     }
     if (failure) {
@@ -762,9 +630,6 @@ export class NativeViews {
         if (entry && entry.isClosed()) {
           this.entries.delete(state.targetId);
           entry = undefined;
-        }
-        if (entry && entry.settings.textureSurface !== state.textureSurface) {
-          throw new Error("Texture replacement requires a fresh native target");
         }
         if (entry) {
           entry.update(state);

@@ -34,8 +34,8 @@ Features:
   serves `nsh/base`'s UI set, then each crate's `#[native_module]` `registry()` (`app!(sets = [..])`), while the
   bundle is a raw file of the HAP as for any TSX app.
 - **Mount items** (`src/render/mount.rs`): `Shader`, `ShaderTransition` and `NavShader` are implemented; `ShaderInput`
-  is a no-op because ArkUI's `RenderNode` texture producer reports native content updates directly (including native
-  input and scroll changes between engine batches); and the terminal-only projections (`TreeOrder`, `ProjectStates`)
+  invalidates enclosing effects. NativeImage frame-available events deliver changed native content, including
+  scrolling and nested shader fills, without a UI-thread capture request. The terminal-only projections (`TreeOrder`, `ProjectStates`)
   are ignored.
 - **Streaming assets**: the video player and web views read large files through `services::assets::StreamAssets`,
   this backend's trait over `nsh_engine::Assets`.
@@ -47,14 +47,13 @@ Features:
   explicitly from the provided `UIContext` (`UIAbilityContext` and `Window`) in a standard `UIAbility` without a custom
   base class or process-global context guessing.
 - **Commits, frames and frame-rate arbitration** (`src/render/`, `src/app/frame_rate.rs`, `src/app/runtime.rs`): the
-  engine submits each `MountBatch` through a N-API threadsafe function to the ArkUI UI thread. `OH_ArkUI_PostFrameCallback`
-  (falling back to per-surface `NativeVSync` before attachment) drives demanded UI frames on the UI thread while `FrameRate`
-  arbitrates UI animation demand (`Uncapped` or reduced-rate `Capped`, e.g. `30` Hz) and shader compositor demand as the
-  single owner of `OH_NativeVSync_SetExpectedFrameRateRange`; idle surfaces and native `Scroll` gestures schedule zero
-  synthetic keepalive callbacks on the UI thread. Intentional policy: while any GPU shader holds an active vote
-  (`shader_votes > 0`), `FrameRate` pins the shared `NativeVSync` range to full panel `hz`, overriding concurrent
-  `UiDemand::Capped` caps until the last shader vote drops (per-consumer UI throttling, if ever needed alongside a live
-  shader, belongs in `Animator` rather than lowering the shared VSync handle).
+  engine submits each `MountBatch` through a N-API threadsafe function to the ArkUI UI thread. The surface's
+  window-associated `NativeVSync` drives demanded NSH animation frames; its callback posts UI work through
+  that same dispatcher and never accesses ArkUI off the UI thread. `FrameRate` owns the rate request on
+  this actual frame source, combining explicit UI caps with the compositor's animation demand. Uncapped
+  animations request the display's maximum supported rate supplied by the window host. Idle surfaces
+  request no synthetic keepalive frames. GPU animations keep the shared clock at the panel rate;
+  explicit UI caps resume when the last GPU vote ends.
 - **Device tests** (`nsh-platform-harmonyos-cli/src/test/`, `src/app/testing.rs`, `src/render/mount/testing.rs`): the
   CLI runs NSH's public `TestRun` and `Agent`, with a `RemoteScene` over the dev protocol. The device's `Model`
   observes mount batches and provides selectors, storage, network mocks and the manual clock. ArkUI answers native
@@ -64,19 +63,34 @@ Features:
 - **Shaders and composition** (`src/render/shader/`, `src/render/composition/`, `src/interop/`): a per-surface
   `nsh-compositor` worker thread owns an EGL / GLES 3 (`glow`) context and renders outside the ArkUI UI thread across
   three lanes:
-  1. **Native ArkUI path**: standard views, transforms, opacity, single blur / backdrop-blur and native blend modes stay
-     entirely on ArkUI `C-API` nodes without texture export or GPU worker involvement. `Attribute::Blur` and
+  1. **Native ArkUI content**: standard views, transforms, opacity, single blur / backdrop-blur and native blend modes
+     are drawn by ArkUI `C-API` nodes into the surface's native texture producer. `Attribute::Blur` and
      `Attribute::BackdropBlur` pass through `native_blur_value(css_radius, scale)`, inverting ArkUI/Rosen's
      physical-pixel `ConvertRadiusToSigma(r) = 0.57735 * r + 0.5` mapping so native blur matches CSS `sigma = radius * scale`.
-  2. **Direct GPU path** (`fill.rs`, `worker.rs` `Composite`): standalone fill shaders render directly into a child C
-     `XComponent` surface, while content shaders, non-blur filter chains, `ShaderTransition` and `NavShader` export the
-     wrapped subtree via ArkTS `BuilderNode` texture export (`RENDER_TYPE_TEXTURE` -> `OH_NativeImage` OES external
-     texture) into a presentation `XComponent` without CPU readback or synchronous wrapper-preview `PixelMap` snapshots.
-     Navigation `transitionShader` capture is demand-driven per active transition—reusing an existing `Composite`'s GPU
-     output immediately or exporting only the leaving picture root until its snapshot lands (`500` ms fallback deadline
-     to standard motion), causing zero idle texture exports or backdrop-blur `Scene` promotions. Fill shaders retain
-     `dirty = true` with bounded backoff retries across transient GL/window errors (failing immediately without retry on
-     shader compilation errors and preserving any previous bound window on `Window` bind errors).
+  2. **GPU effects** (`fill.rs`, `worker.rs` `Composite`): standalone fill shaders render directly into a child C
+     `XComponent` surface. Content shaders, filter chains and transitions use a `BuilderNode` texture export
+     into a `NativeImage`, then sample its external OES texture on the compositor worker. This follows the upstream
+     split between native content recording and GPU effect presentation; there is no component snapshot, PixelMap
+     transfer, or CPU readback for these GPU effects. Surface roots retain their output queue throughout their
+     lifetime. Without sampling effects, ArkUI exports directly into that queue; the compositor performs no
+     full-screen copy. When sampling is needed, the export targets a NativeImage and GLES submits to the same
+     output queue. EGL releases its surface when returning the queue to the native producer. Other nodes
+     export only for their own effects.
+     This permanent-root-export approach remains a candidate: physical-device regression found an ordinary-page
+     rendering cost that fails the 120 FPS requirement. See [shader regression](shader-regression.md) for the
+     measurements and the rejected on-demand alternative; the flicker result alone does not establish acceptance.
+     A stable layout wrapper owns the content parent and sibling presentation surface. Attachment generations and
+     worker release acknowledgement bound their lifetimes. Fullscreen shader changes update the root effect’s
+     composition while the displayed queue retains its last buffer until the next producer submits. Shader
+     programs adapt their vertex clip space to the top-left texture convention, avoiding a separate output-flip
+     copy. Navigation retains a GPU texture of the old picture
+     for the transition, just as upstream transitions retain their before image.
+     Custom text, canvas ink, outlines, shadows and header glyphs use native `RenderNode` content modifiers
+     (`paint_node.rs`). C custom-node draw events record one-shot commands via `DrawOnNode`; those recordings are not
+     replayed by Rosen’s `DoFlushModifier` when a subtree changes renderer. A content modifier retains its draw
+     callback, so renderer migration records the current ink without scroll tracking, subtree repaint loops or
+     frame-count delays. Its property is invalidated only by actual content changes. The modifier is attached to its node
+     before the property is attached, so Rosen assigns that property a live invalidation target.
   3. **Surface `Scene` path** (`scene.rs`, `draw.rs`): subtrees requiring CSS `mask-image` (`masks[0]`, matching
      upstream mobile backends), multi-filter / backdrop-filter combinations, shader backdrop sampling, or blend modes
      unsupported natively are promoted into a minimal stable `Scene` root (`scene_root_for` keeps non-overflowing
@@ -84,12 +98,12 @@ Features:
      background covers the projected sample bounds). `Scene::prepare` builds the composition plan via `paint_plan()` /
      `build_paint_tree()`, commits processed state only on success under an RAII `preparing` guard, marks `Unsupported`
      requirements ineligible with one diagnostic, retries transient errors with bounded backoff (`0` / `100` / `500` ms),
-     and unconditionally clears `scene_prepared` / `scene_root` on rollback. `nsh-compositor` reads exported `OES`
-     planes into bounded RGBA bitmaps, composites CPU masks / backdrop filters (`TileMode::Clamp`) and blends, runs any
+     and unconditionally clears `scene_prepared` / `scene_root` on rollback. `nsh-compositor` reads exported NativeImage textures
+     as bounded RGBA bitmaps, composites CPU masks / backdrop filters (`TileMode::Clamp`) and blends, runs any
      attached GLES passes, presents onto the `Scene` root wrapper's custom draw canvas, and logs throttled
      `[NSH] scene-stats` counters (active planes, readback bytes, upload bytes).
-     Platform limitation: embedded separate hardware surfaces (`Video` / `ArkWeb` `XComponent`s) inside a `BuilderNode`
-     texture export depend on system surface composition and are not guaranteed to appear in exported textures.
+     Platform limitation: embedded separate hardware surfaces (`Video` / `ArkWeb` `XComponent`s) inside texture exports depend on
+     system surface composition support; their inclusion must be checked on the target OS.
 - **Typography** (`src/text/`): the engine thread shapes and measures paragraphs with `ohos-drawing-binding`
   (`FontCollection::shared()`, `Typography`) and hands recorded native drawing commands and selection geometry to the UI
   thread.

@@ -1,12 +1,11 @@
 //! Fill layers on the surface's compositor context and VSync.
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use nsh_core::{NodeId, animation::AnimationValue, shader::ShaderLayer};
 use ohos_native_window_binding::NativeWindow;
 use rustc_hash::FxHashMap;
 
 use super::{
-    fill_retry::{FillFailureAction, FillRetry},
     gles::{self, Effects},
     readback::{TextureContext, Window},
 };
@@ -41,21 +40,17 @@ struct View {
     shown: bool,
     dirty: bool,
     window_dirty: bool,
-    retry: FillRetry,
+    failed: bool,
 }
 impl View {
-    /// True while the view needs VSync wakeups (including during backoff before
-    /// `retry_at` expires, so static fills wake once their backoff elapses).
+    /// Only live output work requests a compositor frame.
     fn needs_wake(&self) -> bool {
-        !self.retry.has_invalid_layer()
+        !self.failed
             && self.shown
             && self.window.is_some()
             && self.size.0 > 0
             && self.size.1 > 0
             && (self.dirty || self.window_dirty || self.effects.wants_frame())
-    }
-    fn due(&self, now: Instant) -> bool {
-        self.needs_wake() && self.retry.due(now)
     }
     fn render(&mut self) -> Result<(), gles::Error> {
         let (width, height, scale) =
@@ -75,32 +70,18 @@ impl View {
         }
         self.dirty = false;
         self.window_dirty = false;
-        self.retry.on_render_success();
         Ok(())
     }
-    fn handle_render_error(
-        &mut self,
-        key: Key,
-        error: &gles::Error,
-        now: Instant,
-        route: Option<&Dispatcher>,
-    ) {
+    fn handle_render_error(&mut self, key: Key, error: &gles::Error, route: Option<&Dispatcher>) {
         log::warn!("shader fill: {error}");
-        match self.retry.on_render_failure(now, error.is_retryable()) {
-            FillFailureAction::RetryLater => {
-                self.dirty = true;
-            }
-            FillFailureAction::GiveUp { report } => {
-                self.shown = false;
-                self.dirty = false;
-                self.window_dirty = false;
-                if report && let Some(route) = route {
-                    route.send(Message::Error(format!(
-                        "shader fill node {}: {error}",
-                        key.id
-                    )));
-                }
-            }
+        self.failed = true;
+        self.dirty = false;
+        self.window_dirty = false;
+        if let Some(route) = route {
+            route.send(Message::Error(format!(
+                "shader fill node {}: {error}",
+                key.id
+            )));
         }
     }
 }
@@ -179,16 +160,16 @@ impl Fills {
                     shown: false,
                     dirty: true,
                     window_dirty: false,
-                    retry: FillRetry::default(),
+                    failed: false,
                 });
                 view.overflow = layer.overflow.0.max(0.0);
-                view.retry.on_new_layer();
+                view.failed = false;
                 match view.effects.layers(&[(key.id, layer)]) {
                     Ok(()) => {
                         view.dirty = true;
                     }
                     Err(error) => {
-                        view.handle_render_error(key, &error, Instant::now(), route);
+                        view.handle_render_error(key, &error, route);
                     }
                 }
             }
@@ -237,13 +218,10 @@ impl Fills {
             }
             Command::Shown(key, shown) => {
                 if let Some(view) = self.views.get_mut(&key) {
-                    if view.retry.has_invalid_layer() {
+                    if view.failed {
                         view.shown = false;
                         view.dirty = false;
                         return;
-                    }
-                    if shown && !view.shown {
-                        view.retry.reset_transient();
                     }
                     view.shown = shown;
                     view.dirty |= shown;
@@ -258,35 +236,13 @@ impl Fills {
                         existing.invalidate_geometry();
                         view.window_dirty = true;
                         view.dirty = true;
-                        view.retry.on_window_attached();
+                        view.failed = false;
                         return;
                     }
-                    match gpu.window(window) {
-                        Ok(next) => {
-                            view.window = Some(next);
-                            view.window_dirty = true;
-                            view.dirty = true;
-                            view.retry.on_window_attached();
-                        }
-                        Err(error) => {
-                            // Keep any previously bound window alive and mark window_dirty
-                            // so presentation retries rather than silently dropping output.
-                            view.window_dirty = true;
-                            view.dirty = true;
-                            log::warn!("shader fill window: {error}");
-                            if view
-                                .retry
-                                .on_window_failure(view.window.is_some())
-                                .report_error
-                                && let Some(route) = route
-                            {
-                                route.send(Message::Error(format!(
-                                    "shader fill node {} window: {error}",
-                                    key.id
-                                )));
-                            }
-                        }
-                    }
+                    view.window = Some(gpu.window(window));
+                    view.window_dirty = true;
+                    view.dirty = true;
+                    view.failed = false;
                 }
             }
             Command::WindowGone(key, raw) => {
@@ -299,13 +255,14 @@ impl Fills {
             Command::Remove(key) => self.remove(key),
         }
     }
-    pub(super) fn render(&mut self, now: Instant, route: Option<&Dispatcher>) {
+    pub(super) fn render(&mut self, route: Option<&Dispatcher>) {
+        let _trace = super::trace::Scope::new(c"NSH fills");
         for (&key, view) in &mut self.views {
-            if !view.due(now) {
+            if !view.needs_wake() {
                 continue;
             }
             if let Err(error) = view.render() {
-                view.handle_render_error(key, &error, now, route);
+                view.handle_render_error(key, &error, route);
             }
         }
     }

@@ -521,6 +521,8 @@ impl ImageView {
                             );
                         }
                         owner.emit(EventKind::LoadEnd, EventPayload::None);
+                        owner.invalidate_composites();
+                        owner.flush_arkui()?;
                     }
                     Ok(())
                 })

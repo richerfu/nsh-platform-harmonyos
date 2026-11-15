@@ -76,6 +76,7 @@ pub(crate) struct HostInit {
     pub cache_dir: String,
     pub files_dir: String,
     pub pixel_ratio: f64,
+    pub max_refresh_rate: Option<u32>,
     pub rtl: bool,
     pub lifecycle: String,
     pub color_mode: i32,
@@ -188,6 +189,7 @@ pub(crate) struct Services {
     id: u32,
     active: AtomicBool,
     pixel_ratio: AtomicU32,
+    max_refresh_rate: AtomicU32,
     loads: AtomicUsize,
     resource_lock: Mutex<()>,
     resource_manager: Arc<ResourceManager>,
@@ -232,6 +234,14 @@ impl Drop for LoadPermit {
 }
 
 impl Services {
+    pub(crate) fn max_refresh_rate(&self) -> u32 {
+        crate::app::frame_rate::normalize_display_hz(self.max_refresh_rate.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_max_refresh_rate(&self, hz: u32) {
+        self.max_refresh_rate.store(hz, Ordering::Relaxed);
+    }
+
     pub(crate) fn window_id(&self) -> Option<u64> {
         let id = self.window_id.load(Ordering::Acquire);
         (id != 0).then_some(u64::from(id))
@@ -667,6 +677,10 @@ impl Services {
             id,
             active: AtomicBool::new(true),
             pixel_ratio: AtomicU32::new((init.pixel_ratio as f32).to_bits()),
+            max_refresh_rate: AtomicU32::new(
+                init.max_refresh_rate
+                    .unwrap_or_else(ohos_display_binding::default_display_refresh_rate),
+            ),
             loads: AtomicUsize::new(0),
             resource_lock: Mutex::new(()),
             resource_manager: Arc::new(resource_manager),

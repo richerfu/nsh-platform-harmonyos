@@ -18,11 +18,7 @@ impl Node {
         })
     }
     pub(crate) fn desired_visibility(&self) -> i32 {
-        if self.retained.get()
-            || self.clearing_export.get()
-            || !self.header_item_visible()
-            || self.is_settled_popped_screen()
-        {
+        if self.retained.get() || !self.header_item_visible() || self.is_settled_popped_screen() {
             2
         } else if self
             .screen
@@ -34,11 +30,6 @@ impl Node {
         } else {
             i32::from(self.style.borrow().hidden)
         }
-    }
-    pub(crate) fn invalidate_applied_transform(&self) {
-        let mut applied = self.applied.get();
-        applied.transform = None;
-        self.applied.set(applied);
     }
     pub(crate) fn native_visibility_hidden(&self) -> bool {
         self.desired_visibility() != 0 || self.backface_away.get()
@@ -161,13 +152,8 @@ impl Node {
         let native = visual.borrow();
         if is_identity {
             self.backface_away.set(false);
-            let visibility = if self.export_repair.get() != 0 {
-                0
-            } else {
-                self.desired_visibility()
-            };
+            let visibility = self.desired_visibility();
             let visibility_changed = applied.visibility != visibility;
-            let revealed = visibility_changed && applied.visibility != 0 && visibility == 0;
             if visibility_changed {
                 native.set_i32_attribute(Attribute::Visibility, visibility)?;
                 applied.visibility = visibility;
@@ -184,9 +170,6 @@ impl Node {
                 if visibility != 0 {
                     self.notify_mount_parent_visibility_hidden()?;
                 }
-            }
-            if revealed {
-                self.schedule_subtree_paint(2)?;
             }
             if self.input_transform.replace(Matrix::IDENTITY) != Matrix::IDENTITY {
                 self.invalidate_composites();
@@ -235,9 +218,7 @@ impl Node {
         }
         self.backface_away
             .set(style.backface_hidden && m.0[10] < 0.0);
-        let visibility = if self.export_repair.get() != 0 {
-            0
-        } else {
+        let visibility = {
             let desired = self.desired_visibility();
             if desired != 0 {
                 desired
@@ -246,7 +227,6 @@ impl Node {
             }
         };
         let visibility_changed = applied.visibility != visibility;
-        let revealed = visibility_changed && applied.visibility != 0 && visibility == 0;
         if visibility_changed {
             native.set_i32_attribute(Attribute::Visibility, visibility)?;
             applied.visibility = visibility;
@@ -281,9 +261,6 @@ impl Node {
             if visibility != 0 {
                 self.notify_mount_parent_visibility_hidden()?;
             }
-        }
-        if revealed {
-            self.schedule_subtree_paint(2)?;
         }
         let origin = (ox as f64, oy as f64, oz as f64);
         let mut before = Matrix::IDENTITY;

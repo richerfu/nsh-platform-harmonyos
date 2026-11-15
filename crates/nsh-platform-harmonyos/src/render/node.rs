@@ -1,7 +1,6 @@
 //! Main-thread ArkUI nodes. Callbacks hold weak references; the mounter owns
 //! the nodes through detachment and frame-delayed retirement.
 
-pub(crate) mod export_paint;
 mod layout;
 mod lifecycle;
 mod motion;
@@ -25,30 +24,6 @@ use crate::{
 };
 
 pub(crate) type NativeNode = Rc<RefCell<ArkUINode>>;
-
-pub(crate) trait FrameCallbackExt {
-    /// Registers a next-VSync `OH_ArkUI_PostFrameCallback` on this node's
-    /// `UIContext` and pulses `NodeDirtyFlag::NeedRender` so OpenHarmony's
-    /// `PipelineContext::RequestFrame()` schedules the `UIVsyncTask` even
-    /// when no other node in the context was mutated on this turn.
-    fn post_frame_callback_dirty(
-        &self,
-        callback: impl FnOnce(u64, u32) + 'static,
-    ) -> std::result::Result<(), ohos_arkui_binding::common::error::ArkUIError>;
-}
-
-impl FrameCallbackExt for ArkUINode {
-    fn post_frame_callback_dirty(
-        &self,
-        callback: impl FnOnce(u64, u32) + 'static,
-    ) -> std::result::Result<(), ohos_arkui_binding::common::error::ArkUIError> {
-        self.post_frame_callback(callback)?;
-        if self.is_owned() {
-            let _ = self.mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
@@ -160,9 +135,6 @@ pub(crate) struct Node {
     pub(crate) video: RefCell<Option<crate::media::video::Video>>,
     pub(crate) web: RefCell<Option<crate::media::webview::WebView>>,
     pub(crate) active: Cell<bool>,
-    pub(crate) export_repair: Cell<u32>,
-    pub(crate) clearing_export: Cell<bool>,
-    pub(crate) bridged_on_root_outer: Cell<bool>,
     pub(crate) retained: Cell<bool>,
     pub(crate) retained_owner: RefCell<Weak<Node>>,
     pub(crate) retained_children: RefCell<Vec<Weak<Node>>>,
@@ -172,7 +144,6 @@ pub(crate) struct Node {
     pub(crate) animated_opacity: Cell<Option<f32>>,
     applied: Cell<AppliedStyle>,
     styled: Cell<bool>,
-    paint_state: Cell<super::subtree_paint::SubtreePaint>,
     pub(crate) live: RefCell<Option<Box<crate::render::transition::Live>>>,
     /// Leaving (an exit transition, a popped screen): changed only through
     /// [`Node::set_leaving`], which keeps the surface's count of them.
@@ -181,11 +152,8 @@ pub(crate) struct Node {
     navigation_presentation: Cell<(f32, f32)>,
     decoration: crate::render::decor::Decoration,
     layout_callbacks: Cell<bool>,
-    drawing: Cell<bool>,
-    outlined: Cell<bool>,
-    drawn_export_target: Cell<u32>,
-    drawn_outline_export_target: Cell<u32>,
-    unrecorded_check_state: Cell<(u32, u8)>,
+    drawing: RefCell<Option<super::paint_node::PaintNode>>,
+    outlined: RefCell<Option<super::paint_node::PaintNode>>,
     shadow_layer: RefCell<Option<Rc<super::shadow::ShadowLayer>>>,
     pub(crate) text_drawing: RefCell<Option<crate::text::typography::TextDrawing>>,
     pub(crate) selection_area: RefCell<Option<crate::text::selection::area::Area>>,

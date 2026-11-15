@@ -5,12 +5,11 @@ use std::rc::Rc;
 use nsh_core::{Points, ViewKind, ViewStyle};
 use ohos_arkui_binding::{
     common::attribute::ArkUINodeAttributeNumber as Number,
-    component::attribute::{ArkUICommonAttribute, ArkUIEvent},
+    component::attribute::ArkUICommonAttribute,
     types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
 };
-use ohos_drawing_binding::Canvas;
 
-use super::{NativeNode, Node, Result, callback};
+use super::{NativeNode, Node, Result};
 use crate::{render::geometry::Size, text::typography::argb};
 
 impl Node {
@@ -23,8 +22,7 @@ impl Node {
         self.native
             .borrow()
             .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-        self.clear_drawn_export_target();
-        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        self.invalidate_paint()?;
         Ok(())
     }
 
@@ -61,38 +59,33 @@ impl Node {
     }
     pub(crate) fn style(self: &Rc<Self>, style: &ViewStyle) -> Result<()> {
         self.invalidate_composites();
-        if style.outline.width.0 > 0.0 && !self.outlined.replace(true) {
+        if style.outline.width.0 > 0.0 && self.outlined.borrow().is_none() {
             let weak = Rc::downgrade(self);
-            self.native
-                .borrow_mut()
-                .on_custom_foreground_draw(move |event| {
-                    callback(|| {
-                        if let Some(node) = weak.upgrade()
-                            && !node.scene_active()
-                            && let Some(raw) =
-                                event.draw_context_in_draw().and_then(|ctx| ctx.canvas())
-                        {
-                            // SAFETY: ArkUI retains this drawing context for this callback.
-                            let canvas = unsafe { Canvas::from_raw_borrowed(raw) };
-                            let frame = node.frame.get();
-                            node.decoration.outline(
-                                &canvas,
-                                &node.style.borrow(),
-                                Size::new(frame.width, frame.height),
-                                node.scale.get(),
-                            );
-                            node.drawn_outline_export_target
-                                .set(node.recordable_export_target_id());
-                        }
-                        Ok(())
-                    })
-                });
+            let paint = crate::render::paint_node::PaintNode::new(move |canvas| {
+                if let Some(node) = weak.upgrade()
+                    && !node.scene_active()
+                {
+                    let outset = (node.applied.get().ink_outset * node.scale.get()).ceil();
+                    canvas.save();
+                    canvas.translate(outset, outset);
+                    let frame = node.frame.get();
+                    node.decoration.outline(
+                        canvas,
+                        &node.style.borrow(),
+                        Size::new(frame.width, frame.height),
+                        node.scale.get(),
+                    );
+                    canvas.restore();
+                }
+            })?;
+            paint.native.borrow().z_index(i32::MAX)?;
+            self.native.borrow_mut().add_child(paint.native.clone())?;
+            *self.outlined.borrow_mut() = Some(paint);
         }
         if self.style.borrow().effects != style.effects
             || self.style.borrow().outline != style.outline
         {
-            self.clear_drawn_export_target();
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
         }
         let cursor_changed = self.style.borrow().cursor != style.cursor;
         let mut target = Box::new(style.clone());
@@ -178,19 +171,15 @@ impl Node {
                     .contains(nsh_core::shader::ShaderInput::Backdrop)
             });
         drop(shaders);
-        let shader_keep_alive = unhidden && self.shaders.keep_alive(self.id);
-        let composite_active = self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
-            wrapper
-                .composite
-                .borrow()
-                .as_ref()
-                .is_some_and(|composite| composite.surface().is_some())
-        });
+        let composite_active = self
+            .wrapper
+            .borrow()
+            .as_ref()
+            .is_some_and(|wrapper| wrapper.composite.borrow().as_ref().is_some());
         crate::render::effects::EffectsPlan::compute(
             style,
             crate::render::effects::EffectsContext {
                 has_shaders,
-                shader_keep_alive,
                 shader_samples_backdrop,
                 navigation_capture: surface_active && self.navigation_capture.get(),
                 scene_active: self.scene_active(),
@@ -298,7 +287,6 @@ impl Node {
         self.interaction.opacity(
             self,
             crate::render::effects::resolve_native_node_opacity(
-                self.export_repair.get(),
                 self.native_visibility_hidden(),
                 scene_active,
                 self.visual_opacity_for(style_opacity),
@@ -395,7 +383,7 @@ impl Node {
         self.applied.set(applied);
         Ok(())
     }
-    /// Outlines still use the foreground callback; box shadows own bounded nodes.
+    /// Outlines and box shadows own bounded retained paint nodes.
     pub(super) fn apply_ink_outset(&self, style: &ViewStyle) -> Result<()> {
         let mut outset = 0.0f32;
         if style.outline.is_visible() {
@@ -407,6 +395,7 @@ impl Node {
             applied.ink_outset = outset;
             self.applied.set(applied);
             self.invalidate_ink(outset.max(1.0))?;
+            self.invalidate_paint()?;
         }
         Ok(())
     }
@@ -573,7 +562,7 @@ impl Node {
                     .iter()
                     .any(|shadow| shadow.inset && shadow.is_visible())
         }) {
-            self.enable_drawing();
+            self.enable_drawing()?;
         }
         crate::render::decor::warn_repeating_conic(self, style);
         self.ensure_shadow_layer(style)?;
@@ -597,45 +586,11 @@ impl Node {
     }
     pub(crate) fn reset_text_tint(&self) -> Result<()> {
         if self.tint.take().is_some() {
-            self.clear_drawn_export_target();
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
         }
         Ok(())
     }
-    pub(crate) fn export_hidden(&self) -> bool {
-        self.applied.get().visibility != 0 || self.export_repair.get() != 0
-    }
-    pub(crate) fn restore_after_export(self: &Rc<Self>) -> Result<()> {
-        if !self.active.get() {
-            return Ok(());
-        }
-        self.clear_drawn_export_target();
-        let mut applied = self.applied.get();
-        applied.visibility = -1;
-        self.applied.set(applied);
-        self.interaction.invalidate_opacity();
-        self.restore_style()?;
-        let inherited = self
-            .parent_node
-            .borrow()
-            .upgrade()
-            .is_some_and(|parent| parent.interaction.blocks_children());
-        self.interaction.pointer(self, inherited)?;
-        self.accessibility_state.changed(self);
-        Ok(())
-    }
-    pub(crate) fn restore_export_controls(&self) -> Result<()> {
-        if !self.active.get() {
-            return Ok(());
-        }
-        if let Some(screen) = self.screen.borrow().as_ref() {
-            screen.restore_visibility()?;
-        }
-        if let Some(video) = self.video.borrow().as_ref() {
-            video.restore_visibility()?;
-        }
-        Ok(())
-    }
+
     pub(crate) fn restore_style(&self) -> Result<()> {
         self.apply_style(&self.style.borrow())
     }

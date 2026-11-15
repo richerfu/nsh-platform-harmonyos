@@ -1,7 +1,6 @@
 //! Surface-local text selection. UI callbacks consume owned geometry, never typography.
 use std::{ops::Range, rc::Rc};
 
-use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
 use ohos_drawing_binding::{Brush, Canvas, Point, Rect};
 
 use super::area::{Area, project};
@@ -127,8 +126,7 @@ impl Node {
             self.selection.invalidate_menu();
             self.selection.handles.set([false; 2]);
             *self.selection.geometry.borrow_mut() = Default::default();
-            self.clear_drawn_export_target();
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
         }
         Ok(())
     }
@@ -171,8 +169,7 @@ impl Node {
         }
         self.selection.invalidate_menu();
         self.selection.range.set(Some((range.start, range.end)));
-        self.clear_drawn_export_target();
-        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        self.invalidate_paint()?;
         Ok(())
     }
     pub(crate) fn selection_extend(&self, point: (f32, f32)) -> Result<()> {

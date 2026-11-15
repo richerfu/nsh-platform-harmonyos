@@ -374,6 +374,25 @@ pub(crate) fn outline(style: &ViewStyle, size: Size, spread: f32) -> Path {
     )
     .to_array()
     .map(|r| r.0);
+    if !style.continuous_corners {
+        // Preserve the native rounded-rectangle primitive. Expanding circular
+        // corners into cubics prevents the renderer's rounded-rect blur path.
+        let rect = Rect::new(-spread, -spread, w - spread, h - spread);
+        let mut round_rect = RoundRect::new(&rect, 0.0, 0.0);
+        for (corner, radius) in [
+            CornerPosition::TopLeft,
+            CornerPosition::TopRight,
+            CornerPosition::BottomRight,
+            CornerPosition::BottomLeft,
+        ]
+        .into_iter()
+        .zip(radii)
+        {
+            round_rect.set_corner(corner, radius, radius);
+        }
+        path.add_round_rect(&round_rect, PathDirection::Cw);
+        return path;
+    }
     nsh_core::shape::rounded_rect(
         nsh_core::Bounds::new(
             nsh_core::Point::new(Points(-spread), Points(-spread)),

@@ -118,9 +118,7 @@ impl Shaders {
     pub(crate) fn hosts_retainable(&self) -> bool {
         self.effects.hosts_retainable()
     }
-    pub(crate) fn keep_alive(&self, id: NodeId) -> bool {
-        self.effects.keep_alive(id)
-    }
+
     pub(crate) fn has_navigation_layer(&self, target_id: NodeId) -> bool {
         self.effects.has_navigation_layer(target_id)
     }
@@ -128,14 +126,7 @@ impl Shaders {
         self.reconcile_hosts()
     }
     fn reconcile_hosts(&self) -> Result<()> {
-        let has_fill_in_root = self.views.borrow().values().any(|state| {
-            state
-                .owner
-                .upgrade()
-                .is_some_and(|owner| effects::mounted_and_unhidden_in_root(&owner))
-        });
-        let fill_count = self.views.borrow().len();
-        self.effects.reconcile_hosts(has_fill_in_root, fill_count)
+        self.effects.reconcile_hosts()
     }
 
     pub(crate) fn set(&self, owner: &Rc<Node>, layer: Option<Arc<ShaderLayer>>) -> Result<()> {
@@ -143,7 +134,6 @@ impl Shaders {
             self.remove(owner.id);
             return Ok(());
         };
-        self.effects.prewarm_root_early(owner)?;
         if layer.role != nsh_core::shader::ShaderRole::Fill {
             if self.views.borrow().contains_key(&owner.id) {
                 self.remove(owner.id);
@@ -281,9 +271,6 @@ impl Shaders {
     pub(crate) fn cancel_navigation(&self, reason: &str) -> Result<()> {
         self.effects.cancel_navigation(reason)
     }
-    pub(crate) fn expire_captures(&self) -> Result<()> {
-        self.effects.expire_captures()
-    }
     pub(crate) fn log_idle_configured(&self) {
         self.effects.log_idle_configured();
     }
@@ -326,14 +313,6 @@ impl Shaders {
                 callback(|| state.surface.dispose(Some(&state.parent)));
             }
         }
-    }
-
-    pub(crate) fn detach_immediately(&self, id: NodeId) -> Result<()> {
-        self.visibility.borrow_mut().remove(&id);
-        self.invalidate_visibility();
-        let effect_res = self.effects.remove(id);
-        self.retire_fill_view(id);
-        effect_res
     }
 
     pub(crate) fn remove(&self, id: NodeId) {
@@ -441,8 +420,6 @@ impl Shaders {
         }
         self.collect()
     }
-    /// `Message::Shader`: releases the surfaces of views the worker has let
-    /// go of.
     pub(crate) fn collect(&self) -> Result<()> {
         let worker = self.worker.borrow();
         let Some(worker) = worker.as_ref() else {

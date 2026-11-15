@@ -7,10 +7,7 @@ use napi_derive_ohos::napi;
 use napi_ohos::{Env, Error, Result, bindgen_prelude::Object};
 use rustc_hash::FxHashMap;
 
-use crate::{
-    interop::attachment::NativeAttachment,
-    render::node::{NativeNode, Node},
-};
+use crate::{interop::attachment::NativeAttachment, render::node::Node};
 
 #[derive(Clone, Debug, PartialEq)]
 #[napi(object)]
@@ -141,8 +138,8 @@ pub(crate) struct ViewOptions {
     pub width: f64,
     pub height: f64,
     pub hue: f64,
-    pub texture_surface: Option<String>,
     pub texture_insets: Option<TextureInsets>,
+    pub texture_surface: Option<String>,
     pub test_id: Option<String>,
     pub semantic: bool,
     pub clickable: bool,
@@ -224,8 +221,6 @@ pub(crate) struct WebDownload {
 // Only weak routes live here. Nodes, native targets and engines retain their own lifetime.
 struct ViewRegistration {
     owner: Weak<Node>,
-    inner: std::rc::Weak<std::cell::RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
-    export: std::rc::Rc<super::texture_export::Export>,
 }
 thread_local! {
     static VIEWS: RefCell<FxHashMap<u32, ViewRegistration>> = RefCell::default();
@@ -235,37 +230,22 @@ thread_local! {
 pub(crate) struct ViewRoute {
     id: u32,
     owner: Weak<Node>,
-    export: std::rc::Rc<super::texture_export::Export>,
 }
 impl ViewRoute {
-    pub(crate) fn new(id: u32, owner: Weak<Node>, inner: &NativeNode) -> Self {
-        let export = std::rc::Rc::new(super::texture_export::Export::default());
+    pub(crate) fn new(id: u32, owner: Weak<Node>) -> Self {
         VIEWS.with(|views| {
             views.borrow_mut().insert(
                 id,
                 ViewRegistration {
                     owner: owner.clone(),
-                    inner: std::rc::Rc::downgrade(inner),
-                    export: export.clone(),
                 },
             )
         });
-        Self { id, owner, export }
-    }
-    pub(crate) fn texture(&self, enabled: bool) {
-        // A route is replaced at each export boundary. Subsequent style updates
-        // may precede its deferred ArkTS attachment; they must not disarm repair.
-        if enabled {
-            self.export.enabled.set(true);
-        }
-    }
-    pub(crate) fn is_repairing(&self) -> bool {
-        self.export.is_repairing()
+        Self { id, owner }
     }
 }
 impl Drop for ViewRoute {
     fn drop(&mut self) {
-        self.export.restore();
         VIEWS.with(|views| {
             let mut views = views.borrow_mut();
             if views
@@ -343,59 +323,20 @@ pub(crate) fn nsh_attach_native_subtree(
     #[napi(ts_arg_type = "FrameNode")] content: Object<'_>,
     #[napi(ts_arg_type = "NodeContent")] slot: Object<'_>,
 ) -> Result<()> {
-    let (owner, inner, export) = VIEWS
+    let owner = VIEWS
         .with(|views| {
-            views.borrow().get(&target_id).and_then(|route| {
-                route
-                    .owner
-                    .upgrade()
-                    .zip(route.inner.upgrade())
-                    .map(|(owner, inner)| (owner, inner, route.export.clone()))
-            })
+            views
+                .borrow()
+                .get(&target_id)
+                .and_then(|route| route.owner.upgrade())
         })
         .ok_or_else(|| Error::from_reason("Native subtree route is no longer live"))?;
-    let is_direct = owner.is_current_direct_target(target_id);
-    export
-        .prepare(&owner, &inner)
-        .map_err(|error| Error::from_reason(error.to_string()))?;
-    if let Err(error) = NativeAttachment::attach_subtree(&env, target_id, &content, &slot) {
-        export.restore();
-        return Err(error);
-    }
-    if is_direct {
-        if let Err(error) = owner.prepare_direct_target_attach() {
-            log::warn!(
-                "OHOS post-attach direct hold release failed for target {target_id}: {error}"
-            );
-        }
-    } else if let Err(error) = owner.on_export_target_attached(target_id) {
-        log::warn!("OHOS post-attach export target hook failed for target {target_id}: {error}");
-    }
-    if let Err(error) = owner.flush_pending_bridge_reattach_if_direct() {
-        log::warn!("OHOS post-attach bridge reattach failed for target {target_id}: {error}");
-    }
-    if is_direct && let Err(error) = owner.restore_subtree_scroll_offsets(true) {
-        log::warn!("OHOS post-attach scroll restore failed for target {target_id}: {error}");
-    }
-    if let Err(error) = owner.sync_subtree_scroll_offsets() {
-        log::warn!("OHOS post-attach scroll sync failed for target {target_id}: {error}");
-    }
-    let callback_host = owner.mounted();
-    if let Err(error) = export.after_attach(&callback_host, &inner) {
-        log::warn!("OHOS post-attach export repair failed for target {target_id}: {error}");
-    }
-    // Reparenting into or out of a texture export changes the render target
-    // across the attachment and surface-export frames. ArkUI's retained custom
-    // draw recordings must be rebuilt once the destination pipeline is live.
-    if let Err(error) = owner.invalidate_subtree_paint() {
-        log::warn!("OHOS post-attach subtree invalidate failed for target {target_id}: {error}");
-    }
-    if let Err(error) = owner.schedule_subtree_paint(6) {
-        log::warn!("OHOS post-attach subtree paint failed for target {target_id}: {error}");
-    }
-    if is_direct {
-        owner.notify_direct_target_attached();
-    }
+    NativeAttachment::attach_subtree(&env, target_id, &content, &slot)?;
+    owner.invalidate_composites();
+    owner
+        .update_wrapper()
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+
     Ok(())
 }
 

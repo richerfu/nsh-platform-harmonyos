@@ -24,7 +24,7 @@ use ohos_arkui_binding::{
 use crate::{
     render::{
         geometry::Size,
-        node::{FrameCallbackExt as _, NativeNode, Node, Result, callback},
+        node::{NativeNode, Node, Result, callback},
     },
     scroll::motion::{ZoomFrame, ZoomMotion, focal_offset, resisted_scale},
 };
@@ -71,9 +71,6 @@ pub(crate) struct Scroller {
     snap_limit: Cell<Option<f32>>,
     pinch: RefCell<Option<ohos_arkui_binding::gesture::inner_gesture::Gesture>>,
     selection_progress: RefCell<crate::text::selection::scroll::Progress>,
-    export_paint_offset: Cell<Option<(u32, f32, f32)>>,
-    reparent_offset: Cell<Option<(f32, f32)>>,
-    restoring_reparent: Cell<bool>,
 }
 
 impl Scroller {
@@ -200,9 +197,6 @@ impl Scroller {
             snap_limit: Cell::new(None),
             pinch: RefCell::default(),
             selection_progress: RefCell::default(),
-            export_paint_offset: Cell::new(None),
-            reparent_offset: Cell::new(None),
-            restoring_reparent: Cell::new(false),
         });
         let weak = Rc::downgrade(&scroll);
         scroll.content.borrow_mut().on_custom_measure(move |event| {
@@ -230,9 +224,6 @@ impl Scroller {
                     let position = event.position_in_layout();
                     event.set_layout_position(position.x, position.y)?;
                     owner.layout_children(event)?;
-                    if scroll.reparent_offset.get().is_some() {
-                        scroll.sync_saved_offset()?;
-                    }
                     if (scroll.layout_pending.get()
                         || scroll.zoom_offset.get().is_some()
                         || scroll.owed.get() != (0.0, 0.0))
@@ -253,7 +244,6 @@ impl Scroller {
                     if let Some(scroll) = weak.upgrade() {
                         let phase = event.component_i32(2).unwrap_or(0);
                         if phase == 1 {
-                            scroll.reparent_offset.set(None);
                             scroll.snap_limit.set(None);
                             scroll.zoom_motion.set(None);
                             scroll.owed.set((0.0, 0.0));
@@ -329,15 +319,10 @@ impl Scroller {
                 // one frame, which must not race a synchronized peer's commands.
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
-                        if scroll.restoring_reparent.get() || scroll.reparent_offset.get().is_some()
-                        {
-                            scroll.invalidate_exported_scroll(false)?;
-                            return Ok(());
-                        }
                         if scroll.applying_offset.get() {
                             scroll.report()?;
                         }
-                        scroll.invalidate_exported_scroll(false)?;
+                        scroll.invalidate_shader_input()?;
                     }
                     Ok(())
                 })
@@ -349,18 +334,13 @@ impl Scroller {
             .on_event(E::ScrollEventOnDidScroll, move |event| {
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
-                        if scroll.restoring_reparent.get() || scroll.reparent_offset.get().is_some()
-                        {
-                            scroll.invalidate_exported_scroll(false)?;
-                            return Ok(());
-                        }
                         if scroll.applying_offset.get() {
                             scroll.report()?;
-                            scroll.invalidate_exported_scroll(false)?;
+                            scroll.invalidate_shader_input()?;
                             return Ok(());
                         }
                         scroll.queue_report()?;
-                        scroll.invalidate_exported_scroll(false)?;
+                        scroll.invalidate_shader_input()?;
                         scroll.phase(event.component_i32(2).unwrap_or(0))?;
                     }
                     Ok(())
@@ -373,18 +353,13 @@ impl Scroller {
             .on_event(E::ScrollEventOnScrollStop, move |_| {
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
-                        if scroll.restoring_reparent.get() || scroll.reparent_offset.get().is_some()
-                        {
-                            scroll.invalidate_exported_scroll(true)?;
-                            return Ok(());
-                        }
                         if scroll.applying_offset.get() {
                             scroll.report()?;
-                            scroll.invalidate_exported_scroll(true)?;
+                            scroll.invalidate_shader_input()?;
                             return Ok(());
                         }
                         scroll.queue_report()?;
-                        scroll.invalidate_exported_scroll(true)?;
+                        scroll.invalidate_shader_input()?;
                         scroll.phase(0)?;
                     }
                     Ok(())
@@ -463,7 +438,7 @@ impl Scroller {
             owner.scroll_watchers.resized(owner.id);
         }
         if previous.width != size.width || previous.height != size.height {
-            self.invalidate_exported_scroll(true)?;
+            self.invalidate_shader_input()?;
         }
         Ok(())
     }
@@ -615,7 +590,6 @@ impl Scroller {
         Ok(())
     }
     pub(crate) fn command_to(&self, x: f32, y: f32, animated: bool) -> Result<()> {
-        self.reparent_offset.set(None);
         self.corrections.set(self.corrections.get().wrapping_add(1));
         self.owed.set((0.0, 0.0));
         // Native ScrollOffset accepts overscroll positions. Commands, unlike
@@ -661,7 +635,7 @@ impl Scroller {
         if dx != 0.0 || dy != 0.0 {
             self.pay_owed(dx, dy)?;
         }
-        self.invalidate_exported_scroll(true)?;
+        self.invalidate_shader_input()?;
         Ok(())
     }
     pub(crate) fn to(&self, x: f32, y: f32, animated: bool) -> Result<()> {
@@ -700,10 +674,9 @@ impl Scroller {
         })();
         self.applying_offset.set(was_applying);
         result?;
-        self.invalidate_exported_scroll(false)
+        self.invalidate_shader_input()
     }
     pub(crate) fn by(&self, dx: f32, dy: f32) -> Result<()> {
-        self.reparent_offset.set(None);
         self.corrections.set(self.corrections.get().wrapping_add(1));
         if let Some(mut motion) = self.zoom_motion.get() {
             motion.from.offset.0 += dx;
@@ -748,75 +721,13 @@ impl Scroller {
             ));
         }
         self.report()?;
-        self.invalidate_exported_scroll(false)?;
+        self.invalidate_shader_input()?;
         Ok(())
     }
-    /// Under `RenderType.RENDER_TYPE_TEXTURE`, ArkUI culls `on_custom_draw` for
-    /// custom nodes outside the scroll viewport while clearing `NeedRender`.
-    /// Mark only newly exposed custom-draw descendants that have not yet
-    /// recorded into `target_id`, avoiding full-subtree repaints each frame.
-    pub(crate) fn export_content_viewports(&self) -> (Option<[f32; 4]>, Option<[f32; 4]>) {
-        let offset = self
-            .read_native_offset()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| self.offset.get());
-        self.export_content_viewports_for(offset)
-    }
-    fn export_content_viewports_for(
-        &self,
-        offset: (f32, f32),
-    ) -> (Option<[f32; 4]>, Option<[f32; 4]>) {
-        let zoom = self.zoom.get().max(0.01);
-        let viewport = self.viewport_size.get();
-        let inset = self.behavior.borrow().content_inset;
-        let content_offset = (
-            (offset.0 + inset.left.0) / zoom,
-            (offset.1 + inset.top.0) / zoom,
-        );
-        let content_viewport = (
-            (viewport.width - inset.left.0 - inset.right.0).max(0.0) / zoom,
-            (viewport.height - inset.top.0 - inset.bottom.0).max(0.0) / zoom,
-        );
-        let strict_vp = crate::render::node::export_paint::scroll_viewport_rect(
-            content_offset,
-            content_viewport,
-            0.0,
-        );
-        let mark_vp = crate::render::node::export_paint::scroll_viewport_rect(
-            content_offset,
-            content_viewport,
-            crate::render::node::export_paint::SCROLL_EXPORT_LOOKAHEAD_PT,
-        );
-        (strict_vp, mark_vp)
-    }
-    fn invalidate_exported_scroll(&self, force: bool) -> Result<()> {
-        let Some(owner) = self.owner.upgrade() else {
-            self.export_paint_offset.set(None);
-            return Ok(());
-        };
-        let Some(target_id) = owner.active_export_target_id() else {
-            self.export_paint_offset.set(None);
-            return Ok(());
-        };
-        let offset = self
-            .read_native_offset()?
-            .unwrap_or_else(|| self.offset.get());
-        let should_check = match self.export_paint_offset.get() {
-            Some((prev_target, px, py)) if prev_target == target_id && !force => {
-                (offset.0 - px).abs() >= 2.0 || (offset.1 - py).abs() >= 2.0
-            }
-            _ => true,
-        };
-        if should_check {
-            self.export_paint_offset
-                .set(Some((target_id, offset.0, offset.1)));
-            let (strict_vp, mark_vp) = self.export_content_viewports_for(offset);
-            let marked =
-                owner.invalidate_unrecorded_scroller_export_paint(target_id, strict_vp, mark_vp)?;
-            if marked > 0 || force {
-                owner.schedule_unrecorded_export_check(target_id, 2);
-            }
+    fn invalidate_shader_input(&self) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.invalidate_composites();
+            owner.flush_arkui()?;
         }
         Ok(())
     }
@@ -1321,11 +1232,11 @@ impl Scroller {
                             if let Some(scroll) = weak.upgrade() {
                                 if scroll.applying_offset.get() {
                                     scroll.report()?;
-                                    scroll.invalidate_exported_scroll(false)?;
+                                    scroll.invalidate_shader_input()?;
                                     return Ok(());
                                 }
                                 scroll.queue_report()?;
-                                scroll.invalidate_exported_scroll(false)?;
+                                scroll.invalidate_shader_input()?;
                             }
                             Ok(())
                         });
@@ -1547,156 +1458,5 @@ impl Scroller {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn snapshot_for_reparent(&self) {
-        let current = self.offset.get();
-        let target = match self.read_native_offset().ok().flatten() {
-            Some((nx, ny)) if nx.abs() > 0.5 || ny.abs() > 0.5 => (nx, ny),
-            _ => current,
-        };
-        self.offset.set(target);
-        self.reparent_offset.set(Some(target));
-    }
-
-    pub(crate) fn clear_reparent_snapshot(&self) {
-        self.reparent_offset.set(None);
-    }
-
-    pub(crate) fn sync_saved_offset(&self) -> Result<()> {
-        let target = self
-            .reparent_offset
-            .get()
-            .unwrap_or_else(|| self.offset.get());
-        let needs_apply = if target.0.abs() > 0.5 || target.1.abs() > 0.5 {
-            true
-        } else {
-            self.read_native_offset()?
-                .is_some_and(|(nx, ny)| (nx - target.0).abs() > 0.5 || (ny - target.1).abs() > 0.5)
-        };
-        if needs_apply {
-            let was_restoring = self.restoring_reparent.replace(true);
-            let res = self.to(target.0, target.1, false);
-            self.restoring_reparent.set(was_restoring);
-            res?;
-        }
-        self.invalidate_exported_scroll(true)
-    }
-
-    fn advance_reparent_restore(weak: Weak<Self>, remaining: u8) {
-        let Some(scroll) = weak.upgrade() else {
-            return;
-        };
-        callback(|| {
-            if scroll.reparent_offset.get().is_none() {
-                return Ok(());
-            }
-            scroll.sync_saved_offset()?;
-            if remaining > 1 && scroll.native.borrow().is_owned() {
-                let next = Rc::downgrade(&scroll);
-                if scroll
-                    .native
-                    .borrow()
-                    .post_frame_callback_dirty(move |_, _| {
-                        Self::advance_reparent_restore(next, remaining - 1);
-                    })
-                    .is_ok()
-                {
-                    if let Some(owner) = scroll.owner.upgrade() {
-                        owner.pulse_frame_wake();
-                    }
-                    return Ok(());
-                }
-            }
-            scroll.reparent_offset.set(None);
-            Ok(())
-        });
-    }
-
-    pub(crate) fn restore_after_reparent(self: &Rc<Self>, clear_after_frame: bool) -> Result<()> {
-        self.sync_saved_offset()?;
-        if clear_after_frame {
-            let has_nonzero = self
-                .reparent_offset
-                .get()
-                .is_some_and(|(x, y)| x.abs() > 0.5 || y.abs() > 0.5);
-            if has_nonzero && self.native.borrow().is_owned() {
-                let weak = Rc::downgrade(self);
-                if self
-                    .native
-                    .borrow()
-                    .post_frame_callback_dirty(move |_, _| {
-                        Self::advance_reparent_restore(weak, 3);
-                    })
-                    .is_ok()
-                {
-                    if let Some(owner) = self.owner.upgrade() {
-                        owner.pulse_frame_wake();
-                    }
-                } else {
-                    self.reparent_offset.set(None);
-                }
-            } else {
-                self.reparent_offset.set(None);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Node {
-    fn for_each_subtree_scroller(
-        &self,
-        f: &mut impl FnMut(&Rc<Scroller>) -> Result<()>,
-    ) -> Result<()> {
-        if !self.active.get() || self.retained.get() {
-            return Ok(());
-        }
-        let scroller = self.scroll.try_borrow().ok().and_then(|s| s.clone());
-        if let Some(scroll) = scroller {
-            f(&scroll)?;
-        }
-        let children: Vec<Rc<Self>> = self
-            .children
-            .try_borrow()
-            .map(|list| {
-                list.iter()
-                    .filter_map(Weak::upgrade)
-                    .filter(|child| {
-                        child.active.get()
-                            && !child.retained.get()
-                            && child.modal.try_borrow().ok().is_some_and(|m| m.is_none())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        for child in children {
-            child.for_each_subtree_scroller(f)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn snapshot_subtree_scroll_offsets(&self) {
-        let _ = self.for_each_subtree_scroller(&mut |scroll| {
-            scroll.snapshot_for_reparent();
-            Ok(())
-        });
-    }
-
-    pub(crate) fn clear_subtree_scroll_snapshots(&self) {
-        let _ = self.for_each_subtree_scroller(&mut |scroll| {
-            scroll.clear_reparent_snapshot();
-            Ok(())
-        });
-    }
-
-    pub(crate) fn restore_subtree_scroll_offsets(&self, clear_after_frame: bool) -> Result<()> {
-        self.for_each_subtree_scroller(&mut |scroll| {
-            scroll.restore_after_reparent(clear_after_frame)
-        })
-    }
-
-    pub(crate) fn sync_subtree_scroll_offsets(&self) -> Result<()> {
-        self.for_each_subtree_scroller(&mut |scroll| scroll.sync_saved_offset())
     }
 }

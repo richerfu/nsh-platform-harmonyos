@@ -68,9 +68,6 @@ impl Node {
             web: RefCell::default(),
             video: RefCell::default(),
             active: Cell::new(true),
-            export_repair: Cell::new(0),
-            clearing_export: Cell::new(false),
-            bridged_on_root_outer: Cell::new(false),
             retained: Cell::new(false),
             retained_owner: RefCell::default(),
             retained_children: RefCell::default(),
@@ -83,18 +80,14 @@ impl Node {
                 ..AppliedStyle::default()
             }),
             styled: Cell::new(false),
-            paint_state: Cell::new(crate::render::subtree_paint::SubtreePaint::default()),
             live: RefCell::default(),
             leaving: Cell::new(false),
             extra: Cell::new((1.0, crate::render::transition::Extra::NONE)),
             navigation_presentation: Cell::new((1.0, 0.0)),
             decoration: crate::render::decor::Decoration::default(),
             layout_callbacks: Cell::new(false),
-            drawing: Cell::new(false),
-            outlined: Cell::new(false),
-            drawn_export_target: Cell::new(0),
-            drawn_outline_export_target: Cell::new(0),
-            unrecorded_check_state: Cell::new((0, 0)),
+            drawing: RefCell::new(None),
+            outlined: RefCell::new(None),
             shadow_layer: RefCell::default(),
             text_drawing: RefCell::new(None),
             selection_area: RefCell::new(None),
@@ -166,7 +159,7 @@ impl Node {
             node.enable_layout();
         }
         if node.canvas.borrow().is_some() {
-            node.enable_drawing();
+            node.enable_drawing()?;
         }
         if kind == ViewKind::HeaderItem {
             node.apply_z_index()?;
@@ -202,8 +195,6 @@ impl Node {
         if !self.active.replace(false) {
             return;
         }
-        self.bridged_on_root_outer.set(false);
-        self.paint_state.set(self.paint_state.get().reset());
         self.animated_opacity.set(None);
         callback(|| self.cursor.update(self, false));
         callback(|| self.selection_clear());
@@ -368,6 +359,8 @@ impl Drop for Node {
                 });
             }
         }
+        self.drawing.borrow_mut().take();
+        self.outlined.borrow_mut().take();
         self.shadow_layer.borrow_mut().take();
         // Struct fields otherwise outlive this Drop body. Release controller
         // handles before recursively disposing their mounted native descendants.
@@ -417,8 +410,8 @@ impl Drop for Node {
             }
             let wrapper = scroll.wrapper.clone();
             drop(scroll);
-            // Texture export replaces the wrapper in the mounted tree. Once
-            // the attachment releases it, this detached tree needs its own disposal.
+            // Once the overlay attachment releases this wrapper, its detached
+            // tree needs its own disposal.
             if wrapper.borrow().is_owned() && Rc::strong_count(&wrapper) == 1 {
                 callback(|| {
                     wrapper.borrow().remove_from_parent()?;

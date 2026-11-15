@@ -37,9 +37,6 @@ pub(crate) struct Video {
     closed: Cell<bool>,
 }
 impl Video {
-    pub(crate) fn restore_visibility(&self) -> Result<()> {
-        self.ui.apply_visibility()
-    }
     pub(crate) fn native(&self) -> &NativeNode {
         &self.ui.native
     }

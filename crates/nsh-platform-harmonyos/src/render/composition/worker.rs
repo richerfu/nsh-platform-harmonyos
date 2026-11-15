@@ -1,4 +1,4 @@
-//! One compositor worker per surface; exports and replies are generation scoped.
+//! One compositor worker per surface; inputs and replies are generation scoped.
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -41,11 +41,15 @@ struct Settings {
     density: f32,
     insets: [u32; 4],
     scene: bool,
+    capture: bool,
     shaders: Vec<(NodeId, Arc<ShaderLayer>)>,
 }
 impl Settings {
     fn pixels(&self) -> u64 {
         u64::from(self.width) * u64::from(self.height)
+    }
+    fn native_output(&self) -> bool {
+        self.gpu && !self.capture && self.filters.is_empty() && self.shaders.is_empty()
     }
 }
 struct Output {
@@ -57,16 +61,15 @@ struct State {
     settings: Settings,
     screen_origin: Option<(i32, i32)>,
     output: Option<Output>,
-    published_geom: Option<(u32, u32, u32, u32)>,
-    ui_revealed: bool,
     presented: bool,
-    surface: Option<std::result::Result<u64, String>>,
+    published_geom: Option<(u32, u32, u32, u32)>,
+    initialized: Option<std::result::Result<Option<u64>, String>>,
+    output_surface: Option<u64>,
     closed: bool,
 }
 struct Shared {
     released: AtomicBool,
     active: AtomicBool,
-    frozen: AtomicBool,
     present_gate: Mutex<bool>,
     awaiting_origin: AtomicBool,
     state: Mutex<State>,
@@ -100,7 +103,6 @@ enum Task {
     Capture {
         key: crate::render::shader::navigation::Key,
         source: Key,
-        deadline: std::time::Instant,
     },
     CancelCapture(crate::render::shader::navigation::Key),
     Navigation(Navigation<()>),
@@ -195,7 +197,6 @@ struct Navigation<S> {
     key: crate::render::shader::navigation::Key,
     snapshot: S,
     duration: std::time::Duration,
-    queued_at: std::time::Instant,
     backwards: bool,
     reverse_inputs: bool,
     complete: bool,
@@ -208,7 +209,6 @@ struct Snapshot {
 struct PendingCapture {
     key: crate::render::shader::navigation::Key,
     source: Key,
-    deadline: std::time::Instant,
 }
 pub(crate) struct Worker {
     send: CommandSender<Task>,
@@ -304,7 +304,6 @@ impl Worker {
                 let mut captured: Vec<(
                     crate::render::shader::navigation::Key,
                     Snapshot,
-                    std::time::Instant,
                 )> = Vec::new();
                 loop {
                     let task = if pending_precompiles.is_empty() {
@@ -425,9 +424,6 @@ impl Worker {
                                 .is_some_and(|r| r.active.load(Ordering::Acquire))
                             {
                                 for entry in entries.iter_mut().flatten() {
-                                    if entry.shared.frozen.load(Ordering::Acquire) {
-                                        continue;
-                                    }
                                     if entry.window.is_some() {
                                         entry.window_dirty = true;
                                     }
@@ -448,7 +444,6 @@ impl Worker {
                                             .navigation
                                             .as_ref()
                                             .is_some_and(|nav| !nav.complete))
-                                    && !entry.shared.frozen.load(Ordering::Acquire)
                                     && entry.shared.active.load(Ordering::Acquire)
                                     && entry.shared.animating.load(Ordering::Acquire)
                                 {
@@ -482,28 +477,12 @@ impl Worker {
                                 }
                                 let settings = shared.state.lock().unwrap().settings.clone();
                                 check_pixels(&entries, key, settings.pixels())?;
-                                let callback = callback.clone();
-                                let weak = Arc::downgrade(&shared);
                                 if gpu.is_none() {
-                                    gpu = Some(
-                                        TextureContext::new().map_err(|error| error.to_string())?,
-                                    );
+                                    gpu = Some(TextureContext::new().map_err(|error| error.to_string())?);
                                 }
-                                pending_precompiles
-                                    .extend(settings.shaders.iter().map(|(_, layer)| layer.clone()));
-                                let mut reader =
-                                    TextureReader::with_context(gpu.as_ref().unwrap(), move || {
-                                        if let Some(shared) = weak.upgrade()
-                                            && !shared.frozen.load(Ordering::Acquire)
-                                        {
-                                            wake(&callback, key, &shared);
-                                        }
-                                    })
-                                    .map_err(|error| error.to_string())?;
-                                reader
-                                    .resize(settings.width, settings.height)
-                                    .map_err(|error| error.to_string())?;
-                                let id = reader.id().map_err(|error| error.to_string())?;
+                                let mut reader = create_input(gpu.as_ref().unwrap(), &settings, key, &shared, &callback)?;
+                                let id = reader.as_mut().map(TextureReader::id).transpose().map_err(|e| e.to_string())?;
+                                pending_precompiles.extend(settings.shaders.iter().map(|(_, layer)| layer.clone()));
                                 entries.resize_with(entries.len().max(key.slot() + 1), || None);
                                 if let Some(old) = entries[key.slot()].take() {
                                     retire_entry(old, &route);
@@ -521,7 +500,6 @@ impl Worker {
                                     filtered: None,
                                     window: None,
                                     window_dirty: false,
-                                    window_retry: super::fill_retry::FillRetry::default(),
                                     pending_readback_bytes: 0,
                                     navigation: None,
                                     completed: None,
@@ -531,7 +509,7 @@ impl Worker {
                             if result.is_err() {
                                 shared.released.store(true, Ordering::Release);
                             }
-                            shared.state.lock().unwrap().surface = Some(result);
+                            shared.state.lock().unwrap().initialized = Some(result);
                             if let Some(route) = route.upgrade() {
                                 route.send(Message::Composite {
                                     id: key.id,
@@ -563,9 +541,6 @@ impl Worker {
                                 }
                                 continue;
                             }
-                            if entry.shared.frozen.load(Ordering::Acquire) {
-                                continue;
-                            }
                             if !route
                                 .upgrade()
                                 .is_some_and(|r| r.active.load(Ordering::Acquire))
@@ -577,7 +552,9 @@ impl Worker {
                             let settings = entry.shared.state.lock().unwrap().settings.clone();
                             let result =
                                 check_pixels(&entries, key, settings.pixels()).and_then(|()| {
-                                    entries[key.slot()].as_mut().unwrap().render(settings)
+                                    let entry = entries[key.slot()].as_mut().unwrap();
+                                    entry.update_input(&settings, &callback)?;
+                                    entry.render(settings)
                                 });
                             let upgraded = route.upgrade();
                             match result {
@@ -626,7 +603,7 @@ impl Worker {
                                 let publish = {
                                     let state = shared.state.lock().unwrap();
                                     !state.settings.scene
-                                        && (state.output.is_some() || started_animating)
+                                        && (state.output.is_some() || state.initialized.is_some() || started_animating)
                                 };
                                 if publish && !shared.posted.swap(true, Ordering::AcqRel) {
                                     route.send(Message::Composite {
@@ -678,14 +655,8 @@ impl Worker {
                         Task::Capture {
                             key,
                             source,
-                            deadline,
                         } => {
-                            let now = std::time::Instant::now();
-                            captured.retain(|(k, _, at)| {
-                                k.owner != key.owner
-                                    && now.saturating_duration_since(*at)
-                                        < std::time::Duration::from_secs(2)
-                            });
+                            captured.retain(|(k, _)| k.owner != key.owner);
                             pending_captures.retain(|p| p.key.owner != key.owner);
                             let upgraded = route.upgrade();
                             let entry = entries
@@ -698,7 +669,7 @@ impl Worker {
                             if let Some(entry) = entry {
                                 match entry.snapshot() {
                                     Ok(Some(snapshot)) => {
-                                        captured.push((key, snapshot, now));
+                                        captured.push((key, snapshot));
                                         if let Some(route) = &upgraded {
                                             route.send(Message::Navigation(
                                                 crate::render::shader::navigation::Event::Captured(
@@ -715,8 +686,7 @@ impl Worker {
                                         pending_captures.push(PendingCapture {
                                             key,
                                             source,
-                                            deadline,
-                                        });
+                                                        });
                                     }
                                     Err(error) => {
                                         log::warn!("shader navigation capture: {error}");
@@ -737,20 +707,19 @@ impl Worker {
                         }
                         Task::CancelCapture(key) => {
                             pending_captures.retain(|p| p.key != key);
-                            captured.retain(|(k, _, _)| *k != key);
+                            captured.retain(|(k, _)| *k != key);
                         }
                         Task::Navigation(request) => {
                             repaint = scene.is_some();
                             let snapshot = captured
                                 .iter()
-                                .position(|(key, _, _)| *key == request.key)
+                                .position(|(key, _)| *key == request.key)
                                 .map(|idx| captured.swap_remove(idx).1);
                             let request = Navigation {
                                 snapshot,
                                 target: request.target,
                                 key: request.key,
                                 duration: request.duration,
-                                queued_at: request.queued_at,
                                 backwards: request.backwards,
                                 reverse_inputs: request.reverse_inputs,
                                 complete: false,
@@ -807,39 +776,25 @@ impl Worker {
                                 .and_then(Option::as_mut)
                                 .filter(|e| e.key == key)
                             {
+                                let output_surface = window.surface_id().map_err(|e| e.to_string());
+                                let input_surface = entry.reader.as_mut().map(TextureReader::id)
+                                    .transpose().map_err(|e| e.to_string());
+                                {
+                                    let mut state = entry.shared.state.lock().unwrap();
+                                    state.output_surface = output_surface.as_ref().ok().copied();
+                                    // Notify the UI that its native export target is available.
+                                    state.initialized = Some(output_surface.and(input_surface));
+                                }
                                 let raw = window.raw() as usize;
                                 if let Some(existing) = entry.window.as_ref()
                                     && existing.raw() == raw
                                 {
                                     existing.invalidate_geometry();
                                     entry.window_dirty = true;
-                                    entry.window_retry.on_window_attached();
                                 } else {
-                                    match gpu.as_ref().unwrap().window(window) {
-                                        Ok(next) => {
-                                            entry.window = Some(next);
-                                            entry.window_dirty = true;
-                                            entry.window_retry.on_window_attached();
-                                            let mut state = entry.shared.state.lock().unwrap();
-                                            state.ui_revealed = false;
-                                            state.published_geom = None;
-                                        }
-                                        Err(error) => {
-                                            entry.window_dirty = true;
-                                            log::warn!("shader window: {error}");
-                                            if entry
-                                                .window_retry
-                                                .on_window_failure(entry.window.is_some())
-                                                .report_error
-                                                && let Some(route) = route.upgrade()
-                                            {
-                                                route.send(Message::Error(format!(
-                                                    "compositor node {} generation {} window: {error}",
-                                                    key.id, key.generation
-                                                )));
-                                            }
-                                        }
-                                    }
+                                    entry.window = Some(gpu.as_ref().unwrap().window(window));
+                                    entry.shared.state.lock().unwrap().published_geom = None;
+                                    entry.window_dirty = true;
                                 }
                                 wake(&callback, key, &entry.shared);
                             }
@@ -851,9 +806,7 @@ impl Worker {
                                 .filter(|entry| entry.key == key)
                             {
                                 entry.window = None;
-                                let mut state = entry.shared.state.lock().unwrap();
-                                state.ui_revealed = false;
-                                state.published_geom = None;
+                                entry.shared.state.lock().unwrap().output_surface = None;
                             }
                             released.store(true, Ordering::Release);
                             if let Some(route) = route.upgrade() {
@@ -871,9 +824,7 @@ impl Worker {
                                 && entry.window.as_ref().is_some_and(|w| w.raw() == raw)
                             {
                                 entry.window = None;
-                                let mut state = entry.shared.state.lock().unwrap();
-                                state.ui_revealed = false;
-                                state.published_geom = None;
+                                entry.shared.state.lock().unwrap().output_surface = None;
                             }
                         }
                     }
@@ -883,7 +834,7 @@ impl Worker {
                             .as_ref()
                             .is_some_and(|r| r.active.load(Ordering::Acquire))
                     {
-                        fills.render(std::time::Instant::now(), upgraded_for_frame.as_deref());
+                        fills.render( upgraded_for_frame.as_deref());
                     }
                     // Many exports wake together during navigation. Compose their latest
                     // pictures once on VSync, so command delivery never waits for a full
@@ -970,7 +921,6 @@ impl Worker {
                                 upgraded.as_deref(),
                             );
                         }
-                        let now = std::time::Instant::now();
                         pending_captures.retain(|pending| {
                             let live = entries
                                 .get(pending.source.slot())
@@ -979,7 +929,7 @@ impl Worker {
                                     entry.key == pending.source
                                         && !entry.shared.state.lock().unwrap().closed
                                 });
-                            if live && now < pending.deadline {
+                            if live {
                                 true
                             } else {
                                 if let Some(route) = &upgraded {
@@ -1000,17 +950,13 @@ impl Worker {
                         .upgrade()
                         .is_some_and(|r| r.active.load(Ordering::Acquire))
                         && (scene_dirty
-                            || !pending_captures.is_empty()
                             || fills.animating()
                             || entries.iter().flatten().any(|entry| {
                                 let pending_nav =
                                     entry.navigation.as_ref().is_some_and(|n| !n.complete);
                                 (entry.window.is_some() || entry.settings.scene || pending_nav)
-                                    && !entry.shared.frozen.load(Ordering::Acquire)
                                     && entry.shared.active.load(Ordering::Acquire)
-                                    && (entry.window_dirty
-                                        || entry.shaders.wants_frame()
-                                        || pending_nav)
+                                    && entry.shared.animating.load(Ordering::Acquire)
                             }));
                     vote.update(animating);
                     if !frame_pending && animating {
@@ -1185,18 +1131,13 @@ fn fail_captures_for_source(
 fn fulfill_captures(
     entries: &mut [Option<Entry>],
     pending_captures: &mut Vec<PendingCapture>,
-    captured: &mut Vec<(
-        crate::render::shader::navigation::Key,
-        Snapshot,
-        std::time::Instant,
-    )>,
+    captured: &mut Vec<(crate::render::shader::navigation::Key, Snapshot)>,
     only_source: Option<Key>,
     route: Option<&Dispatcher>,
 ) {
     if pending_captures.is_empty() {
         return;
     }
-    let now = std::time::Instant::now();
     pending_captures.retain(|pending| {
         if only_source.is_some_and(|source| pending.source != source) {
             return true;
@@ -1217,8 +1158,8 @@ fn fulfill_captures(
         };
         match entry.snapshot() {
             Ok(Some(snapshot)) => {
-                captured.retain(|(k, _, _)| k.owner != pending.key.owner);
-                captured.push((pending.key, snapshot, now));
+                captured.retain(|(k, _)| k.owner != pending.key.owner);
+                captured.push((pending.key, snapshot));
                 if let Some(route) = route {
                     route.send(Message::Navigation(
                         crate::render::shader::navigation::Event::Captured(pending.key),
@@ -1262,7 +1203,7 @@ fn check_pixels(
 struct Entry {
     key: Key,
     shared: Arc<Shared>,
-    reader: TextureReader,
+    reader: Option<TextureReader>,
     gpu: TextureContext,
     settings: Settings,
     scene_source: Option<Image>,
@@ -1272,13 +1213,53 @@ struct Entry {
     filtered: Option<super::gles::Target>,
     window: Option<super::readback::Window>,
     window_dirty: bool,
-    window_retry: super::fill_retry::FillRetry,
     pending_readback_bytes: u64,
     navigation: Option<Navigation<Option<Snapshot>>>,
     completed: Option<crate::render::shader::navigation::Key>,
 }
+fn create_input(
+    gpu: &TextureContext,
+    settings: &Settings,
+    key: Key,
+    shared: &Arc<Shared>,
+    callback: &CommandSender<Task>,
+) -> std::result::Result<Option<TextureReader>, String> {
+    if settings.native_output() {
+        return Ok(None);
+    }
+    let callback = callback.clone();
+    let weak = Arc::downgrade(shared);
+    let mut reader = TextureReader::with_context(gpu, move || {
+        if let Some(shared) = weak.upgrade() {
+            wake(&callback, key, &shared);
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    reader
+        .resize(settings.width, settings.height)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(reader))
+}
 impl Entry {
+    fn update_input(
+        &mut self,
+        settings: &Settings,
+        callback: &CommandSender<Task>,
+    ) -> std::result::Result<(), String> {
+        if self.reader.is_some() == settings.native_output() {
+            self.reader = create_input(&self.gpu, settings, self.key, &self.shared, callback)?;
+            let id = self
+                .reader
+                .as_mut()
+                .map(TextureReader::id)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            self.shared.state.lock().unwrap().initialized = Some(Ok(id));
+        }
+        Ok(())
+    }
     fn render(&mut self, settings: Settings) -> std::result::Result<bool, String> {
+        let _trace = super::trace::Scope::new(c"NSH composite");
         if let Some(navigation) = &self.navigation {
             if !settings
                 .shaders
@@ -1295,90 +1276,40 @@ impl Entry {
                 return Ok(false);
             }
         }
-        if let Some(navigation) = &mut self.navigation
-            && !navigation.complete
-            && navigation.queued_at.elapsed()
-                > navigation.duration + std::time::Duration::from_secs(1)
-        {
-            navigation.complete = true;
-            self.completed = Some(navigation.key);
-            self.shared
-                .animating
-                .store(self.shaders.wants_frame(), Ordering::Release);
-            return Ok(false);
-        }
         let mut changed = self.settings != settings || std::mem::take(&mut self.window_dirty);
         self.shaders.layers(&settings.shaders)?;
-        if (settings.width, settings.height) != (self.settings.width, self.settings.height) {
-            self.reader
-                .resize(settings.width, settings.height)
-                .map_err(|e| e.to_string())?;
-        }
         self.settings = settings;
         let direct = !self.settings.scene;
         let x = -(self.settings.insets[0] as f32);
         let y = -(self.settings.insets[1] as f32);
-        let passthrough = direct
-            && self.settings.filters.is_empty()
-            && self.settings.shaders.is_empty()
-            && self.navigation.is_none();
-        if passthrough {
+        if self.settings.native_output() {
             self.scene_source = None;
             self.scene_output = None;
             self.shaders.clear_output();
+            self.filtered = None;
             self.shared.awaiting_origin.store(false, Ordering::Release);
-            if let Some(window) = &mut self.window {
-                let outcome = {
-                    let gate = self.shared.present_gate.lock().unwrap();
-                    if !*gate || self.shared.frozen.load(Ordering::Acquire) {
-                        self.shared.animating.store(false, Ordering::Release);
-                        return Ok(false);
-                    }
-                    self.reader
-                        .present_passthrough(window, changed)
-                        .map_err(|e| e.to_string())?
-                };
-                match outcome {
-                    super::readback::PassthroughOutcome::Presented { width, height } => {
-                        self.shared.animating.store(false, Ordering::Release);
-                        self.record_gpu_output(width, height, x, y);
-                        return Ok(true);
-                    }
-                    super::readback::PassthroughOutcome::Deferred => {
-                        self.window_dirty = true;
-                        self.shared.animating.store(true, Ordering::Release);
-                        return Ok(false);
-                    }
-                    super::readback::PassthroughOutcome::Idle => {
-                        self.shared.animating.store(false, Ordering::Release);
-                        return Ok(false);
-                    }
-                }
-            }
-            let updated = self.reader.drain_oes(4).map_err(|e| e.to_string())?;
             self.shared.animating.store(false, Ordering::Release);
-            return Ok(updated);
+            if let Some(window) = &self.window {
+                window.release_egl();
+                // ArkUI submits directly to the persistent output queue. No
+                // NativeImage resolve or additional full-screen draw is needed.
+                self.record_geometry(self.settings.width, self.settings.height, x, y);
+            }
+            return Ok(false);
         }
+        let reader = self.reader.as_mut().unwrap();
+        reader
+            .resize(self.settings.width, self.settings.height)
+            .map_err(|e| e.to_string())?;
         if direct {
-            if self.reader.drain_oes(4).map_err(|e| e.to_string())? {
-                changed = true;
-            }
-        } else {
-            for _ in 0..4 {
-                let Some(frame) = self.reader.read().map_err(|e| e.to_string())? else {
-                    break;
-                };
-                self.pending_readback_bytes = self
-                    .pending_readback_bytes
-                    .saturating_add(frame.pixels.len() as u64);
-                // Keep bounded captures at their own resolution. The scene canvas scales
-                // them while painting, after reserving its intermediate pixel budget.
-                let mut image = Image::new(frame);
-                image.x = -(self.settings.insets[0] as f32);
-                image.y = -(self.settings.insets[1] as f32);
-                self.scene_source = Some(image);
-                changed = true;
-            }
+            changed |= reader.update_texture().map_err(|e| e.to_string())?;
+        } else if let Some(frame) = reader.read().map_err(|e| e.to_string())? {
+            self.pending_readback_bytes += frame.pixels.len() as u64;
+            let mut image = Image::new(frame);
+            image.x = x;
+            image.y = y;
+            self.scene_source = Some(image);
+            changed = true;
         }
         changed |= self.start_navigation()?;
         let pending_nav = self.navigation.as_ref().is_some_and(|nav| !nav.complete);
@@ -1387,10 +1318,11 @@ impl Entry {
             return Ok(false);
         }
         if direct {
-            let Some(source) = self.reader.ensure_texture().map_err(|e| e.to_string())? else {
-                self.shared
-                    .animating
-                    .store(self.shaders.wants_frame() || pending_nav, Ordering::Release);
+            let Some(source) = self.reader.as_ref().and_then(TextureReader::texture) else {
+                // Only the producer can supply the first input. In particular,
+                // offscreen native subtrees need not export a frame at all.
+                // Their frame-available callback resumes this entry when ready.
+                self.shared.animating.store(false, Ordering::Release);
                 return Ok(false);
             };
             self.scene_source = None;
@@ -1467,16 +1399,12 @@ impl Entry {
         if self.settings.scene {
             return Ok(None);
         }
-        self.reader
-            .drain_oes(4)
-            .map_err(|error| error.to_string())?;
-        let picture = match self.shaders.output().map(super::gles::Target::picture) {
-            Some(output) => Some(output),
-            None => self
-                .reader
-                .ensure_texture()
-                .map_err(|error| error.to_string())?,
-        };
+        let picture = self.shaders.output().map(super::gles::Target::picture).or(
+            match self.reader.as_mut() {
+                Some(reader) => reader.ensure_texture().map_err(|e| e.to_string())?,
+                None => None,
+            },
+        );
         let origin = self
             .shared
             .state
@@ -1541,26 +1469,27 @@ impl Entry {
         Ok(true)
     }
     fn record_gpu_output(&self, width: u32, height: u32, x: f32, y: f32) {
-        let geom = (width, height, x.to_bits(), y.to_bits());
-        let mut state = self.shared.state.lock().unwrap();
-        state.presented = true;
-        if crate::render::subtree_paint::should_publish_gpu_output(
-            state.ui_revealed,
-            state.published_geom,
-            geom,
-        ) {
-            state.published_geom = Some(geom);
-            state.output = Some(Output {
-                frame: RgbaFrame {
-                    width,
-                    height,
-                    pixels: Vec::new(),
-                },
-                x,
-                y,
-            });
-        }
+        self.shared.state.lock().unwrap().presented = true;
+        self.record_geometry(width, height, x, y);
     }
+    fn record_geometry(&self, width: u32, height: u32, x: f32, y: f32) {
+        let mut state = self.shared.state.lock().unwrap();
+        let geometry = (width, height, x.to_bits(), y.to_bits());
+        if state.published_geom == Some(geometry) {
+            return;
+        }
+        state.published_geom = Some(geometry);
+        state.output = Some(Output {
+            frame: RgbaFrame {
+                width,
+                height,
+                pixels: Vec::new(),
+            },
+            x,
+            y,
+        });
+    }
+
     fn publish_gpu(&mut self, repaint: bool, x: f32, y: f32) -> std::result::Result<bool, String> {
         let pending_nav = self.navigation.as_ref().is_some_and(|nav| !nav.complete);
         self.shared
@@ -1577,7 +1506,7 @@ impl Entry {
         }
         let presented = {
             let gate = self.shared.present_gate.lock().unwrap();
-            if !*gate || self.shared.frozen.load(Ordering::Acquire) {
+            if !*gate || self.shared.state.lock().unwrap().settings != self.settings {
                 self.shared.animating.store(false, Ordering::Release);
                 return Ok(false);
             }
@@ -1684,10 +1613,7 @@ impl super::draw::Sources for SceneEntries<'_> {
         let Some(output) = entry.shaders.output() else {
             return Ok(image);
         };
-        let frame = entry
-            .reader
-            .read_texture(output.picture())
-            .map_err(|error| error.to_string())?;
+        let frame = output.read()?;
         self.readback_bytes = self
             .readback_bytes
             .saturating_add(frame.pixels.len() as u64);
@@ -1732,8 +1658,7 @@ fn next_composite_generation() -> u32 {
 pub(crate) struct Composite {
     owner: std::rc::Weak<Node>,
     presentation: RefCell<Option<super::presentation::Presentation>>,
-    bridge: Cell<Option<(f32, f32)>>,
-    surface: RefCell<Option<String>>,
+    surface: Cell<Option<u64>>,
     failed: Cell<bool>,
     pub(crate) generation: u32,
     key: Key,
@@ -1777,17 +1702,16 @@ impl Composite {
         let shared = Arc::new(Shared {
             released: AtomicBool::new(false),
             active: AtomicBool::new(true),
-            frozen: AtomicBool::new(false),
             present_gate: Mutex::new(true),
             awaiting_origin: AtomicBool::new(false),
             state: Mutex::new(State {
                 settings: initial_settings.clone(),
                 screen_origin: initial_origin,
                 output: None,
-                published_geom: None,
-                ui_revealed: false,
                 presented: false,
-                surface: None,
+                published_geom: None,
+                initialized: None,
+                output_surface: None,
                 closed: false,
             }),
             queued: AtomicBool::new(false),
@@ -1841,8 +1765,7 @@ impl Composite {
         Ok(Self {
             owner: Rc::downgrade(owner),
             presentation: RefCell::new(presentation),
-            bridge: Cell::new(None),
-            surface: RefCell::new(None),
+            surface: Cell::new(None),
             failed: Cell::new(false),
             generation,
             key,
@@ -1854,16 +1777,6 @@ impl Composite {
         if self.failed.get() {
             return Ok(false);
         }
-        if !self.key.overlay
-            && (self.shared.frozen.load(Ordering::Acquire)
-                || owner
-                    .wrapper
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(crate::interop::view::Wrapper::blocks_composite_update))
-        {
-            return Ok(false);
-        }
         if !owner.composite_dirty.get()
             && self.shared.state.lock().unwrap().settings.scene == owner.scene_active()
         {
@@ -1871,7 +1784,7 @@ impl Composite {
         }
         let settings = settings(owner, self.key.overlay)?;
         if settings.gpu && self.presentation.borrow().is_none() {
-            let mut layer = super::presentation::Presentation::new(
+            let layer = super::presentation::Presentation::new(
                 owner,
                 self.key,
                 WindowEvents {
@@ -1879,9 +1792,6 @@ impl Composite {
                     send: self.worker.send.clone(),
                 },
             )?;
-            if let Some((alpha, dx_vp)) = self.bridge.get() {
-                layer.set_bridge(alpha, dx_vp)?;
-            }
             *self.presentation.borrow_mut() = Some(layer);
         } else if !settings.gpu
             && let Some(mut layer) = self.presentation.borrow_mut().take()
@@ -1907,6 +1817,7 @@ impl Composite {
                 settings.density,
             )?;
         }
+        let _present = self.shared.present_gate.lock().unwrap();
         let mut state = self.shared.state.lock().unwrap();
         if state.screen_origin.is_none() {
             state.screen_origin = owner
@@ -1928,6 +1839,15 @@ impl Composite {
         }
         Ok(changed)
     }
+    pub(crate) fn surface_id(&self) -> Option<String> {
+        let state = self.shared.state.lock().unwrap();
+        let id = if state.settings.native_output() {
+            state.output_surface
+        } else {
+            self.surface.get()
+        };
+        id.map(|id| id.to_string())
+    }
     pub(crate) fn shader_slot(&self, id: NodeId, slot: u16, value: AnimationValue) {
         let _ = self.worker.send.send(Task::Slot(self.key, id, slot, value));
     }
@@ -1937,15 +1857,10 @@ impl Composite {
             .send
             .send(Task::Transition(self.key, id, duration));
     }
-    pub(crate) fn capture(
-        &self,
-        key: crate::render::shader::navigation::Key,
-        deadline: std::time::Instant,
-    ) {
+    pub(crate) fn capture(&self, key: crate::render::shader::navigation::Key) {
         let _ = self.worker.send.send(Task::Capture {
             key,
             source: self.key,
-            deadline,
         });
     }
     pub(crate) fn shader_navigation(
@@ -1960,52 +1875,12 @@ impl Composite {
             key,
             snapshot: (),
             duration,
-            queued_at: std::time::Instant::now(),
             backwards,
             reverse_inputs,
             complete: false,
         }));
     }
-    pub(crate) fn set_bridge_presentation(&self, alpha: f32, dx_vp: f32) -> Result<()> {
-        self.bridge.set(Some((alpha, dx_vp)));
-        if let Some(layer) = self.presentation.borrow_mut().as_mut() {
-            layer.set_bridge(alpha, dx_vp)?;
-        }
-        Ok(())
-    }
-    pub(crate) fn clear_bridge_presentation(&self) -> Result<()> {
-        self.bridge.set(None);
-        if let Some(layer) = self.presentation.borrow_mut().as_mut() {
-            layer.clear_bridge()?;
-        }
-        Ok(())
-    }
-    pub(crate) fn freeze(&self) {
-        let mut gate = self.shared.present_gate.lock().unwrap();
-        *gate = false;
-        self.shared.frozen.store(true, Ordering::Release);
-        self.shared.active.store(false, Ordering::Release);
-    }
-    pub(crate) fn unfreeze(&self) {
-        let was_frozen = {
-            let mut gate = self.shared.present_gate.lock().unwrap();
-            *gate = true;
-            self.shared.frozen.swap(false, Ordering::AcqRel)
-        };
-        if was_frozen {
-            self.shared.active.store(true, Ordering::Release);
-            wake(&self.worker.send, self.key, &self.shared);
-        }
-    }
-    pub(crate) fn activate(&self) {
-        if !self.shared.frozen.load(Ordering::Acquire) {
-            self.shared.active.store(true, Ordering::Release);
-        }
-    }
     pub(crate) fn shader_frame(&self, active: bool) -> bool {
-        if self.shared.frozen.load(Ordering::Acquire) {
-            return false;
-        }
         let was_active = self.shared.active.swap(active, Ordering::AcqRel);
         let due = active && self.needs_shader_frame();
         if due && !was_active {
@@ -2029,48 +1904,28 @@ impl Composite {
             bottom,
         }
     }
-    pub(crate) fn origin(&self) -> (f32, f32) {
-        let insets = self.insets();
-        (-(insets.left as f32), -(insets.top as f32))
-    }
-    pub(crate) fn surface(&self) -> Option<String> {
-        self.surface.borrow().clone()
-    }
     pub(crate) fn is_revealed(&self) -> bool {
         self.presentation
             .borrow()
             .as_ref()
             .is_some_and(super::presentation::Presentation::is_revealed)
     }
-    pub(crate) fn hide_presentation(&self) {
-        if let Some(layer) = self.presentation.borrow_mut().as_mut() {
-            layer.hide();
-        }
-        self.shared.state.lock().unwrap().ui_revealed = false;
-    }
     pub(crate) fn ready(&self) -> (bool, bool) {
-        let surface = self.shared.state.lock().unwrap().surface.take();
-        let mut initialized = false;
-        if let Some(result) = surface {
-            match result {
-                Ok(id) => {
-                    *self.surface.borrow_mut() = Some(id.to_string());
-                    initialized = true;
-                }
-                Err(error) => {
-                    log::warn!("OHOS compositor initialization: {error}");
-                    self.failed.set(true);
-                    if let Some(mut layer) = self.presentation.borrow_mut().take() {
-                        layer.hide();
-                    }
-                }
+        let initialized = self.shared.state.lock().unwrap().initialized.take();
+        let ready = initialized.is_some();
+        if let Some(Ok(id)) = initialized.as_ref() {
+            self.surface.set(*id);
+        }
+        if let Some(Err(error)) = initialized {
+            log::warn!("OHOS compositor initialization: {error}");
+            self.failed.set(true);
+            if let Some(mut layer) = self.presentation.borrow_mut().take() {
+                layer.hide();
             }
         }
+        let initialized = ready;
         self.shared.posted.store(false, Ordering::Release);
         let output = self.shared.state.lock().unwrap().output.take();
-        if self.shared.frozen.load(Ordering::Acquire) {
-            return (initialized, false);
-        }
         if let Some(output) = output {
             let mut presentation = self.presentation.borrow_mut();
             if let Some(layer) = presentation.as_mut() {
@@ -2089,9 +1944,7 @@ impl Composite {
                 };
                 match result {
                     Ok(revealed) => {
-                        let is_revealed = layer.is_revealed();
                         drop(presentation);
-                        self.shared.state.lock().unwrap().ui_revealed = is_revealed;
                         return (initialized, revealed);
                     }
                     Err(error) => log::warn!("shader frame presentation: {error}"),
@@ -2197,6 +2050,7 @@ fn settings(owner: &Node, overlay: bool) -> Result<Settings> {
         height,
         insets,
         scene,
+        capture: owner.navigation_capture.get(),
         shaders: if overlay {
             Vec::new()
         } else {

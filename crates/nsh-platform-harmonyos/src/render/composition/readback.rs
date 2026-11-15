@@ -256,34 +256,15 @@ impl TextureContext {
     pub(super) fn blit_framebuffer(&self) -> glow::Framebuffer {
         self.blit_fbo.raw
     }
-    pub(super) fn window(
-        &self,
-        native: ohos_native_window_binding::NativeWindow,
-    ) -> Result<Window, Error> {
-        let current = self.context.enter()?;
-        // SAFETY: both handles belong to OHOS's default display; Window owns
-        // the retained native window until after its EGL surface is destroyed.
-        let surface = unsafe {
-            self.context.egl.create_window_surface(
-                self.context.display,
-                self.context.config,
-                native.raw().cast(),
-                None,
-            )
-        }
-        .map_err(|error| Error {
-            operation: "eglCreateWindowSurface",
-            code: error.into(),
-        })?;
-        drop(current);
-        Ok(Window {
+    pub(super) fn window(&self, native: ohos_native_window_binding::NativeWindow) -> Window {
+        Window {
             context: self.context.clone(),
-            surface,
+            surface: std::cell::Cell::new(None),
             native,
             size: std::cell::Cell::new((0, 0)),
             swap_interval_zero: std::cell::Cell::new(false),
             waiting: std::cell::Cell::new(false),
-        })
+        }
     }
     /// Creates an offscreen GLES context on the calling rendering worker.
     pub(super) fn new() -> Result<Self, Error> {
@@ -327,7 +308,7 @@ impl TextureContext {
 /// Worker-owned output queue. Entering it preserves the caller's EGL binding.
 pub(super) struct Window {
     context: Rc<Context>,
-    surface: egl::Surface,
+    surface: std::cell::Cell<Option<egl::Surface>>,
     native: ohos_native_window_binding::NativeWindow,
     size: std::cell::Cell<(u32, u32)>,
     swap_interval_zero: std::cell::Cell<bool>,
@@ -345,6 +326,16 @@ impl Window {
         self.swap_interval_zero.set(false);
         self.context.bind_pbuffer();
     }
+    pub(super) fn release_egl(&self) {
+        if let Some(surface) = self.surface.take() {
+            self.context.bind_pbuffer();
+            let _ = self
+                .context
+                .egl
+                .destroy_surface(self.context.display, surface);
+            self.invalidate_geometry();
+        }
+    }
     pub(super) fn enter(&self, width: u32, height: u32) -> Result<Current<'_>, Error> {
         if self.size.get() != (width, height) {
             self.native
@@ -353,15 +344,36 @@ impl Window {
             self.size.set((width, height));
         }
         let current = self.context.enter()?;
-        if self.context.egl.get_current_surface(egl::DRAW) != Some(self.surface)
-            || self.context.egl.get_current_surface(egl::READ) != Some(self.surface)
+        let surface = match self.surface.get() {
+            Some(surface) => surface,
+            None => {
+                // SAFETY: this worker owns the context and the retained native
+                // output queue. EGL owns it only while shader output is active.
+                let surface = unsafe {
+                    self.context.egl.create_window_surface(
+                        self.context.display,
+                        self.context.config,
+                        self.native.raw().cast(),
+                        None,
+                    )
+                }
+                .map_err(|error| Error {
+                    operation: "eglCreateWindowSurface",
+                    code: error.into(),
+                })?;
+                self.surface.set(Some(surface));
+                surface
+            }
+        };
+        if self.context.egl.get_current_surface(egl::DRAW) != Some(surface)
+            || self.context.egl.get_current_surface(egl::READ) != Some(surface)
         {
             self.context
                 .egl
                 .make_current(
                     self.context.display,
-                    Some(self.surface),
-                    Some(self.surface),
+                    Some(surface),
+                    Some(surface),
                     Some(self.context.context),
                 )
                 .map_err(|error| {
@@ -385,9 +397,13 @@ impl Window {
         Ok(current)
     }
     pub(super) fn present(&self) -> Result<(), Error> {
+        let _trace = super::trace::Scope::new(c"NSH present");
         self.context
             .egl
-            .swap_buffers(self.context.display, self.surface)
+            .swap_buffers(
+                self.context.display,
+                self.surface.get().ok_or(failed("missing output surface"))?,
+            )
             .map_err(|error| Error {
                 operation: "eglSwapBuffers",
                 code: error.into(),
@@ -396,13 +412,10 @@ impl Window {
 }
 impl Drop for Window {
     fn drop(&mut self) {
-        self.context.bind_pbuffer();
-        let _ = self
-            .context
-            .egl
-            .destroy_surface(self.context.display, self.surface);
+        self.release_egl();
     }
 }
+
 struct Objects {
     context: Rc<Context>,
     gl: Rc<glow::Context>,
@@ -439,12 +452,6 @@ impl Drop for Objects {
         }
     }
 }
-pub(super) enum PassthroughOutcome {
-    Idle,
-    Deferred,
-    Presented { width: u32, height: u32 },
-}
-
 /// A thread-bound NativeImage reader with an offscreen GLES context.
 ///
 /// GPU sampling resolves the producer's texture layout and transform before
@@ -631,16 +638,17 @@ impl TextureReader {
     /// Updates future dimensions within native signed and GLES texture limits.
     pub(super) fn resize(&mut self, width: u32, height: u32) -> Result<(), Error> {
         let (width, height, _) = super::geometry::target_size(width as f32, height as f32, 1.0);
+        if self.size == (width, height) {
+            return Ok(());
+        }
         self.layout(width, height)?;
         self.surface
             .as_mut()
             .unwrap()
             .resize(width, height)
             .map_err(native_error)?;
-        if self.size != (width, height) {
-            self.size = (width, height);
-            self.target_dirty = true;
-        }
+        self.size = (width, height);
+        self.target_dirty = true;
         Ok(())
     }
     fn layout(&self, width: u32, height: u32) -> Result<Layout, Error> {
@@ -663,14 +671,12 @@ impl TextureReader {
         self.target_dirty = true;
         Ok(true)
     }
-    /// Drains up to `max_frames` queued producer buffers into the OES texture
-    /// without resolving an intermediate RGBA FBO until needed.
-    pub(super) fn drain_oes(&mut self, max_frames: usize) -> Result<bool, Error> {
+    /// Consume the available producer buffers before resolving the newest one.
+    /// Notifications can coalesce while this worker is busy; stopping after an
+    /// arbitrary number would leave stale content queued without another wake.
+    pub(super) fn drain_oes(&mut self) -> Result<bool, Error> {
         let mut updated = false;
-        for _ in 0..max_frames {
-            if !self.poll_oes()? {
-                break;
-            }
+        while self.poll_oes()? {
             updated = true;
         }
         Ok(updated)
@@ -764,55 +770,12 @@ impl TextureReader {
         self.target_dirty = false;
         Ok(Some((self.target, width, height)))
     }
-    /// Presents the latest producer OES buffer directly into `window` in a
-    /// single pass, bypassing intermediate RGBA FBO allocations and blits.
-    pub(super) fn present_passthrough(
-        &mut self,
-        window: &mut Window,
-        force: bool,
-    ) -> Result<PassthroughOutcome, Error> {
-        let updated = self.drain_oes(4)?;
-        if !self.has_oes_frame || (!updated && !force) {
-            return Ok(PassthroughOutcome::Idle);
-        }
-        let (width, height) = self.size;
-        self.layout(width, height)?;
-        let result = (|| -> Result<(), Error> {
-            let _current = window.enter(width, height)?;
-            // SAFETY: `window.enter` made the shared context current on `window`.
-            unsafe {
-                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                self.draw_oes(width, height, 0.5)?;
-            }
-            window.present()
-        })();
-        match result {
-            Ok(()) => {
-                if window.waiting.replace(false) {
-                    log::debug!("OHOS passthrough output resumed");
-                }
-                Ok(PassthroughOutcome::Presented { width, height })
-            }
-            Err(error) if error.output_unavailable() => {
-                window.on_present_unavailable();
-                let _current = self.context.enter()?;
-                // SAFETY: shared GLES context is current on pbuffer.
-                unsafe { while self.gl.get_error() != glow::NO_ERROR {} }
-                if !window.waiting.replace(true) {
-                    log::debug!("OHOS passthrough output deferred: {error}");
-                }
-                Ok(PassthroughOutcome::Deferred)
-            }
-            Err(error) => Err(error),
-        }
-    }
     /// Resolve a producer buffer to a top-left RGBA texture, entirely on GPU.
     pub(super) fn update_texture(&mut self) -> Result<bool, Error> {
-        if !self.poll_oes()? {
-            return Ok(false);
-        }
-        self.ensure_texture()?;
-        Ok(true)
+        let _trace = super::trace::Scope::new(c"NSH acquire input");
+        let updated = self.drain_oes()?;
+        let dirty = self.target_dirty || self.allocated != self.size;
+        Ok(self.ensure_texture()?.is_some() && (updated || dirty))
     }
     pub(super) fn texture(&self) -> Option<(glow::Texture, u32, u32)> {
         (!self.target_dirty && self.allocated != (0, 0)).then_some((

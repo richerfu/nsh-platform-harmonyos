@@ -38,11 +38,6 @@ pub(super) enum Error {
     #[error("shader draw GL error {0:#x}")]
     Draw(u32),
 }
-impl Error {
-    pub(super) fn is_retryable(&self) -> bool {
-        !matches!(self, Self::Shader(_) | Self::Configuration(_))
-    }
-}
 impl From<String> for Error {
     fn from(message: String) -> Self {
         Self::Driver(message)
@@ -127,20 +122,55 @@ impl Target {
     pub(super) fn picture(&self) -> Picture {
         (self.texture, self.width, self.height)
     }
-    pub(super) fn upload(gpu: &TextureContext, frame: &RgbaFrame) -> Result<Self> {
-        if frame.pixels.len() != frame.width as usize * frame.height as usize * 4 {
-            return Err("invalid shader picture storage".into());
+    pub(super) fn read(&self) -> Result<RgbaFrame> {
+        let _current = self.gpu.context.enter()?;
+        let mut pixels = vec![0; self.width as usize * self.height as usize * 4];
+        // SAFETY: the framebuffer and exact-size destination belong to this worker context.
+        unsafe {
+            let gl = &self.gpu.gl;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+            let code = gl.get_error();
+            if code != glow::NO_ERROR {
+                return Err(Error::Draw(code));
+            }
         }
+        Ok(RgbaFrame {
+            width: self.width,
+            height: self.height,
+            pixels,
+        })
+    }
+    pub(super) fn upload(gpu: &TextureContext, frame: &RgbaFrame) -> Result<Self> {
         if frame.width > 4096 || frame.height > 4096 {
             return Err("shader upload must be resampled before allocation".into());
         }
         let target = Self::new(gpu, frame.width, frame.height)?;
-        let _current = gpu.context.enter()?;
+        target.write(frame)?;
+        Ok(target)
+    }
+    pub(super) fn write(&self, frame: &RgbaFrame) -> Result<()> {
+        if (frame.width, frame.height) != (self.width, self.height)
+            || frame.pixels.len() != frame.width as usize * frame.height as usize * 4
+        {
+            return Err("invalid shader picture storage".into());
+        }
+        let _current = self.gpu.context.enter()?;
         // SAFETY: the live texture's exact-size RGBA source stays borrowed during upload.
         unsafe {
-            gpu.gl.bind_texture(glow::TEXTURE_2D, Some(target.texture));
-            gpu.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            gpu.gl.tex_sub_image_2d(
+            let gl = &self.gpu.gl;
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.texture));
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
                 0,
                 0,
@@ -152,15 +182,15 @@ impl Target {
                 glow::PixelUnpackData::Slice(Some(&frame.pixels)),
             );
         }
-        Ok(target)
+        Ok(())
     }
     pub(super) fn copy(gpu: &TextureContext, picture: Picture) -> Result<Self> {
         let target = Self::new(gpu, picture.1, picture.2)?;
-        target.blit(picture, false)?;
+        target.blit(picture)?;
         Ok(target)
     }
-    fn blit(&self, picture: Picture, flip: bool) -> Result<()> {
-        self.blit_rect(picture, flip, [0, 0, self.width as i32, self.height as i32])
+    fn blit(&self, picture: Picture) -> Result<()> {
+        self.blit_rect(picture, [0, 0, self.width as i32, self.height as i32])
     }
     pub(super) fn reframe(
         &self,
@@ -170,11 +200,10 @@ impl Target {
     ) -> Result<()> {
         self.blit_rect(
             picture,
-            false,
             destination.destination(source, (self.width, self.height)),
         )
     }
-    fn blit_rect(&self, picture: Picture, flip: bool, rect: [i32; 4]) -> Result<()> {
+    fn blit_rect(&self, picture: Picture, rect: [i32; 4]) -> Result<()> {
         let _current = self.gpu.context.enter()?;
         let gl = &self.gpu.gl;
         let full_rect = rect == [0, 0, self.width as i32, self.height as i32];
@@ -196,16 +225,11 @@ impl Target {
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
-            let (y0, y1) = if flip {
-                (picture.2 as i32, 0)
-            } else {
-                (0, picture.2 as i32)
-            };
             gl.blit_framebuffer(
                 0,
-                y0,
+                0,
                 picture.1 as i32,
-                y1,
+                picture.2 as i32,
                 rect[0],
                 rect[1],
                 rect[2],
@@ -327,10 +351,17 @@ impl Program {
                 .shader
                 .glsl_es()
                 .map_err(|e| Error::Shader(e.to_string()))?;
+            // Core's GLSL targets a displayed canvas. Our intermediate pictures
+            // have their first row at the top; adapt clip space in the vertex
+            // stage instead of copying and flipping every shader output.
+            let vertex = source
+                .vertex
+                .replacen('\n', "\n#define main nsh_ohos_vertex\n", 1)
+                + "\n#undef main\nvoid main() { nsh_ohos_vertex(); gl_Position.y = -gl_Position.y; }\n";
             let native = gl.create_program()?;
             let compile = || -> Result<()> {
                 for (kind, source) in [
-                    (glow::VERTEX_SHADER, &source.vertex),
+                    (glow::VERTEX_SHADER, &vertex),
                     (glow::FRAGMENT_SHADER, &source.fragment),
                 ] {
                     let shader = gl.create_shader(kind)?;
@@ -511,7 +542,6 @@ struct Effect {
     aligned: Option<Target>,
     backdrop: Option<Target>,
     input: Option<Target>,
-    scratch: Option<Target>,
     output: Option<Target>,
 }
 
@@ -597,7 +627,6 @@ impl Effects {
                         aligned: None,
                         backdrop: None,
                         input: None,
-                        scratch: None,
                         output: None,
                     },
                 );
@@ -780,7 +809,7 @@ impl Effects {
                 {
                     view.input = Some(Target::new(&self.gpu, layer_size.0, layer_size.1)?);
                 }
-                view.input.as_ref().unwrap().blit(current, false)?;
+                view.input.as_ref().unwrap().blit(current)?;
             }
             if replaces
                 && (changed
@@ -788,13 +817,12 @@ impl Effects {
                     || transitioning
                     || view.layer.shader.animated() && !view.layer.paused)
             {
-                for target in [&mut view.scratch, &mut view.output] {
-                    if target
-                        .as_ref()
-                        .is_none_or(|t| (t.width, t.height) != layer_size)
-                    {
-                        *target = Some(Target::new(&self.gpu, layer_size.0, layer_size.1)?);
-                    }
+                if view
+                    .output
+                    .as_ref()
+                    .is_none_or(|t| (t.width, t.height) != layer_size)
+                {
+                    view.output = Some(Target::new(&self.gpu, layer_size.0, layer_size.1)?);
                 }
                 let time = view.elapsed
                     + if view.layer.paused {
@@ -802,7 +830,7 @@ impl Effects {
                     } else {
                         view.clock.elapsed()
                     };
-                let scratch = view.scratch.as_ref().unwrap();
+                let output = view.output.as_ref().unwrap();
                 if let Some(backdrop) = backdrop {
                     if view
                         .backdrop
@@ -825,7 +853,7 @@ impl Effects {
                     (view.from.as_ref().map(Target::picture), Some(current))
                 };
                 view.program.draw(
-                    scratch,
+                    output,
                     &view.words,
                     &builtins(
                         coverage.box_size,
@@ -839,10 +867,6 @@ impl Effects {
                     to_pic,
                     backdrop.and_then(|_| view.backdrop.as_ref().map(Target::picture)),
                 )?;
-                view.output
-                    .as_ref()
-                    .unwrap()
-                    .blit(scratch.picture(), true)?;
                 changed = true;
             }
             if replaces && let Some(output) = &view.output {
